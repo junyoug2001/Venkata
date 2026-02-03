@@ -469,6 +469,34 @@ class Run:
             mev_path = f"{base}_meV{ext}"
             df_mev.to_csv(mev_path)
 
+    def reload_data(self) -> None:
+        """
+        Reload data from the source file, updating arrays and metadata.
+        Preserves the current ID and nickname.
+        """
+        if not self.source_path or not os.path.exists(self.source_path):
+            raise FileNotFoundError(f"Source file not found: {self.source_path}")
+
+        # Load fresh instance
+        fresh = Run.from_file(self.source_path)
+
+        # Update attributes
+        self.source_mtime = fresh.source_mtime
+        self.wl_nm = fresh.wl_nm
+        self.shift_cm1 = fresh.shift_cm1
+        self.energy_eV = fresh.energy_eV
+        self.intensity = fresh.intensity
+        self.intensity_2d = fresh.intensity_2d
+        self.angle_values = fresh.angle_values
+        self.intensity_unit = fresh.intensity_unit
+        self.angle_unit = fresh.angle_unit
+        
+        # Merge metadata (preserve manual nickname)
+        current_nickname = self.metadata.get("nickname")
+        self.metadata.update(fresh.metadata)
+        if current_nickname:
+            self.metadata["nickname"] = current_nickname
+
     # --- construction helpers ---
 
     @classmethod
@@ -757,6 +785,87 @@ class ExperimentSet:
             views_grp.attrs["json"] = json.dumps(
                 {vid: asdict(v) for vid, v in self.views.items()},
                 ensure_ascii=False,
+            )
+
+    @classmethod
+    def from_hdf5(cls, path: str) -> "ExperimentSet":
+        """
+        Load an experiment from an HDF5 file.
+        """
+        import h5py
+        import json
+
+        with h5py.File(path, "r") as h5:
+            # ID
+            exp_id = h5.attrs.get("experiment_id", new_experiment_id())
+            if isinstance(exp_id, bytes):
+                exp_id = exp_id.decode("utf-8")
+
+            # Metadata
+            md_grp = h5["metadata"]
+            metadata = json.loads(md_grp.attrs["json"])
+            next_run_index = int(md_grp.attrs.get("next_run_index", 1))
+
+            # Runs
+            runs = {}
+            if "runs" in h5:
+                runs_grp = h5["runs"]
+                for rid in runs_grp:
+                    rg = runs_grp[rid]
+
+                    # Scalar attrs
+                    source_path = rg.attrs["source_path"]
+                    if isinstance(source_path, bytes):
+                        source_path = source_path.decode("utf-8")
+                    
+                    source_mtime = rg.attrs.get("source_mtime")
+                    intensity_unit = rg.attrs.get("intensity_unit", "au")
+                    if isinstance(intensity_unit, bytes):
+                        intensity_unit = intensity_unit.decode("utf-8")
+                        
+                    angle_unit = rg.attrs.get("angle_unit", "deg")
+                    if isinstance(angle_unit, bytes):
+                        angle_unit = angle_unit.decode("utf-8")
+                        
+                    run_md = json.loads(rg.attrs["metadata_json"])
+
+                    # Arrays (helper)
+                    def read_ds(name):
+                        return rg[name][:] if name in rg else None
+
+                    r = Run(
+                        id=rid,
+                        source_path=source_path,
+                        source_mtime=source_mtime,
+                        wl_nm=read_ds("wl_nm"),
+                        shift_cm1=read_ds("shift_cm1"),
+                        energy_eV=read_ds("energy_eV"),
+                        intensity=read_ds("intensity"),
+                        intensity_2d=read_ds("intensity_2d"),
+                        angle_values=read_ds("angle_values"),
+                        intensity_unit=intensity_unit,
+                        angle_unit=angle_unit,
+                        metadata=run_md,
+                        raw_table=None, 
+                    )
+                    runs[rid] = r
+
+            # Views
+            views = {}
+            if "views" in h5:
+                views_grp = h5["views"]
+                if "json" in views_grp.attrs:
+                    views_dict = json.loads(views_grp.attrs["json"])
+                    for vid, vdata in views_dict.items():
+                        # Reconstruct ViewState
+                        views[vid] = ViewState(**vdata)
+
+            return cls(
+                id=exp_id,
+                runs=runs,
+                views=views,
+                metadata=metadata,
+                next_run_index=next_run_index
             )
 
 
