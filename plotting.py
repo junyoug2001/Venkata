@@ -257,7 +257,7 @@ class AngularPlotter(BasePlotter):
         self._vline = None # Highlight for Cartesian
         self._vline_polar = None # Highlight for Polar
 
-    def render(self, angles: np.ndarray, intensity: np.ndarray, mode: str = "cartesian", title: str = ""):
+    def render(self, angles: np.ndarray, intensity: np.ndarray, mode: str = "cartesian", title: str = "", style: Optional[Any] = None):
         # Note: Switching projections usually requires clearing/recreating the Axes in Matplotlib.
         # This class assumes 'ax' has the correct projection already, or handles rendering logic
         # that fits the current ax projection. The GUI layer is responsible for recreating ax if 
@@ -267,24 +267,33 @@ class AngularPlotter(BasePlotter):
         self._mode = mode
         
         if self._mode == "polar":
-            self._render_polar(angles, intensity, title)
+            self._render_polar(angles, intensity, title, style)
         else:
-            self._render_cartesian(angles, intensity, title)
+            self._render_cartesian(angles, intensity, title, style)
         
         self.draw()
 
-    def _render_cartesian(self, angles, intensity, title):
-        self._line, = self.ax.plot(angles, intensity, "-k", linewidth=1.2)
+    def _render_cartesian(self, angles, intensity, title, style=None):
+        color = style.color if style else "black"
+        lw = style.linewidth if style else 1.2
+        ls = style.linestyle if style else "-"
+        self._line, = self.ax.plot(angles, intensity, color=color, linewidth=lw, linestyle=ls)
         self.set_title(title)
         self.set_labels("Angle (deg)", "Intensity (a.u.)")
         self._vline = self.ax.axvline(0, color="red", alpha=0.3, linewidth=1.0, visible=False)
 
-    def _render_polar(self, angles, intensity, title):
+    def _render_polar(self, angles, intensity, title, style=None):
         theta = np.deg2rad(angles)
         self.ax.set_theta_zero_location("N")
         self.ax.set_theta_direction(-1) # Clockwise
         
-        self.ax.plot(theta, intensity, "o", ms=3, linestyle="None")
+        color = style.color if style else "black"
+        # For polar we often use dots or lines. 
+        # If linestyle is None or empty, we use markers.
+        if style and style.marker:
+            self.ax.plot(theta, intensity, marker=style.marker, ms=style.markersize, color=color, linestyle="None")
+        else:
+            self.ax.plot(theta, intensity, "o", ms=3, color=color, linestyle="None")
         
         # Adaptive R-limits
         valid = intensity[np.isfinite(intensity)]
@@ -348,13 +357,18 @@ class SlicePlotter(BasePlotter):
         title: str = "",
         xlabel: str = "Raman shift (cm$^{-1}$)",
         ylabel: str = "Intensity (a.u.)",
-        x_unit_conversion: Optional[Tuple[Callable, Callable]] = None
+        x_unit_conversion: Optional[Tuple[Callable, Callable]] = None,
+        style: Optional[Any] = None
     ):
         self.clear()
         self._traces = {} # Reset traces
         
+        color = style.color if style else "black"
+        lw = style.linewidth if style else 1.2
+        ls = style.linestyle if style else "-"
+        
         # Main trace
-        line, = self.ax.plot(x, intensity, "-k", linewidth=1.2, label="Signal")
+        line, = self.ax.plot(x, intensity, color=color, linewidth=lw, linestyle=ls, label="Signal")
         self._traces["main"] = line
         
         self.set_title(title)

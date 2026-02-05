@@ -23,6 +23,7 @@ EV_PER_CM1: float = 1.0 / 8065.544
 
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any, Tuple, Union
+from enum import Enum, auto
 
 import os
 import re
@@ -279,6 +280,45 @@ def infer_intensity_unit(y: np.ndarray) -> str:
 # -------------------------
 
 
+class RunType(str, Enum):
+    RUN_1D = "1d run"
+    RUN_2D = "2d run"
+    DERIVED = "derived run"
+    OTHER = "other"
+
+@dataclass
+class PlotStyle:
+    """Style attributes for a single plot component."""
+    visible: bool = True
+    color: str = "black"
+    linestyle: str = "-"  # '-', '--', '-.', ':'
+    linewidth: float = 1.0
+    marker: str = ""
+    markersize: float = 5.0
+    alpha: float = 1.0
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PlotStyle":
+        return cls(**data)
+
+@dataclass
+class RunViewConfig:
+    """Configuration for how a Run is displayed in a View."""
+    # Keyed by component name: e.g. "Map", "SliceH", "SliceV", or "A", "B", "C"
+    # For now, let's use "A", "B", "C" to match the ViewPanel layout.
+    styles: Dict[str, PlotStyle] = field(default_factory=dict)
+
+    def get_style(self, component: str) -> PlotStyle:
+        if component not in self.styles:
+            self.styles[component] = PlotStyle()
+        return self.styles[component]
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RunViewConfig":
+        styles_raw = data.get("styles", {})
+        styles = {k: PlotStyle.from_dict(v) for k, v in styles_raw.items()}
+        return cls(styles=styles)
+
 @dataclass
 class Run:
     """
@@ -313,9 +353,13 @@ class Run:
     intensity_unit: str = "au"    # 'count' or 'au'
     angle_unit: str = "deg"       # 'deg' or 'rad'
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # Run Type
+    run_type: RunType = RunType.OTHER
 
     # Optional copy of the raw loaded table
     raw_table: Optional[pd.DataFrame] = None
+
 
     # --- label helpers ---
 
@@ -548,6 +592,7 @@ class Run:
                 intensity_unit=infer_intensity_unit(y),
                 angle_unit="deg",
                 metadata=metadata,
+                run_type=RunType.RUN_1D,
                 raw_table=None,
             )
 
@@ -579,6 +624,7 @@ class Run:
                 intensity_unit=infer_intensity_unit(intensity),
                 angle_unit="deg",
                 metadata=metadata,
+                run_type=RunType.RUN_2D,
                 raw_table=None,
             )
 
@@ -600,6 +646,9 @@ class ViewState:
     # Which runs are displayed in this view (0–2 for now)
     run_ids: List[str] = field(default_factory=list)
 
+    # Styling configuration per run. Key is run_id.
+    run_configs: Dict[str, RunViewConfig] = field(default_factory=dict)
+
     # Display options
     x_axis: str = "shift_cm1"   # "shift_cm1" or "energy_eV"
     normalize: bool = False
@@ -612,7 +661,23 @@ class ViewState:
     @property
     def n_runs(self) -> int:
         return len(self.run_ids)
+    
+    def get_run_config(self, run_id: str) -> RunViewConfig:
+        if run_id not in self.run_configs:
+            self.run_configs[run_id] = RunViewConfig()
+        return self.run_configs[run_id]
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ViewState":
+        run_configs_raw = data.get("run_configs", {})
+        run_configs = {k: RunViewConfig.from_dict(v) for k, v in run_configs_raw.items()}
+        
+        # Remove these from dict before unpacking to avoid double init
+        base_data = dict(data)
+        if "run_configs" in base_data:
+            del base_data["run_configs"]
+            
+        return cls(run_configs=run_configs, **base_data)
 
 @dataclass
 class ExperimentSet:
@@ -858,7 +923,7 @@ class ExperimentSet:
                     views_dict = json.loads(views_grp.attrs["json"])
                     for vid, vdata in views_dict.items():
                         # Reconstruct ViewState
-                        views[vid] = ViewState(**vdata)
+                        views[vid] = ViewState.from_dict(vdata)
 
             return cls(
                 id=exp_id,
