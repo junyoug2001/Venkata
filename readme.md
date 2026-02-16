@@ -99,6 +99,12 @@ Provides numerical and I/O helpers without GUI dependencies:
   - A directory dialog will open, allowing you to choose where to save the files.
   - For each exported run, two CSV files are created (e.g., `..._angular_matrix_cm-1.csv` and `..._angular_matrix_meV.csv`). The filenames are generated automatically from the run's metadata.
 
+- **Curve Fitting**:
+  - Right-click on any 1D trace (Angular slice or Spectral slice) and select **"Curve Fit..."**.
+  - The "Curve Fit" tab (bottom-left) will activate with the selected data loaded.
+  - Choose a model (Lorentzian, Sum of Lorentzian, or User Defined), adjust parameters, and click **Fit**.
+  - Click **Create Curve** to save the fit result as a new "Derived Run", which will automatically overlay on the original plot.
+
 - **Plot Interaction**:
   - Clicking on a 2D map selects a Raman shift and angle, updating the slice plots.
   - Zoom and pan are synchronized across all relevant plots.
