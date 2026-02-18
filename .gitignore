@@ -4,4 +4,4 @@ TemporaryTools/
 Results/
 *.csv
 *.dat
-
+__pycache__/
