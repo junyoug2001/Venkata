@@ -1,0 +1,12 @@
+{
+    "colormap": "OrRd",
+    "unit": "cm-1",
+    "dark_value": 600.0,
+    "cosmic_threshold": 1200.0,
+    "cosmic_ratio": 20.0,
+    "window_size": [
+        1400,
+        800
+    ],
+    "last_directory": ""
+}
