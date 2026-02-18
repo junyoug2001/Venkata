@@ -23,6 +23,7 @@ from data_structure import (
     RunType
 )
 from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
+from config_manager import config
 
 try:
     import cmcrameri.cm
@@ -657,7 +658,7 @@ class PlotConfigPanel(wx.Panel):
         
         self._on_reset = on_reset
         
-        self.x_unit = 'cm-1' # Default unit
+        self.x_unit = config.get('unit', 'cm-1')
 
         sizer = wx.BoxSizer(wx.VERTICAL)
         
@@ -669,7 +670,10 @@ class PlotConfigPanel(wx.Panel):
         # Unit radio buttons
         self.rb_cm1 = wx.RadioButton(self, label="cm-1", style=wx.RB_GROUP)
         self.rb_mev = wx.RadioButton(self, label="meV")
-        self.rb_cm1.SetValue(True)
+        if self.x_unit == 'meV':
+            self.rb_mev.SetValue(True)
+        else:
+            self.rb_cm1.SetValue(True)
         unit_sizer = wx.BoxSizer(wx.HORIZONTAL)
         unit_sizer.Add(self.rb_cm1, 0, wx.RIGHT, 5)
         unit_sizer.Add(self.rb_mev, 0)
@@ -738,25 +742,43 @@ class PlotConfigPanel(wx.Panel):
         cat_choices = ['Standard']
         if self.cmaps_cmc:
             cat_choices.append('CMCrameri')
-            
         self.choice_cat = wx.Choice(self, choices=cat_choices)
-        self.choice_cat.SetSelection(0)
-        cmap_sizer.Add(self.choice_cat, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
-
+        
         # Map Choice
-        self.choice_cmap = wx.Choice(self, choices=self.cmaps_std)
-        self.choice_cmap.SetStringSelection('OrRd')
+        self.choice_cmap = wx.Choice(self) # Create empty, will be populated below
+
+        # Load saved colormap and populate choices
+        saved_cmap = config.get('colormap', 'OrRd')
+        if saved_cmap.startswith('cmc.') and self.cmaps_cmc:
+            self.choice_cat.SetStringSelection('CMCrameri')
+            self.choice_cmap.Set(self.cmaps_cmc)
+        else:
+            self.choice_cat.SetStringSelection('Standard')
+            self.choice_cmap.Set(self.cmaps_std)
+            
+        self.choice_cmap.SetStringSelection(saved_cmap)
+        if self.choice_cmap.GetSelection() == wx.NOT_FOUND and self.choice_cmap.GetCount() > 0:
+            self.choice_cmap.SetSelection(0)
+
+        cmap_sizer.Add(self.choice_cat, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
         cmap_sizer.Add(self.choice_cmap, 1, wx.EXPAND)
         
         sizer.Add(cmap_sizer, 0, wx.EXPAND | wx.ALL, 5)
         
         # Contrast controls
-        sizer.Add(wx.StaticText(self, label="Contrast (percentiles)"), 0, wx.LEFT | wx.TOP, 5)
+        sizer.Add(wx.StaticText(self, label="Contrast"), 0, wx.LEFT | wx.TOP, 5)
         
+        # Header for Percentile vs Value
+        header_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        header_sizer.Add(wx.StaticText(self, label=""), 0, wx.RIGHT, 35) # spacing for 'min:' label
+        header_sizer.Add(wx.StaticText(self, label="Percentile (%)"), 1, wx.ALIGN_CENTER)
+        header_sizer.Add(wx.StaticText(self, label="Value (a.u.)"), 0, wx.ALIGN_CENTER | wx.LEFT, 10)
+        sizer.Add(header_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+
         vmin_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.vmin_label = wx.StaticText(self, label="min:")
         self.vmin_slider = wx.Slider(self, value=0, minValue=0, maxValue=100)
-        self.txt_vmin = wx.TextCtrl(self, value="0", size=(40, -1), style=wx.TE_PROCESS_ENTER)
+        self.txt_vmin = wx.TextCtrl(self, value="0", size=(60, -1), style=wx.TE_PROCESS_ENTER)
         
         vmin_sizer.Add(self.vmin_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         vmin_sizer.Add(self.vmin_slider, 1, wx.EXPAND | wx.RIGHT, 5)
@@ -766,16 +788,22 @@ class PlotConfigPanel(wx.Panel):
         vmax_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.vmax_label = wx.StaticText(self, label="max:")
         self.vmax_slider = wx.Slider(self, value=100, minValue=0, maxValue=100)
-        self.txt_vmax = wx.TextCtrl(self, value="100", size=(40, -1), style=wx.TE_PROCESS_ENTER)
+        self.txt_vmax = wx.TextCtrl(self, value="100", size=(60, -1), style=wx.TE_PROCESS_ENTER)
         
         vmax_sizer.Add(self.vmax_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         vmax_sizer.Add(self.vmax_slider, 1, wx.EXPAND | wx.RIGHT, 5)
         vmax_sizer.Add(self.txt_vmax, 0, wx.ALIGN_CENTER_VERTICAL)
         sizer.Add(vmax_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
 
-        # Reset button
+        # Action buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.reset_button = wx.Button(self, label="Reset Plot")
-        sizer.Add(self.reset_button, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        self.btn_roi_vlim = wx.Button(self, label="Adjust color to this ROI")
+        
+        btn_sizer.Add(self.reset_button, 0, wx.ALL, 5)
+        btn_sizer.Add(self.btn_roi_vlim, 0, wx.ALL, 5)
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER)
 
         self.SetSizer(sizer)
 
@@ -795,6 +823,7 @@ class PlotConfigPanel(wx.Panel):
         self.choice_cat.Bind(wx.EVT_CHOICE, self.on_cat_change)
         self.choice_cmap.Bind(wx.EVT_CHOICE, self.on_cmap_change)
         self.reset_button.Bind(wx.EVT_BUTTON, self.on_reset_button)
+        self.btn_roi_vlim.Bind(wx.EVT_BUTTON, self.on_roi_vlim_button)
 
         self.target_view: Optional["ViewPanel"] = None
         self.set_target_view(None)
@@ -805,14 +834,14 @@ class PlotConfigPanel(wx.Panel):
             for widget in [self.rb_cm1, self.rb_mev, self.x_min_text, self.x_max_text,
                            self.y_min_text, self.y_max_text, self.choice_cat, self.choice_cmap,
                            self.vmin_slider, self.txt_vmin, self.vmax_slider, self.txt_vmax,
-                           self.reset_button]:
+                           self.reset_button, self.btn_roi_vlim]:
                 widget.Disable()
             return
 
         for widget in [self.rb_cm1, self.rb_mev, self.x_min_text, self.x_max_text,
                        self.y_min_text, self.y_max_text, self.choice_cat, self.choice_cmap,
                        self.vmin_slider, self.txt_vmin, self.vmax_slider, self.txt_vmax,
-                       self.reset_button]:
+                       self.reset_button, self.btn_roi_vlim]:
             widget.Enable()
 
         config = self.target_view.get_plot_config()
@@ -832,6 +861,10 @@ class PlotConfigPanel(wx.Panel):
         vmin_p = config.get('vmin_p', 0)
         vmax_p = config.get('vmax_p', 100)
         self.set_vlim_range(vmin_p, vmax_p)
+        
+        # Sync Absolute Contrast Values
+        v_abs = self.target_view.get_absolute_vlim_for_percentiles(vmin_p, vmax_p)
+        self.update_absolute_vlim_display(v_abs[0], v_abs[1])
         
         # Sync Colormap
         cmap = config.get('cmap', 'OrRd')
@@ -861,6 +894,7 @@ class PlotConfigPanel(wx.Panel):
         if new_unit == self.x_unit:
             return
         self.x_unit = new_unit
+        config.set('unit', new_unit)
         
         if self.target_view:
             xlim_cm1, _ = self.target_view.get_plot_limits()
@@ -890,46 +924,49 @@ class PlotConfigPanel(wx.Panel):
                 wx.MessageBox("Invalid Y range. Please enter numeric values.", "Error", wx.OK | wx.ICON_ERROR)
 
     def on_vlim_slide(self, event):
-        vmin = self.vmin_slider.GetValue()
-        vmax = self.vmax_slider.GetValue()
+        vmin_p = self.vmin_slider.GetValue()
+        vmax_p = self.vmax_slider.GetValue()
         # Simple guard
-        if vmin > vmax:
+        if vmin_p > vmax_p:
             if event.GetEventObject() is self.vmin_slider:
-                vmax = vmin
-                self.vmax_slider.SetValue(vmax)
+                vmax_p = vmin_p
+                self.vmax_slider.SetValue(vmax_p)
             else:
-                vmin = vmax
-                self.vmin_slider.SetValue(vmin)
-        
-        self.txt_vmin.SetValue(str(vmin))
-        self.txt_vmax.SetValue(str(vmax))
+                vmin_p = vmax_p
+                self.vmin_slider.SetValue(vmin_p)
         
         if self.target_view:
-            self.target_view.set_vlim(vmin, vmax)
+            self.target_view.set_vlim(vmin_p, vmax_p)
+            # update_absolute_vlim_display is called by set_vlim via ViewPanel
 
     def on_vlim_text_enter(self, event):
         try:
-            vmin = int(float(self.txt_vmin.GetValue()))
-            vmax = int(float(self.txt_vmax.GetValue()))
-            
-            vmin = max(0, min(100, vmin))
-            vmax = max(0, min(100, vmax))
+            vmin = float(self.txt_vmin.GetValue())
+            vmax = float(self.txt_vmax.GetValue())
             
             if vmin > vmax:
-                vmax = vmin
-            
-            self.vmin_slider.SetValue(vmin)
-            self.vmax_slider.SetValue(vmax)
-            self.txt_vmin.SetValue(str(vmin))
-            self.txt_vmax.SetValue(str(vmax))
+                vmax = vmin + 1e-9
+                self.txt_vmax.SetValue(f"{vmax:.2f}")
             
             if self.target_view:
-                self.target_view.set_vlim(vmin, vmax)
+                self.target_view.set_vlim_absolute(vmin, vmax)
         except ValueError:
             pass
 
+    def update_absolute_vlim_display(self, vmin, vmax):
+        """Called by ViewPanel to update the absolute value text boxes."""
+        self.txt_vmin.ChangeValue(f"{vmin:.2f}")
+        self.txt_vmax.ChangeValue(f"{vmax:.2f}")
+
+    def on_roi_vlim_button(self, event):
+        if self.target_view:
+            vmin, vmax = self.target_view.get_roi_vlim()
+            self.target_view.set_vlim_absolute(vmin, vmax)
+            self.update_absolute_vlim_display(vmin, vmax)
+
     def on_cmap_change(self, event):
         cmap = self.choice_cmap.GetStringSelection()
+        config.set('colormap', cmap)
         if self.target_view:
             self.target_view.set_colormap(cmap)
     

@@ -85,6 +85,7 @@ class RamanPlotter2d(BasePlotter):
         # Highlight Artists
         self._vline = None
         self._hline = None
+        self._points_scatter = None
         
         # Config
         self._highlight_mode = "click" # "none", "click"
@@ -185,6 +186,68 @@ class RamanPlotter2d(BasePlotter):
             vmax_val = vmin_val + 1e-9
             
         self.mesh.set_clim(vmin_val, vmax_val)
+        self.draw()
+
+    def get_value_at_percentile(self, p: float) -> float:
+        """Calculate intensity value at a specific percentile of the current data."""
+        if self._data is None:
+            return 0.0
+        valid_data = self._data[np.isfinite(self._data)]
+        if valid_data.size == 0:
+            return 0.0
+        return float(np.percentile(valid_data, p))
+
+    def set_clim(self, vmin: float, vmax: float):
+        """Set absolute color limits for the 2D mesh."""
+        if self.mesh is None:
+            return
+        if vmax <= vmin:
+            vmax = vmin + 1e-9
+        self.mesh.set_clim(vmin, vmax)
+        self.draw()
+
+    def get_roi_limits(self) -> Tuple[float, float]:
+        """Get the min/max intensity values within the currently visible axis limits."""
+        if self._data is None or self._x_centers is None or self._y_centers is None:
+            return 0.0, 1.0
+        
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        
+        # Use a small tolerance or clip to avoid empty selections due to floating point
+        ix_min = np.searchsorted(self._x_centers, min(xlim), side='left')
+        ix_max = np.searchsorted(self._x_centers, max(xlim), side='right')
+        iy_min = np.searchsorted(self._y_centers, min(ylim), side='left')
+        iy_max = np.searchsorted(self._y_centers, max(ylim), side='right')
+        
+        # Slicing
+        roi_data = self._data[iy_min:iy_max, ix_min:ix_max]
+        
+        if roi_data.size == 0:
+            return 0.0, 1.0
+            
+        valid = roi_data[np.isfinite(roi_data)]
+        if valid.size == 0:
+            return 0.0, 1.0
+            
+        return float(np.min(valid)), float(np.max(valid))
+
+    def set_points(self, x_vals: List[float], y_vals: List[float], color="cyan", size=30):
+        """Overlay multiple point markers (e.g. selected peaks) on the 2D map."""
+        if self._points_scatter:
+            try: self._points_scatter.remove()
+            except: pass
+            self._points_scatter = None
+        
+        if x_vals and y_vals:
+            self._points_scatter = self.ax.scatter(
+                x_vals, y_vals, 
+                c=color, s=size, 
+                marker='s', alpha=0.8, 
+                edgecolors='white', linewidths=0.5,
+                zorder=5 # ensure markers are above the mesh
+            )
+        
         self.draw()
 
     def set_highlight(self, x_val: float, y_val: float, visible: bool = True):

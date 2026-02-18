@@ -67,6 +67,7 @@ from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
 from wx_left_panel import FilesPanel, RunsPanel, ExperimentPanel, LogPanel
 from wx_left_lower_panel import PreviewPanel, CurveFitPanel, PlotConfigPanel, AppearancesPanel
 from wx_right_panel import RamanToolbar, ViewPanel
+from config_manager import config
 
 
 # -----------------------------
@@ -76,10 +77,11 @@ from wx_right_panel import RamanToolbar, ViewPanel
 
 class MainFrame(wx.Frame):
     def __init__(self, initial_files: Optional[List[str]] = None):
+        size = config.get("window_size", [1400, 800])
         super().__init__(
             None,
             title="Venkata - GUI Based Raman Analysis",
-            size=(1400, 800),
+            size=(size[0], size[1]),
         )
 
         # Core experiment model
@@ -99,12 +101,25 @@ class MainFrame(wx.Frame):
         # Status bar
         self.CreateStatusBar()
 
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
         # Load any initial files passed from CLI
         if initial_files:
             self.load_initial_files(initial_files)
+        else:
+            last_dir = config.get("last_directory", "")
+            if last_dir and os.path.isdir(last_dir):
+                self.files_panel.set_directory(last_dir)
 
         self.Centre()
         self.Show()
+
+    def on_close(self, event):
+        """Save settings and close the app."""
+        size = self.GetSize()
+        config.set("window_size", [size.width, size.height])
+        config.save()
+        self.Destroy()
 
     # -------- menu --------
 
@@ -168,19 +183,45 @@ class MainFrame(wx.Frame):
     def on_merge_run_dialog(self, event):
         """Open the merge-run dialog.
 
-        Note: wx.FileDialog cannot embed extra checkboxes in a cross-platform way.
-        Therefore merge options are collected inside the subsequent MergeRunsDialog.
+        Allows multiple file selection. If multiple files correspond to different
+        experiment seeds, the dialog is shown sequentially for each seed.
         """
         with wx.FileDialog(
             self,
-            message="Select a 1D run file to seed merging",
+            message="Select 1D run files to merge",
             wildcard="Data files (*.csv;*.txt)|*.csv;*.txt|All files (*.*)|*.*",
-            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
         ) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
-            seed_path = dlg.GetPath()
+            paths = dlg.GetPaths()
 
+        if not paths:
+            return
+
+        # Group paths by seed patterns to identify unique merge operations
+        unique_seeds = {}
+        for p in paths:
+            abs_p = os.path.abspath(p)
+            d = os.path.dirname(abs_p)
+            base = os.path.basename(abs_p)
+            m = analysis.IDX_RE.match(base)
+            if m:
+                # Experiment pattern: group by (dir, prefix, ext)
+                key = (d, m.group("prefix"), m.group("ext"))
+            else:
+                # Standalone file: each is its own seed
+                key = (d, base, "")
+            
+            if key not in unique_seeds:
+                unique_seeds[key] = abs_p
+
+        # Process each unique seed
+        for seed_path in unique_seeds.values():
+            self._run_merge_dialog_for_seed(seed_path)
+
+    def _run_merge_dialog_for_seed(self, seed_path: str):
+        """Helper to run MergeRunsDialog for a specific seed path."""
         md = MergeRunsDialog(self, [seed_path], log_cb=self.log_panel.append_log)
         try:
             if md.ShowModal() == wx.ID_OK and md.result_run:
@@ -188,12 +229,12 @@ class MainFrame(wx.Frame):
                 self.experiment.add_run(new_run)
                 nickname = self.experiment.get_run_nickname(new_run.id)
                 self.log_panel.append_log(
-                    f"Merged run created as {nickname} ({new_run.id})."
+                    f"Merged run created as {nickname} ({new_run.id}) from seed {os.path.basename(seed_path)}."
                 )
                 self._refresh_left_panels()
-                self._refresh_all_view_panels() # To update any open views
+                self._refresh_all_view_panels() 
             else:
-                self.log_panel.append_log("Merge operation cancelled.")
+                self.log_panel.append_log(f"Merge operation cancelled for seed {os.path.basename(seed_path)}.")
         finally:
             md.Destroy()
 
@@ -424,7 +465,9 @@ class MainFrame(wx.Frame):
 
         # Initialize Files tab directory to the first loaded directory
         if set_files_dir and loaded_dirs:
-            self.files_panel.set_directory(loaded_dirs[0])
+            target_dir = loaded_dirs[0]
+            self.files_panel.set_directory(target_dir)
+            config.set("last_directory", target_dir)
 
     def on_import_run_from_files_panel(self, path: str) -> None:
         """Called from FilesPanel context menu: import a single file as a run."""

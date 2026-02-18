@@ -321,6 +321,10 @@ class RunsPanel(wx.Panel):
 
         top_sizer.Add(self.run_list, 1, wx.EXPAND | wx.ALL, 4)
 
+        # Sorting state
+        self._sort_col = -1
+        self._sort_ascending = True
+
         # Bottom panel: views
         bottom_panel = wx.Panel(self.splitter)
         bottom_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -340,10 +344,50 @@ class RunsPanel(wx.Panel):
 
         # Context menus
         self.run_list.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.on_context_menu_runs)
+        self.run_list.Bind(wx.EVT_LIST_COL_CLICK, self.on_column_click)
         self.views_list.Bind(wx.EVT_CONTEXT_MENU, self.on_context_menu_views)
 
         # Key bindings for run list
         self.run_list.Bind(wx.EVT_KEY_DOWN, self.on_run_list_key_down)
+
+    def on_column_click(self, event):
+        col = event.GetColumn()
+        if col == self._sort_col:
+            self._sort_ascending = not self._sort_ascending
+        else:
+            self._sort_col = col
+            self._sort_ascending = True
+        
+        self._sort_list()
+
+    def _sort_list(self):
+        if self._sort_col == -1:
+            return
+
+        # Collect data for sorting
+        items = []
+        for i in range(self.run_list.GetItemCount()):
+            items.append({
+                "col0": self.run_list.GetItemText(i, 0),
+                "col1": self.run_list.GetItemText(i, 1),
+                "col2": self.run_list.GetItemText(i, 2),
+                "run_id": self._run_ids[i]
+            })
+
+        # Sort
+        key_map = {0: "col0", 1: "col1", 2: "col2"}
+        sort_key = key_map[self._sort_col]
+        items.sort(key=lambda x: x[sort_key].lower(), reverse=not self._sort_ascending)
+
+        # Re-populate
+        self.run_list.DeleteAllItems()
+        self._run_ids.clear()
+        for item in items:
+            idx = self.run_list.InsertItem(self.run_list.GetItemCount(), item["col0"])
+            self.run_list.SetItem(idx, 1, item["col1"])
+            self.run_list.SetItem(idx, 2, item["col2"])
+            self._run_ids.append(item["run_id"])
+
 
     def _set_initial_sash(self):
         """Set an initial runs:views split of about 60%:40%."""

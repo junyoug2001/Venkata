@@ -203,6 +203,43 @@ class ViewPanel(wx.Panel):
             self.plotterA1.set_contrast(vmin, vmax)
         if self.plotterA2:
             self.plotterA2.set_contrast(vmin, vmax)
+        
+        # Update absolute value displays in config panel
+        if self.plot_config_panel:
+            v_abs = self.get_absolute_vlim_for_percentiles(vmin, vmax)
+            self.plot_config_panel.update_absolute_vlim_display(v_abs[0], v_abs[1])
+
+    def set_vlim_absolute(self, vmin, vmax):
+        """Set absolute intensity limits for contrast."""
+        if self.plotterA1:
+            self.plotterA1.set_clim(vmin, vmax)
+        if self.plotterA2:
+            self.plotterA2.set_clim(vmin, vmax)
+        self.canvas.draw_idle()
+
+    def get_roi_vlim(self) -> Tuple[float, float]:
+        """Calculate min/max values within the current Region of Interest (ROI)."""
+        lims = []
+        if self.plotterA1:
+            lims.append(self.plotterA1.get_roi_limits())
+        if self.plotterA2:
+            lims.append(self.plotterA2.get_roi_limits())
+        
+        if not lims:
+            return 0.0, 1.0
+        
+        vmin = min(l[0] for l in lims)
+        vmax = max(l[1] for l in lims)
+        return vmin, vmax
+
+    def get_absolute_vlim_for_percentiles(self, p_min: float, p_max: float) -> Tuple[float, float]:
+        """Get absolute intensity values corresponding to given percentiles."""
+        if not self.plotterA1:
+            return 0.0, 1.0
+        # Use Plot 1A as reference
+        v_min = self.plotterA1.get_value_at_percentile(p_min)
+        v_max = self.plotterA1.get_value_at_percentile(p_max)
+        return v_min, v_max
 
     def set_colormap(self, cmap_name: str):
         self.current_cmap = cmap_name

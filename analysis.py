@@ -343,11 +343,16 @@ def build_raw_matrix_wavelength_axis(
             xs = x
         if assume_xgrid_consistent:
             n = min(xs.size, x.size, y.size)
-            if n != xs.size:
+            if n < xs.size:
                 xs = xs[:n]
+                # Trim all existing rows to the new minimum size
+                rows = [r[:n] for r in rows]
             rows.append(np.asarray(y[:n], float))
         else:
             n = min(xs.size, x.size, y.size)
+            if n < xs.size:
+                xs = xs[:n]
+                rows = [r[:n] for r in rows]
             rows.append(np.asarray(y[:n], float))
         xxxx, yyyy = _parse_xxxx_yyyy_from_path(p)
         ang = _angle_deg_from_filename(p, xxxx, default=idx)
@@ -575,14 +580,16 @@ def detect_cosmic_peaks_comparative(
     )
 
     if use_raw:
-        I = discover_result.raw_intensity_matrix - dark_value
+        I = np.asarray(discover_result.raw_intensity_matrix, dtype=float).copy()
+        I -= dark_value
         I[I < 0] = 0
         angles = discover_result.raw_angle_values
         files = discover_result.raw_files
     else:
         # Fallback to primitive matrix if raw is not available/valid.
-        # The comparative logic will be limited in this case.
-        I = discover_result.intensity_matrix
+        I = np.asarray(discover_result.intensity_matrix, dtype=float).copy()
+        I -= dark_value
+        I[I < 0] = 0
         angles = discover_result.angle_values
         files = discover_result.files
 
@@ -593,11 +600,17 @@ def detect_cosmic_peaks_comparative(
     # Structure for reference lookups
     raw_rows_by_xxxx = discover_result.raw_rows_by_xxxx or {}
     primitive_xxxx = discover_result.primitive_xxxx or []
-    primitive_matrix = discover_result.primitive_matrix
+    
+    # Ensure primitive_matrix is also dark-subtracted if used as reference
+    primitive_matrix = None
+    if discover_result.primitive_matrix is not None:
+        primitive_matrix = np.asarray(discover_result.primitive_matrix, dtype=float).copy()
+        primitive_matrix -= dark_value
+        primitive_matrix[primitive_matrix < 0] = 0
 
     # 1. Find all candidate peaks above the intensity threshold
     for r in range(ny):
-        y = I[r, :] - dark_value
+        y = I[r, :] # Already dark-subtracted
 
         # Find local maxima (y[i] > y[i-1] and y[i] >= y[i+1])
         y0 = np.nan_to_num(y, nan=-np.inf)
@@ -624,7 +637,7 @@ def detect_cosmic_peaks_comparative(
             if use_raw and row_xxxx and row_xxxx in raw_rows_by_xxxx:
                 rep_rows = [rr for rr in raw_rows_by_xxxx.get(row_xxxx, []) if rr != r]
                 if rep_rows:
-                    reference_intensity = np.nanmean(I[rep_rows, c]) - dark_value
+                    reference_intensity = np.nanmean(I[rep_rows, c]) # Already dark-subtracted
                     reference_type = "repetition"
 
             # Priority 2 & 3: Neighboring xxxx from primitive matrix
@@ -638,7 +651,7 @@ def detect_cosmic_peaks_comparative(
                     if prim_idx < len(primitive_xxxx) - 1: neighbor_prim_indices.append(prim_idx + 1)
 
                     if neighbor_prim_indices:
-                        reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices, c]) - dark_value
+                        reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices, c]) # Already dark-subtracted
                         reference_type = "neighbor"
 
                     # If still no good reference, try neighbors at distance 2
@@ -648,7 +661,7 @@ def detect_cosmic_peaks_comparative(
                         if prim_idx < len(primitive_xxxx) - 2: neighbor_prim_indices_2.append(prim_idx + 2)
                         
                         if neighbor_prim_indices_2:
-                            reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices_2, c]) - dark_value
+                            reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices_2, c]) # Already dark-subtracted
                             reference_type = "neighbor_dist_2"
 
                 except (ValueError, IndexError):
@@ -849,6 +862,31 @@ def apply_cosmic_removal(
         remove_mask,
     )
 
+    # If I2 is RAW (multiple repetitions per angle), we MUST average it
+    # down to a primitive matrix to maintain dimension consistency with angle_values.
+    is_raw = (
+        getattr(discover_result, "raw_intensity_matrix", None) is not None
+        and I2.shape[0] == len(getattr(discover_result, "raw_files", []))
+        and len(getattr(discover_result, "raw_files", [])) > len(discover_result.unique_xxxx)
+    )
+
+    if is_raw:
+        # Re-build primitive matrix from the corrected RAW matrix I2
+        raw_files = discover_result.raw_files
+        raw_angles = discover_result.raw_angle_values
+        _, primitive_angle_values_new, primitive_matrix, _ = build_primitive_matrix_by_xxxx(
+            raw_files,
+            discover_result.wavelength_nm,
+            raw_angles,
+            I2,
+            dark_value=0.0 # dark_value already subtracted or handled
+        )
+        intensity_matrix_out = primitive_matrix
+        angle_values_out = primitive_angle_values_new
+    else:
+        intensity_matrix_out = I2
+        angle_values_out = discover_result.angle_values
+
     # Construct and return a new MergeDiscoverResult
     return MergeDiscoverResult(
         files=discover_result.files,
@@ -856,20 +894,20 @@ def apply_cosmic_removal(
         unique_xxxx=discover_result.unique_xxxx,
         unique_yyyy=discover_result.unique_yyyy,
         wavelength_nm=discover_result.wavelength_nm,
-        angle_values=discover_result.angle_values,
-        # Use the corrected intensity matrix
-        intensity_matrix=I2,
+        angle_values=angle_values_out,
+        # Use the corrected (and potentially averaged) intensity matrix
+        intensity_matrix=intensity_matrix_out,
         title=f"{discover_result.title} (cosmic removed)",
         candidate_laser_nm=discover_result.candidate_laser_nm,
         raw_files=discover_result.raw_files,
         raw_xxxx=discover_result.raw_xxxx,
         raw_yyyy=discover_result.raw_yyyy,
         raw_angle_values=discover_result.raw_angle_values,
-        raw_intensity_matrix=discover_result.raw_intensity_matrix,
+        raw_intensity_matrix=I2, # Keep the corrected RAW matrix here
         raw_rows_by_xxxx=discover_result.raw_rows_by_xxxx,
         primitive_xxxx=discover_result.primitive_xxxx,
-        primitive_matrix=discover_result.primitive_matrix, # primitive_matrix is not updated directly here, but rather through intensity_matrix
-        cosmic_matrix=I2, # Store corrected matrix here
+        primitive_matrix=intensity_matrix_out,
+        cosmic_matrix=I2, # Store corrected RAW matrix here if raw, else primitive
     )
 
 
@@ -1114,7 +1152,7 @@ def cosmic_apply_for_gui(
     with the corrected matrix embedded into a temporary discover_result.
     """
 
-    I2, summary = apply_cosmic_removal_placeholder(
+    I2, summary = _apply_cosmic_removal_logic(
         discover_result,
         cosmic_result.peaks,
         remove_mask,

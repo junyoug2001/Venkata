@@ -155,8 +155,9 @@ def parse_filename(path: str) -> Dict[str, Any]:
     return info
 
 
-def load_table(path: str) -> Union[Tuple[np.ndarray, np.ndarray],
-                                   Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def load_table(path: str) -> Tuple[Union[Tuple[np.ndarray, np.ndarray],
+                                   Tuple[np.ndarray, np.ndarray, np.ndarray]],
+                                   Optional[List[str]]]:
     """
     Load a simple text / table file and return numeric arrays instead of a DataFrame.
 
@@ -164,16 +165,17 @@ def load_table(path: str) -> Union[Tuple[np.ndarray, np.ndarray],
 
     - 1D data (spectra):
         * Assumed to have exactly two numeric columns.
-        * Returns: (x, y)
+        * Returns: ((x, y), header_labels)
           where x is x-axis array (e.g. wavelength or shift),
                 y is intensity array.
+          header_labels is a list of column names if detected, else None.
 
     - 2D data (e.g. angular_matrix_meV.csv):
         * First column: y-axis values (e.g. angle in degrees).
         * Remaining columns: intensity matrix, column-wise.
         * Column labels (except the first) are treated as x-axis values when
           they can be parsed as floats; otherwise, a simple index grid is used.
-        * Returns: (x_axis, y_axis, intensity_matrix)
+        * Returns: ((x_axis, y_axis, intensity_matrix), None)
 
     This function does not try to infer physical units; that is the job of
     the caller (e.g. converting meV → eV → cm^-1).
@@ -199,11 +201,46 @@ def load_table(path: str) -> Union[Tuple[np.ndarray, np.ndarray],
     if ncols < 2:
         raise ValueError(f"File {path} must have at least 2 columns, got {ncols}.")
 
+    labels = None
+
     # 1D: exactly two columns → (x, y)
     if ncols == 2:
+        # Check if current columns are meaningful (not just 0, 1 integers)
+        is_default_cols = False
+        try:
+            # Check if columns are RangeIndex or similar integers
+            if list(df.columns) == [0, 1]:
+                is_default_cols = True
+        except:
+            pass
+
+        if not is_default_cols:
+            # Columns might be headers
+            # Check if they look like strings
+            if all(isinstance(c, str) for c in df.columns) and not str(df.columns[0]).isdigit():
+                labels = list(df.columns)
+        
+        # If columns were default integers (likely header=None), check the first row content
+        if labels is None:
+            # Check if first row is non-numeric
+            first_row_is_numeric = False
+            try:
+                pd.to_numeric(df.iloc[0], errors='raise')
+                first_row_is_numeric = True
+            except ValueError:
+                pass
+            
+            if not first_row_is_numeric:
+                # Promote first row to header
+                labels = df.iloc[0].astype(str).tolist()
+                df = df.iloc[1:]
+                # Convert data to numeric
+                df = df.apply(pd.to_numeric, errors='coerce')
+                df = df.dropna(how='any')
+
         x = df.iloc[:, 0].to_numpy(dtype=float)
         y = df.iloc[:, 1].to_numpy(dtype=float)
-        return x, y
+        return (x, y), labels
 
     # 2D: first column = y-axis, remaining columns = intensity (x-grid in header)
     y_axis = df.iloc[:, 0].to_numpy(dtype=float)
@@ -217,7 +254,7 @@ def load_table(path: str) -> Union[Tuple[np.ndarray, np.ndarray],
 
     intensity = data.to_numpy(dtype=float)
 
-    return x_axis, y_axis, intensity
+    return (x_axis, y_axis, intensity), None
 
 
 def nm_to_wavenumber(nm: np.ndarray) -> np.ndarray:
@@ -307,6 +344,12 @@ class RunViewConfig:
     # Keyed by component name: e.g. "Map", "SliceH", "SliceV", or "A", "B", "C"
     # For now, let's use "A", "B", "C" to match the ViewPanel layout.
     styles: Dict[str, PlotStyle] = field(default_factory=dict)
+    overlay_target: Optional[str] = None  # e.g. "1B", "1C"
+    
+    # Derived run configuration overrides
+    derived_n_points: Optional[int] = None
+    derived_autorange: Optional[bool] = None
+    derived_range: Optional[Tuple[float, float]] = None
 
     def get_style(self, component: str) -> PlotStyle:
         if component not in self.styles:
@@ -317,21 +360,22 @@ class RunViewConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "RunViewConfig":
         styles_raw = data.get("styles", {})
         styles = {k: PlotStyle.from_dict(v) for k, v in styles_raw.items()}
-        return cls(styles=styles)
+        overlay_target = data.get("overlay_target")
+        derived_n_points = data.get("derived_n_points")
+        derived_autorange = data.get("derived_autorange")
+        derived_range = data.get("derived_range")
+        if derived_range: derived_range = tuple(derived_range)
+        
+        return cls(styles=styles, overlay_target=overlay_target,
+                   derived_n_points=derived_n_points,
+                   derived_autorange=derived_autorange,
+                   derived_range=derived_range)
 
 @dataclass
 class Run:
     """
     One Raman dataset.
-
-    A Run may represent:
-    - A single 1D spectrum (shift vs intensity).
-    - A 2D map (e.g. angle × shift) if `intensity_2d` and `angle_values`
-      are populated.
-
-    This class is deliberately generic and independent of any specific
-    CLI workflow. More specialized metadata can be added later via the
-    `metadata` dictionary.
+    ...
     """
 
     # Identity / origin
@@ -369,7 +413,8 @@ class Run:
         Human-friendly name for this run.
 
         The primary storage is metadata["nickname"]. If this key is missing
-        or empty, we fall back to:
+        or empty, we attempt to construct it from metadata in 'sample-pol-unit' order.
+        If that fails, we fall back to:
         - metadata["sample"] if available, otherwise
         - the internal id.
 
@@ -381,14 +426,28 @@ class Run:
         if isinstance(name, str) and name.strip():
             return name.strip()
 
+        # Attempt to construct from sample-pol-unit
         sample = md.get("sample")
+        pol = md.get("pol")
+        # 'unit' might refer to temperature or the energy unit (cm-1/meV)
+        # We try temp_str first, then check if x_unit is in metadata
+        unit = md.get("temp_str") or md.get("raw_x_unit")
+        
+        parts = []
+        if sample: parts.append(str(sample))
+        if pol: parts.append(str(pol))
+        if unit: parts.append(str(unit))
+        
+        if parts:
+            return "_".join(parts)
+
         if isinstance(sample, str) and sample.strip():
             return sample.strip()
 
         return self.id
 
     @nickname.setter
-    def nickname(self, value: str) -> None:
+    def nickname(self, value: Optional[str]) -> None:
         """
         Set the human-friendly nickname for this run.
 
@@ -396,7 +455,11 @@ class Run:
         """
         if not isinstance(self.metadata, dict):
             self.metadata = {}
-        self.metadata["nickname"] = str(value).strip()
+        
+        if value is None:
+            self.metadata["nickname"] = None
+        else:
+            self.metadata["nickname"] = str(value).strip()
 
     # --- convenience ---
 
@@ -415,6 +478,31 @@ class Run:
         if self.intensity is not None:
             return int(self.intensity.size)
         return 0
+    
+    def evaluate(self, x: np.ndarray) -> np.ndarray:
+        """
+        Evaluate the run at given x values.
+        For RUN_1D, this might imply interpolation (not implemented yet).
+        For DERIVED, this evaluates the stored formula.
+        """
+        if self.run_type == RunType.DERIVED:
+            formula = self.metadata.get("formula")
+            params = self.metadata.get("formula_params", {})
+            if formula:
+                # Safe evaluation environment
+                allowed_locals = {"x": x, "np": np}
+                allowed_locals.update(params)
+                try:
+                    return eval(formula, {"__builtins__": {}}, allowed_locals)
+                except Exception as e:
+                    # Fallback or error logging?
+                    # For now return zeros of same shape
+                    print(f"Error evaluating formula '{formula}': {e}")
+                    return np.zeros_like(x)
+        
+        # Fallback for non-derived: return intensity if shapes match?
+        # Interpolation logic would go here.
+        return np.zeros_like(x)
 
     def to_dict_summary(self) -> Dict[str, Any]:
         """
@@ -442,46 +530,27 @@ class Run:
 
     def export_csv(self, base_filepath: Optional[str] = None, output_dir: Optional[str] = None):
         """
-        Export the Run data to two CSV files, one with Raman shift in cm-1
-        and another in meV.
+        Export the Run data to CSV files.
+        For 2D runs: exports two files (cm-1 and meV).
+        For 1D runs: exports one file with the best available X-axis.
 
         If `base_filepath` is provided, it is used. Otherwise, a filename is
         generated from metadata and saved in `output_dir` (if provided) or
         the run's source directory.
         """
-        if not self.is_2d:
-            raise ValueError("Export to CSV is only supported for 2D runs.")
+        if self.is_2d:
+            self._export_csv_2d(base_filepath, output_dir)
+        else:
+            self.export_csv_1d(base_filepath, output_dir)
 
+    def _export_csv_2d(self, base_filepath: Optional[str] = None, output_dir: Optional[str] = None):
+        """
+        Internal helper to export 2D runs (cm-1 and meV matrices).
+        """
         if self.shift_cm1 is None or self.angle_values is None or self.intensity_2d is None:
-            raise ValueError("Run is missing data for CSV export.")
+            raise ValueError("Run is missing data for 2D CSV export.")
 
-        if base_filepath is None:
-            # Determine the directory to save in
-            if output_dir:
-                save_dir = output_dir
-            else:
-                save_dir = os.path.dirname(self.source_path) if self.source_path else '.'
-            
-            # Rebuild filename from individual metadata components
-            parts = []
-            for key in ["category", "sample", "inttime", "grating", "slit", "cm_val", "laser_nm_str", "power", "pol", "temp_str"]:
-                val = self.metadata.get(key)
-                if val:
-                    parts.append(str(val))
-            
-            if self.metadata.get("has_angular"):
-                parts.append("angular_matrix")
-            
-            tail = self.metadata.get("tail")
-            if tail and not self.metadata.get("has_angular"):
-                parts.append(str(tail))
-
-            base_name = "_".join(parts)
-            
-            if 'merged_files' in self.metadata:
-                base_name += "_merged"
-            
-            base_filepath = os.path.join(save_dir, base_name)
+        base_filepath = self._resolve_export_path(base_filepath, output_dir)
 
         # --- cm-1 export ---
         df_cm1 = pd.DataFrame(
@@ -512,6 +581,95 @@ class Run:
             
             mev_path = f"{base}_meV{ext}"
             df_mev.to_csv(mev_path)
+
+    def export_csv_1d(self, base_filepath: Optional[str] = None, output_dir: Optional[str] = None):
+        """
+        Export 1D Run data to a CSV file with a header.
+        """
+        if self.intensity is None:
+            # Maybe it's a derived run that needs evaluation?
+            # For now, if no intensity array, we can't export static CSV easily unless we evaluate it.
+            # But derived runs often don't have stored intensity.
+            # If it's derived, we might need to generate x values.
+            if self.run_type == RunType.DERIVED:
+                # Generate dummy X or use default range
+                x_range = self.metadata.get("default_range", (0, 100))
+                n_points = self.metadata.get("default_n_points", 100)
+                x = np.linspace(x_range[0], x_range[1], n_points)
+                y = self.evaluate(x)
+                x_label = "x"
+                y_label = "y"
+            else:
+                raise ValueError("Run is missing intensity data for 1D CSV export.")
+        else:
+            y = self.intensity
+            y_label = "Intensity"
+            
+            if self.shift_cm1 is not None and len(self.shift_cm1) == len(y):
+                x = self.shift_cm1
+                x_label = "Raman Shift (cm-1)"
+            elif self.wl_nm is not None and len(self.wl_nm) == len(y):
+                x = self.wl_nm
+                x_label = "Wavelength (nm)"
+            elif self.energy_eV is not None and len(self.energy_eV) == len(y):
+                x = self.energy_eV
+                x_label = "Energy (eV)"
+            elif self.angle_values is not None and len(self.angle_values) == len(y):
+                x = self.angle_values
+                x_label = "Angle (deg)"
+            else:
+                x = np.arange(len(y))
+                x_label = "Index"
+
+        base_filepath = self._resolve_export_path(base_filepath, output_dir)
+        
+        df = pd.DataFrame({x_label: x, y_label: y})
+        df.to_csv(base_filepath, index=False)
+
+    def _resolve_export_path(self, base_filepath: Optional[str], output_dir: Optional[str]) -> str:
+        """Helper to determine the output filename/path."""
+        if base_filepath:
+            return base_filepath
+            
+        # Determine the directory to save in
+        if output_dir:
+            save_dir = output_dir
+        else:
+            save_dir = os.path.dirname(self.source_path) if self.source_path else '.'
+        
+        # Rebuild filename from individual metadata components
+        parts = []
+        # Use nickname if available and safe, or construct from metadata
+        if self.metadata.get("nickname"):
+             # Sanitize nickname for filename
+             safe_nick = "".join([c for c in self.metadata["nickname"] if c.isalnum() or c in (' ', '-', '_')]).strip()
+             parts.append(safe_nick.replace(" ", "_"))
+        else:
+            for key in ["category", "sample", "inttime", "grating", "slit", "cm_val", "laser_nm_str", "power", "pol", "temp_str"]:
+                val = self.metadata.get(key)
+                if val:
+                    parts.append(str(val))
+            
+            if self.metadata.get("has_angular"):
+                parts.append("angular_matrix")
+            
+            tail = self.metadata.get("tail")
+            if tail and not self.metadata.get("has_angular"):
+                parts.append(str(tail))
+
+        base_name = "_".join(parts)
+        if not base_name:
+            base_name = f"Run_{self.id}"
+        
+        if 'merged_files' in self.metadata:
+            base_name += "_merged"
+        
+        # Ensure it ends with .csv if no extension provided in the end
+        if not base_name.lower().endswith(".csv"):
+            base_name += ".csv"
+            
+        return os.path.join(save_dir, base_name)
+
 
     def reload_data(self) -> None:
         """
@@ -544,6 +702,93 @@ class Run:
     # --- construction helpers ---
 
     @classmethod
+    def from_formula(cls, formula: str, params: Dict[str, float] = None, 
+                     n_points: int = 100, x_range: Tuple[float, float] = (0, 100),
+                     autorange: bool = False,
+                     nickname: str = "Formula Run") -> "Run":
+        """
+        Create a Derived Run defined by a formula.
+        """
+        metadata = {
+            "nickname": nickname,
+            "raw_dim": "1d",
+            "derived": True,
+            "formula": formula,
+            "formula_params": params or {},
+            "default_n_points": n_points,
+            "default_autorange": autorange,
+            "default_range": x_range
+        }
+        
+        return cls(
+            id=new_run_id(prefix="derived"),
+            source_path="",
+            source_mtime=None,
+            intensity=None, # Calculated on fly
+            intensity_2d=None,
+            angle_values=None,
+            intensity_unit="au",
+            angle_unit="deg",
+            metadata=metadata,
+            run_type=RunType.DERIVED,
+            raw_table=None,
+        )
+
+    @classmethod
+    def from_arrays(cls, x: np.ndarray, y: np.ndarray, x_label: str = "x", y_label: str = "y", nickname: str = "Derived Run") -> "Run":
+        """
+        Create a 1D Run from x and y arrays.
+        Useful for creating derived runs (e.g. slices).
+        """
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        
+        metadata = {
+            "nickname": nickname,
+            "raw_dim": "1d",
+            "raw_x_unit": x_label,
+            "raw_y_unit": y_label,
+        }
+
+        # Try to infer if x is shift_cm1, energy_eV, or something else based on label?
+        # For now, let's store it generic, but if x_label suggests shift/eV, populate those fields.
+        
+        shift_cm1 = None
+        energy_eV = None
+        wl_nm = None
+        angle_values = None
+        
+        # Simple heuristic mapping
+        if "cm" in x_label and "-1" in x_label:
+            shift_cm1 = x
+        elif "eV" in x_label:
+            energy_eV = x
+        elif "nm" in x_label:
+            wl_nm = x
+        elif "Angle" in x_label or "deg" in x_label:
+            angle_values = x
+        else:
+            # Default fallback for generic data
+            shift_cm1 = x
+            
+        return cls(
+            id=new_run_id(prefix="derived"),
+            source_path="", # No source file
+            source_mtime=None,
+            wl_nm=wl_nm,
+            shift_cm1=shift_cm1,
+            energy_eV=energy_eV,
+            intensity=y,
+            intensity_2d=None,
+            angle_values=angle_values,
+            intensity_unit=infer_intensity_unit(y),
+            angle_unit="deg",
+            metadata=metadata,
+            run_type=RunType.RUN_1D,
+            raw_table=None,
+        )
+
+    @classmethod
     def from_file(cls, path: str) -> "Run":
         """
         Build a Run from a data file using load_table and parse_filename.
@@ -560,7 +805,7 @@ class Run:
             * Only stores raw x and intensity in metadata for now; detailed
               axis semantics will be handled later in the analysis layer.
         """
-        arrays = load_table(path)
+        arrays, header_labels = load_table(path)
         info = parse_filename(path)
         metadata = dict(info)
 
@@ -578,17 +823,81 @@ class Run:
             metadata.setdefault("raw_dim", "1d")
             metadata.setdefault("raw_x_unit", "unknown")
             metadata.setdefault("raw_y_unit", "intensity")
+            
+            # Infer axes from header if available
+            shift_cm1 = None
+            angle_values = None
+            energy_eV = None
+            wl_nm = None
+            
+            # Default to shift_cm1 if no better match found
+            default_x = x
+            
+            # 1. Check filename for explicit units first (Priority)
+            fname_lower = os.path.basename(path).lower()
+            found_in_fname = False
+            
+            if "cm-1" in fname_lower or "cm1" in fname_lower:
+                shift_cm1 = x
+                energy_eV = shift_to_eV(shift_cm1)
+                metadata["raw_x_unit"] = "cm-1"
+                found_in_fname = True
+                default_x = None
+            elif "mev" in fname_lower:
+                energy_eV = x / 1000.0
+                shift_cm1 = energy_eV / EV_PER_CM1
+                metadata["raw_x_unit"] = "meV"
+                found_in_fname = True
+                default_x = None
+            # Basic check for 'eV' but avoid matching 'level' etc if possible. 
+            # Assuming '_ev' or 'ev.' or ' ev' pattern or just presence if user says so.
+            elif "ev" in fname_lower and "level" not in fname_lower and "dev" not in fname_lower: 
+                energy_eV = x
+                shift_cm1 = energy_eV / EV_PER_CM1
+                metadata["raw_x_unit"] = "eV"
+                found_in_fname = True
+                default_x = None
+            elif "nm" in fname_lower and "wl" in fname_lower: # explicit wavelength hint
+                wl_nm = x
+                metadata["raw_x_unit"] = "nm"
+                found_in_fname = True
+                default_x = None
+
+            # 2. If not found in filename, check headers
+            if not found_in_fname and header_labels and len(header_labels) > 0:
+                x_label = str(header_labels[0]).lower()
+                metadata["raw_x_unit"] = str(header_labels[0]) # store original label
+                
+                if any(k in x_label for k in ["angle", "deg", "theta"]):
+                    angle_values = x
+                    default_x = None 
+                elif any(k in x_label for k in ["ev", "energy"]):
+                    energy_eV = x
+                    # attempt auto-conversion
+                    shift_cm1 = energy_eV / EV_PER_CM1
+                    default_x = None
+                elif any(k in x_label for k in ["nm", "wave"]):
+                    wl_nm = x
+                    default_x = None
+                elif any(k in x_label for k in ["cm-1", "raman", "shift", "wavenumber"]):
+                    shift_cm1 = x
+                    energy_eV = shift_to_eV(shift_cm1)
+                    default_x = None
+            
+            if default_x is not None:
+                shift_cm1 = default_x
+                energy_eV = shift_to_eV(shift_cm1)
 
             return cls(
                 id=new_run_id(),
                 source_path=os.path.abspath(path),
                 source_mtime=mtime,
-                wl_nm=None,
-                shift_cm1=None,
-                energy_eV=None,
+                wl_nm=wl_nm,
+                shift_cm1=shift_cm1,
+                energy_eV=energy_eV,
                 intensity=y,
                 intensity_2d=None,
-                angle_values=None,
+                angle_values=angle_values,
                 intensity_unit=infer_intensity_unit(y),
                 angle_unit="deg",
                 metadata=metadata,
@@ -603,12 +912,26 @@ class Run:
             y_axis = np.asarray(y_axis, dtype=float)
             intensity = np.asarray(intensity, dtype=float)
 
-            # Interpret x_raw as meV for now
-            energies_eV = x_raw / 1000.0
-            shift_cm1 = energies_eV / EV_PER_CM1
+            # Check filename for units
+            fname_lower = os.path.basename(path).lower()
+            
+            if "cm-1" in fname_lower or "cm1" in fname_lower:
+                # Treat as Raman shift (cm^-1)
+                shift_cm1 = x_raw
+                energies_eV = shift_to_eV(shift_cm1)
+                metadata.setdefault("raw_x_unit", "cm-1")
+            elif "mev" in fname_lower:
+                # Treat as meV
+                energies_eV = x_raw / 1000.0
+                shift_cm1 = energies_eV / EV_PER_CM1
+                metadata.setdefault("raw_x_unit", "meV")
+            else:
+                # Default fallback (legacy behavior assumed meV)
+                energies_eV = x_raw / 1000.0
+                shift_cm1 = energies_eV / EV_PER_CM1
+                metadata.setdefault("raw_x_unit", "meV")
 
             metadata.setdefault("raw_dim", "2d")
-            metadata.setdefault("raw_x_unit", "meV")
             metadata.setdefault("raw_y_unit", "deg")
 
             return cls(
@@ -653,6 +976,13 @@ class ViewState:
     x_axis: str = "shift_cm1"   # "shift_cm1" or "energy_eV"
     normalize: bool = False
     show_legend: bool = False
+    
+    # Persisted plot settings
+    xlim: Optional[Tuple[float, float]] = None
+    ylim: Optional[Tuple[float, float]] = None
+    vmin: float = 0.0
+    vmax: float = 100.0
+    cmap: str = "OrRd"
 
     # Curve-fit placeholders (to be filled by analysis / GUI)
     active_fit_id: Optional[str] = None
@@ -829,6 +1159,7 @@ class ExperimentSet:
                 rg.attrs["source_mtime"] = r.source_mtime if r.source_mtime is not None else 0.0
                 rg.attrs["intensity_unit"] = r.intensity_unit
                 rg.attrs["angle_unit"] = r.angle_unit
+                rg.attrs["run_type"] = r.run_type.value
                 rg.attrs["metadata_json"] = json.dumps(r.metadata, ensure_ascii=False)
 
                 # Numeric arrays
@@ -891,12 +1222,22 @@ class ExperimentSet:
                     angle_unit = rg.attrs.get("angle_unit", "deg")
                     if isinstance(angle_unit, bytes):
                         angle_unit = angle_unit.decode("utf-8")
+                    
+                    run_type_str = rg.attrs.get("run_type", RunType.OTHER.value)
+                    if isinstance(run_type_str, bytes):
+                        run_type_str = run_type_str.decode("utf-8")
+                    try:
+                        run_type = RunType(run_type_str)
+                    except ValueError:
+                        run_type = RunType.OTHER
                         
                     run_md = json.loads(rg.attrs["metadata_json"])
 
                     # Arrays (helper)
                     def read_ds(name):
                         return rg[name][:] if name in rg else None
+                    
+                    intensity_2d = read_ds("intensity_2d")
 
                     r = Run(
                         id=rid,
@@ -906,13 +1247,24 @@ class ExperimentSet:
                         shift_cm1=read_ds("shift_cm1"),
                         energy_eV=read_ds("energy_eV"),
                         intensity=read_ds("intensity"),
-                        intensity_2d=read_ds("intensity_2d"),
+                        intensity_2d=intensity_2d,
                         angle_values=read_ds("angle_values"),
                         intensity_unit=intensity_unit,
                         angle_unit=angle_unit,
                         metadata=run_md,
+                        run_type=run_type,
                         raw_table=None, 
                     )
+                    
+                    # Infer run_type for legacy files
+                    if r.run_type == RunType.OTHER:
+                        if r.metadata.get("derived"):
+                            r.run_type = RunType.DERIVED
+                        elif r.intensity_2d is not None:
+                            r.run_type = RunType.RUN_2D
+                        else:
+                            r.run_type = RunType.RUN_1D
+                            
                     runs[rid] = r
 
             # Views

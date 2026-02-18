@@ -26,6 +26,7 @@ from data_structure import (
     parse_filename,
 )
 from plotting import RamanPlotter2d, SlicePlotter
+from config_manager import config
 
 
 class MergeRunsToolbar(NavigationToolbar):
@@ -159,7 +160,8 @@ class MergeRunsDialog(wx.Dialog):
 
         # Dark value
         row_dark = wx.BoxSizer(wx.HORIZONTAL)
-        self.txt_dark_value = wx.TextCtrl(ctrl_panel, value="600", size=(80, -1))
+        dark_val = config.get("dark_value", 600.0)
+        self.txt_dark_value = wx.TextCtrl(ctrl_panel, value=str(dark_val), size=(80, -1))
         row_dark.Add(wx.StaticText(ctrl_panel, label="Dark value"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
         row_dark.Add(self.txt_dark_value, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
         box_opt.Add(row_dark, 0, wx.ALL, 2)
@@ -343,6 +345,12 @@ class MergeRunsDialog(wx.Dialog):
         self._render_raw_from_discover(self._disc_active)
 
     def _on_dark_value_change(self, event) -> None:
+        try:
+            val = float(self.txt_dark_value.GetValue())
+            config.set("dark_value", val)
+        except ValueError:
+            pass
+
         if not self._in_preview_mode:
             self._render_raw_from_discover(self._disc_active)
 
@@ -490,7 +498,19 @@ class MergeRunsDialog(wx.Dialog):
             metadata["merge_unique_xxxx"] = self._disc.unique_xxxx
             metadata["merge_unique_yyyy"] = self._disc.unique_yyyy
             metadata["merged_files"] = self._disc.files
-            metadata["nickname"] = None
+            
+            # Set nickname based on sample and pol
+            sample = metadata.get("sample")
+            pol = metadata.get("pol")
+            if sample and pol:
+                metadata["nickname"] = f"{sample} {pol}"
+            else:
+                metadata["nickname"] = None
+
+        if self.chk_raman_x_axis.GetValue():
+            metadata["raw_x_unit"] = "cm-1" if self.rad_raman_unit_cm1.GetValue() else "meV"
+        else:
+            metadata["raw_x_unit"] = "nm"
 
         intensity_unit = "au" 
         if self._disc and self._disc.raw_intensity_matrix is not None:
@@ -531,13 +551,9 @@ class MergeRunsDialog(wx.Dialog):
         self._secax_ev = None
         self._laser_vline = None
 
-        x_centers = np.asarray(disc.wavelength_nm, dtype=float)
-        y_centers = np.asarray(disc.angle_values, dtype=float)
-        I_display = getattr(disc, "cosmic_matrix", None)
-        if I_display is None:
-            I_display = getattr(disc, "primitive_matrix", None)
-            if I_display is None:
-                I_display = disc.intensity_matrix
+        self._x = np.asarray(disc.wavelength_nm, dtype=float)
+        self._y = np.asarray(disc.angle_values, dtype=float)
+        self._I = np.asarray(disc.intensity_matrix, dtype=float)
 
         try:
             dark_value = float(self.txt_dark_value.GetValue())
@@ -545,13 +561,9 @@ class MergeRunsDialog(wx.Dialog):
             dark_value = 0.0
 
         if dark_value != 0.0:
-            I_display = np.asarray(I_display, dtype=float).copy()
-            I_display -= dark_value
-            I_display[I_display < 0] = 0
-
-        self._x = x_centers
-        self._y = y_centers
-        self._I = np.asarray(I_display, dtype=float)
+            self._I = self._I.copy()
+            self._I -= dark_value
+            self._I[self._I < 0] = 0
 
         if self._I.ndim != 2:
             self._show_message("Invalid matrix shape from discover stage.")
@@ -770,6 +782,7 @@ class MergeRunsDialog(wx.Dialog):
             return
         if self.btn_cosmic_revert.IsEnabled():
             self._on_cosmic_revert(None)
+            disc = self._disc_active
 
         try:
             dark_value = float(self.txt_dark_value.GetValue())
@@ -804,6 +817,14 @@ class MergeRunsDialog(wx.Dialog):
             self._show_message(f"Cosmic discover failed: {e}")
             return
         
+        # Check for shape mismatch
+        ny, nx = cosmic_result.intensity_matrix.shape
+        ly = len(cosmic_result.angle_values)
+        lx = len(cosmic_result.wavelength_nm)
+        if ny != ly or nx != lx:
+            self._show_message(f"Shape Mismatch: Data ({ny}, {nx}) vs Axes")
+            return
+        
         if not cosmic_result.peaks:
             self._show_message(f"No cosmic peaks detected.\nEvidence: {cosmic_result.evidence}")
             return
@@ -817,6 +838,7 @@ class MergeRunsDialog(wx.Dialog):
             res = dlg.ShowModal()
             if res != wx.ID_OK:
                 return
+            cosmic_result = dlg.get_cosmic_result()
             remove_mask = dlg.get_remove_mask()
             self._contrast_percent = dlg.get_contrast_percent()
         finally:
