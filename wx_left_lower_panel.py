@@ -23,6 +23,13 @@ from data_structure import (
     RunType
 )
 from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
+from config_manager import config
+
+try:
+    import cmcrameri.cm
+    HAS_CMCRAMERI = True
+except ImportError:
+    HAS_CMCRAMERI = False
 
 if TYPE_CHECKING:
     from wx_right_panel import ViewPanel
@@ -48,15 +55,601 @@ class PreviewPanel(wx.Panel):
         self.preview.SetValue(text)
 
 
+import re
+try:
+    from scipy.optimize import curve_fit
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
 class CurveFitPanel(wx.Panel):
     """
-    Curve Fit tab: placeholder for future curve-fitting controls.
+    Curve Fit tab: 1D curve fitting implementation.
     """
 
-    def __init__(self, parent):
+    def __init__(self, parent, on_run_created=None):
         super().__init__(parent)
-        # For now just an empty white panel (like "no active curve" state)
-        self.SetBackgroundColour(wx.Colour(255, 255, 255))
+        self.on_run_created = on_run_created
+        
+        self.data_x = None
+        self.data_y = None
+        self.data_y_2d = None # For batch fitting
+        self.source_run: Optional[Run] = None
+        self.plot_type = "" # "B" or "C" or "A" (for batch)
+        self.fit_result_curve = None # x, y of fit
+        self.current_model = "Lorentzian"
+        
+        # UI Layout
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # 1. Top Toolbar / Info
+        self.info_label = wx.StaticText(self, label="No data selected (Right-click trace -> Curve Fit)")
+        main_sizer.Add(self.info_label, 0, wx.ALL, 5)
+        
+        # 2. Plot Area
+        self.figure = Figure(figsize=(4, 3), dpi=100)
+        self.canvas = FigureCanvas(self, -1, self.figure)
+        self.ax = self.figure.add_subplot(111)
+        self.figure.tight_layout()
+        main_sizer.Add(self.canvas, 1, wx.EXPAND | wx.ALL, 2)
+        
+        # 3. Controls
+        controls_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Model Selection
+        model_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        model_sizer.Add(wx.StaticText(self, label="Model:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.choice_model = wx.Choice(self, choices=["Lorentzian", "Sum of Lorentzian", "User Defined"])
+        self.choice_model.SetSelection(0)
+        model_sizer.Add(self.choice_model, 0, wx.RIGHT, 10)
+        
+        # N Peaks (for Sum)
+        self.lbl_peaks = wx.StaticText(self, label="N Peaks:")
+        self.spin_peaks = wx.SpinCtrl(self, value="2", min=1, max=10)
+        model_sizer.Add(self.lbl_peaks, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        model_sizer.Add(self.spin_peaks, 0, wx.RIGHT, 10)
+        
+        # User Formula (for User Defined)
+        self.lbl_formula = wx.StaticText(self, label="f(x)=")
+        self.txt_formula = wx.TextCtrl(self, value="a*x + b")
+        self.btn_parse = wx.Button(self, label="Parse", size=(50, -1))
+        model_sizer.Add(self.lbl_formula, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        model_sizer.Add(self.txt_formula, 1, wx.EXPAND | wx.RIGHT, 5)
+        model_sizer.Add(self.btn_parse, 0)
+        
+        controls_sizer.Add(model_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Parameter Grid (Scrolled)
+        self.scrolled = wx.ScrolledWindow(self, style=wx.VSCROLL)
+        self.scrolled.SetScrollRate(0, 10)
+        self.param_sizer = wx.FlexGridSizer(cols=5, vgap=5, hgap=5)
+        self.param_sizer.AddGrowableCol(1, 1)
+        self.scrolled.SetSizer(self.param_sizer)
+        
+        controls_sizer.Add(self.scrolled, 1, wx.EXPAND | wx.ALL, 5)
+        
+        # Fit Range & Buttons
+        action_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        action_sizer.Add(wx.StaticText(self, label="Range:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.txt_min = wx.TextCtrl(self, size=(50, -1))
+        self.txt_max = wx.TextCtrl(self, size=(50, -1))
+        action_sizer.Add(self.txt_min, 0, wx.RIGHT, 5)
+        action_sizer.Add(self.txt_max, 0, wx.RIGHT, 10)
+        
+        self.btn_fit = wx.Button(self, label="Fit")
+        self.btn_create = wx.Button(self, label="Create Curve")
+        self.btn_create.Disable()
+        
+        self.btn_batch = wx.Button(self, label="Batch Fit (All Rows)")
+        self.btn_batch.Disable()
+        self.btn_batch.Hide()
+        
+        action_sizer.Add(self.btn_fit, 0, wx.RIGHT, 5)
+        action_sizer.Add(self.btn_create, 0, wx.RIGHT, 5)
+        action_sizer.Add(self.btn_batch, 0)
+        
+        controls_sizer.Add(action_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        
+        main_sizer.Add(controls_sizer, 1, wx.EXPAND)
+        self.SetSizer(main_sizer)
+        
+        # Bindings
+        self.choice_model.Bind(wx.EVT_CHOICE, self.on_model_change)
+        self.spin_peaks.Bind(wx.EVT_SPINCTRL, self.on_model_change)
+        self.btn_parse.Bind(wx.EVT_BUTTON, self.on_model_change)
+        self.btn_fit.Bind(wx.EVT_BUTTON, self.on_fit)
+        self.btn_create.Bind(wx.EVT_BUTTON, self.on_create_curve)
+        self.btn_batch.Bind(wx.EVT_BUTTON, self.on_batch_fit)
+        
+        # Init UI state
+        self.param_controls = {} # name -> dict with 'value', 'fixed', 'min', 'max'
+        self.on_model_change(None)
+
+    def set_data(self, run: Run, plot_type: str, x_data: np.ndarray, y_data: np.ndarray):
+        self.source_run = run
+        self.plot_type = plot_type
+        self.data_x = x_data
+        
+        # Check for 2D data (Batch Mode)
+        if y_data.ndim == 2:
+            self.data_y_2d = y_data
+            # Select middle row for preview
+            mid_idx = y_data.shape[0] // 2
+            self.data_y = y_data[mid_idx, :]
+            
+            self.btn_batch.Show()
+            self.btn_batch.Enable()
+            self.info_label.SetLabel(f"Fitting: {run.nickname} (2D Batch Mode - Preview Row {mid_idx})")
+        else:
+            self.data_y = y_data
+            self.data_y_2d = None
+            self.btn_batch.Hide()
+            self.info_label.SetLabel(f"Fitting: {run.nickname} ({plot_type})")
+            
+        self.fit_result_curve = None
+        self.btn_create.Disable()
+        self.Layout()
+        
+        # Reset range defaults
+        if len(x_data) > 0:
+            self.txt_min.SetValue(f"{np.min(x_data):.2f}")
+            self.txt_max.SetValue(f"{np.max(x_data):.2f}")
+        
+        # Initial guess for parameters (Auto-guess)
+        self._auto_guess_params()
+        
+        self._plot_data()
+
+    def _auto_guess_params(self):
+        # Basic heuristics
+        if self.data_x is None or len(self.data_x) == 0: return
+        
+        y_min = np.min(self.data_y)
+        y_max = np.max(self.data_y)
+        x_at_max = self.data_x[np.argmax(self.data_y)]
+        amp = y_max - y_min
+        
+        model = self.choice_model.GetStringSelection()
+        
+        if model == "Lorentzian":
+            if "y0" in self.param_controls: self.param_controls["y0"]["value"].SetValue(f"{y_min:.2f}")
+            if "x0" in self.param_controls: self.param_controls["x0"]["value"].SetValue(f"{x_at_max:.2f}")
+            if "A" in self.param_controls: self.param_controls["A"]["value"].SetValue(f"{amp:.2f}")
+            if "Gamma" in self.param_controls: self.param_controls["Gamma"]["value"].SetValue("5.0")
+            
+        elif model == "Sum of Lorentzian":
+            # Just repeat same guess for all peaks for now (stacked)
+            n = self.spin_peaks.GetValue()
+            for i in range(1, n+1):
+                if f"y0_{i}" in self.param_controls: self.param_controls[f"y0_{i}"]["value"].SetValue(f"{y_min/n:.2f}")
+                if f"x0_{i}" in self.param_controls: self.param_controls[f"x0_{i}"]["value"].SetValue(f"{x_at_max:.2f}")
+                if f"A_{i}" in self.param_controls: self.param_controls[f"A_{i}"]["value"].SetValue(f"{amp/n:.2f}")
+                if f"Gamma_{i}" in self.param_controls: self.param_controls[f"Gamma_{i}"]["value"].SetValue("5.0")
+
+    def on_model_change(self, event):
+        model = self.choice_model.GetStringSelection()
+        self.current_model = model
+        
+        # Visibility
+        self.lbl_peaks.Show(model == "Sum of Lorentzian")
+        self.spin_peaks.Show(model == "Sum of Lorentzian")
+        self.lbl_formula.Show(model == "User Defined")
+        self.txt_formula.Show(model == "User Defined")
+        self.btn_parse.Show(model == "User Defined")
+        self.Layout()
+        
+        # Rebuild Grid
+        self.param_sizer.Clear(True)
+        self.param_controls = {}
+        
+        params = []
+        if model == "Lorentzian":
+            params = ["y0", "x0", "A", "Gamma"]
+        elif model == "Sum of Lorentzian":
+            n = self.spin_peaks.GetValue()
+            for i in range(1, n+1):
+                params.extend([f"y0_{i}", f"x0_{i}", f"A_{i}", f"Gamma_{i}"])
+        elif model == "User Defined":
+            # Parse formula
+            f_str = self.txt_formula.GetValue()
+            # Extract identifiers (simple regex)
+            tokens = set(re.findall(r"[a-zA-Z_]\w*", f_str))
+            # Exclude math constants/funcs
+            excludes = {"x", "np", "pi", "e", "sin", "cos", "tan", "exp", "log", "sqrt", "abs"}
+            params = sorted(list(tokens - excludes))
+            
+        # Headers
+        self.param_sizer.Add(wx.StaticText(self.scrolled, label="Param"), 0, wx.ALIGN_CENTER)
+        self.param_sizer.Add(wx.StaticText(self.scrolled, label="Value"), 0, wx.ALIGN_CENTER)
+        self.param_sizer.Add(wx.StaticText(self.scrolled, label="Fix"), 0, wx.ALIGN_CENTER)
+        self.param_sizer.Add(wx.StaticText(self.scrolled, label="Min"), 0, wx.ALIGN_CENTER)
+        self.param_sizer.Add(wx.StaticText(self.scrolled, label="Max"), 0, wx.ALIGN_CENTER)
+        
+        for p in params:
+            self.param_sizer.Add(wx.StaticText(self.scrolled, label=f"{p}:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+            val = "1.0"
+            if "y0" in p: val = "0.0"
+            if "x0" in p and self.data_x is not None: val = f"{np.mean(self.data_x):.2f}"
+            
+            txt_val = wx.TextCtrl(self.scrolled, value=val)
+            self.param_sizer.Add(txt_val, 1, wx.EXPAND)
+            
+            chk_fixed = wx.CheckBox(self.scrolled)
+            self.param_sizer.Add(chk_fixed, 0, wx.ALIGN_CENTER)
+            
+            txt_min = wx.TextCtrl(self.scrolled)
+            self.param_sizer.Add(txt_min, 1, wx.EXPAND)
+            
+            txt_max = wx.TextCtrl(self.scrolled)
+            self.param_sizer.Add(txt_max, 1, wx.EXPAND)
+            
+            self.param_controls[p] = {
+                "value": txt_val,
+                "fixed": chk_fixed,
+                "min": txt_min,
+                "max": txt_max
+            }
+            
+        self.scrolled.Layout()
+        self.scrolled.FitInside()
+
+    def _get_param_values(self):
+        vals = {}
+        for p, ctrls in self.param_controls.items():
+            try:
+                vals[p] = float(ctrls["value"].GetValue())
+            except ValueError:
+                vals[p] = 0.0
+        return vals
+
+    def _lorentzian(self, x, y0, x0, A, G):
+        # Using Height form as per prompt: A is height.
+        # Standard: I = I_max * (G^2 / (4(x-x0)^2 + G^2))
+        return y0 + A * (G**2 / (4 * (x - x0)**2 + G**2))
+
+    def _get_fit_func(self, model_name, p_names):
+        if model_name == "Lorentzian":
+            def func(x, y0, x0, A, G):
+                return self._lorentzian(x, y0, x0, A, G)
+            return func
+            
+        elif model_name == "Sum of Lorentzian":
+            n = self.spin_peaks.GetValue()
+            def func(x, *args):
+                y = np.zeros_like(x)
+                for i in range(n):
+                    idx = i * 4
+                    y += self._lorentzian(x, args[idx], args[idx+1], args[idx+2], args[idx+3])
+                return y
+            return func
+            
+        elif model_name == "User Defined":
+            f_str = self.txt_formula.GetValue()
+            def func(x, *args):
+                local_scope = {"x": x, "np": np}
+                for name, val in zip(p_names, args):
+                    local_scope[name] = val
+                return eval(f_str, {"__builtins__": None}, local_scope)
+            return func
+        return None
+
+    def on_fit(self, event):
+        if not HAS_SCIPY:
+            wx.MessageBox("Scipy is not installed.", "Error")
+            return
+        if self.data_x is None: return
+
+        # 1. Get Range Mask
+        try:
+            xmin = float(self.txt_min.GetValue())
+            xmax = float(self.txt_max.GetValue())
+        except ValueError:
+            xmin, xmax = -np.inf, np.inf
+            
+        mask = (self.data_x >= xmin) & (self.data_x <= xmax)
+        x_fit = self.data_x[mask]
+        y_fit = self.data_y[mask]
+        
+        if len(x_fit) < 4:
+            wx.MessageBox("Not enough data points in range.", "Error")
+            return
+
+        # 2. Define Model Function
+        model_name = self.choice_model.GetStringSelection()
+        p_names = list(self.param_controls.keys())
+        
+        p_free_names = []
+        p_free_indices = []
+        p0_free = []
+        bounds_min = []
+        bounds_max = []
+        p_full_current = []
+
+        for i, p in enumerate(p_names):
+            ctrls = self.param_controls[p]
+            try:
+                val = float(ctrls["value"].GetValue())
+            except ValueError:
+                val = 0.0
+            p_full_current.append(val)
+            
+            if ctrls["fixed"].GetValue():
+                continue
+            
+            p_free_names.append(p)
+            p_free_indices.append(i)
+            p0_free.append(val)
+            
+            # Bounds
+            try:
+                v_min = float(ctrls["min"].GetValue())
+            except ValueError:
+                v_min = -np.inf
+            try:
+                v_max = float(ctrls["max"].GetValue())
+            except ValueError:
+                v_max = np.inf
+            bounds_min.append(v_min)
+            bounds_max.append(v_max)
+            
+        if not p_free_names:
+            wx.MessageBox("All parameters are fixed. Nothing to fit.", "Info")
+            return
+            
+        bounds = (bounds_min, bounds_max)
+        fit_func_base = self._get_fit_func(model_name, p_names)
+        
+        def wrapper_func(x, *args):
+            current_args = list(p_full_current)
+            for idx, val in zip(p_free_indices, args):
+                current_args[idx] = val
+            return fit_func_base(x, *current_args)
+
+        # 3. Perform Fit
+        try:
+            popt, pcov = curve_fit(wrapper_func, x_fit, y_fit, p0=p0_free, bounds=bounds)
+            
+            # 4. Update UI
+            for i, val in enumerate(popt):
+                p_name = p_free_names[i]
+                self.param_controls[p_name]["value"].SetValue(f"{val:.4f}")
+                p_full_current[p_free_indices[i]] = val
+            
+            # 5. Plot Result
+            y_model = fit_func_base(self.data_x, *p_full_current)
+            self.fit_result_curve = (self.data_x, y_model)
+            self._plot_data()
+            self.btn_create.Enable()
+            
+        except Exception as e:
+            wx.MessageBox(f"Fit failed: {str(e)}", "Error")
+
+    def on_batch_fit(self, event):
+        if not HAS_SCIPY or self.data_y_2d is None or self.data_x is None: return
+        
+        if not self.on_run_created: return
+
+        # 1. Range Mask
+        try:
+            xmin = float(self.txt_min.GetValue())
+            xmax = float(self.txt_max.GetValue())
+        except ValueError:
+            xmin, xmax = -np.inf, np.inf
+        
+        mask = (self.data_x >= xmin) & (self.data_x <= xmax)
+        x_fit = self.data_x[mask]
+        
+        if len(x_fit) < 4:
+            wx.MessageBox("Not enough data points in range.", "Error")
+            return
+
+        # 2. Model & Initial Guess
+        model_name = self.choice_model.GetStringSelection()
+        p_names = list(self.param_controls.keys())
+        
+        # Prepare wrapping logic (same as on_fit, but re-evaluated per row ideally, 
+        # but here we use the initial UI state to define what is fixed/bounded)
+        
+        p_free_indices = []
+        p_free_names = []
+        p0_free = []
+        bounds_min = []
+        bounds_max = []
+        p_full_current = []
+        
+        for i, p in enumerate(p_names):
+            ctrls = self.param_controls[p]
+            try:
+                val = float(ctrls["value"].GetValue())
+            except ValueError:
+                val = 0.0
+            p_full_current.append(val)
+            
+            if ctrls["fixed"].GetValue():
+                continue
+                
+            p_free_indices.append(i)
+            p_free_names.append(p)
+            p0_free.append(val)
+            
+            try:
+                v_min = float(ctrls["min"].GetValue())
+            except ValueError:
+                v_min = -np.inf
+            try:
+                v_max = float(ctrls["max"].GetValue())
+            except ValueError:
+                v_max = np.inf
+            bounds_min.append(v_min)
+            bounds_max.append(v_max)
+            
+        if not p_free_names:
+            wx.MessageBox("All parameters are fixed.", "Info")
+            return
+            
+        bounds = (bounds_min, bounds_max)
+        fit_func_base = self._get_fit_func(model_name, p_names)
+        
+        def wrapper_func(x, *args):
+            current_args = list(p_full_current)
+            for idx, val in zip(p_free_indices, args):
+                current_args[idx] = val
+            return fit_func_base(x, *current_args)
+        
+        # 3. Iterate
+        n_rows = self.data_y_2d.shape[0]
+        results = np.zeros((n_rows, len(p_names)))
+        
+        # We need to fill fixed values into results
+        for i in range(n_rows):
+            results[i, :] = p_full_current # Initialize with fixed/initial values
+        
+        # We assume rows correspond to angle_values of source_run
+        # Try to get y-axis values (e.g. Angles)
+        y_axis = None
+        if self.source_run and self.source_run.angle_values is not None:
+            if len(self.source_run.angle_values) == n_rows:
+                y_axis = self.source_run.angle_values
+        
+        if y_axis is None:
+            y_axis = np.arange(n_rows) # Fallback indices
+
+        dlg = wx.ProgressDialog("Batch Fitting", "Fitting rows...", maximum=n_rows, parent=self, style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE)
+        
+        p_current_free = list(p0_free)
+        
+        try:
+            for i in range(n_rows):
+                y_row_fit = self.data_y_2d[i, mask]
+                try:
+                    popt, _ = curve_fit(wrapper_func, x_fit, y_row_fit, p0=p_current_free, bounds=bounds)
+                    
+                    # Store results
+                    # Populating full params array for this row
+                    row_res = list(p_full_current) # Start with fixed
+                    for idx, val in zip(p_free_indices, popt):
+                        row_res[idx] = val
+                    results[i, :] = row_res
+                    
+                    p_current_free = popt # Sequential update for next row
+                except:
+                    # Fallback to previous or NaN?
+                    results[i, :] = results[i-1, :] if i > 0 else p_full_current
+                
+                if i % 10 == 0:
+                    dlg.Update(i)
+        finally:
+            dlg.Destroy()
+            
+        # 4. Export Runs
+        # Create a new run for EACH parameter
+        cnt = 0
+        for p_idx, p_name in enumerate(p_names):
+            # p_name e.g. "x0", "Gamma"
+            # Create 1D run: x = Angle, y = Param Value
+            
+            # Param name cleanup
+            clean_p = p_name
+            if model_name == "Sum of Lorentzian":
+                # Maybe nicer name?
+                pass
+            
+            nickname = f"{self.source_run.nickname}_{clean_p}"
+            
+            # y_axis is Angle, results[:, p_idx] is value
+            new_run = Run.from_arrays(
+                y_axis, results[:, p_idx], 
+                x_label="Angle (deg)", 
+                y_label=clean_p, 
+                nickname=nickname
+            )
+            self.on_run_created(new_run)
+            cnt += 1
+            
+        wx.MessageBox(f"Created {cnt} parameter runs.", "Batch Fit Complete")
+
+    def _plot_data(self):
+        self.ax.clear()
+        if self.data_x is not None:
+            self.ax.plot(self.data_x, self.data_y, 'o', markersize=2, alpha=0.5, label='Data')
+            
+        if self.fit_result_curve:
+            self.ax.plot(self.fit_result_curve[0], self.fit_result_curve[1], 'r-', linewidth=1.5, label='Fit')
+            
+        self.ax.legend()
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Intensity")
+        self.canvas.draw()
+
+    def on_create_curve(self, event):
+        if not self.fit_result_curve or not self.source_run: return
+        if not self.on_run_created: return
+        
+        # Construct Formula String with baked values
+        model_name = self.choice_model.GetStringSelection()
+        vals = self._get_param_values()
+        
+        final_formula = ""
+        
+        if model_name == "Lorentzian":
+            # y0 + A * (G**2 / (4 * (x - x0)**2 + G**2))
+            # Use baked values
+            final_formula = f"{vals['y0']} + {vals['A']} * ({vals['Gamma']}**2 / (4 * (x - {vals['x0']})**2 + {vals['Gamma']}**2))"
+            
+        elif model_name == "Sum of Lorentzian":
+            n = self.spin_peaks.GetValue()
+            parts = []
+            for i in range(1, n+1):
+                part = f"{vals[f'y0_{i}']} + {vals[f'A_{i}']} * ({vals[f'Gamma_{i}']}**2 / (4 * (x - {vals[f'x0_{i}']})**2 + {vals[f'Gamma_{i}']}**2))"
+                parts.append(part)
+            final_formula = " + ".join(parts)
+            
+        elif model_name == "User Defined":
+            final_formula = self.txt_formula.GetValue()
+            # Substitute parameters
+            # Sort by length desc to avoid substring replacement collision (e.g. A vs A1)
+            for p in sorted(vals.keys(), key=len, reverse=True):
+                # Simple replace might be dangerous if variable names overlap (e.g. 'a' and 'aa')
+                # Proper tokenization is better, but simple replace is what is asked for "baked".
+                # To be safer, we can put spaces or parens?
+                # Actually, DerivedRun formula logic relies on `eval`. 
+                # If we replace 'a' with '1.0', it's hard to distinguish 'a' in 'tan(a)'.
+                # A better approach: 
+                # We can keep the formula as is, but DerivedRun needs self-contained string.
+                # So we MUST replace.
+                # We'll use regex word boundary.
+                pattern = r"\b" + re.escape(p) + r"\b"
+                final_formula = re.sub(pattern, str(vals[p]), final_formula)
+        
+        # Create Run
+        # We use a special method or just 'from_formula'
+        # The prompt says: "appropriately named derived run should be added... added to view of origin, overlayed..."
+        
+        # Generate new ID and nickname
+        nickname = f"{self.source_run.nickname}_fit"
+        
+        # We need to construct a Derived Run. 
+        # But `Run.from_formula` doesn't exist? Wait, `Run.from_formula` was mentioned in context.
+        # Let's check `data_structure.py`.
+        # Assuming `Run.from_formula(formula, ...)` exists.
+        
+        # Check `data_structure.py` content via memory or assumptions.
+        # The context said "Implemented Run.from_arrays, Run.from_formula".
+        # So I will use it.
+        
+        new_run = Run.from_formula(final_formula, nickname=nickname)
+        
+        # We also want to set default range for the derived run to match the fit range
+        xmin = float(self.txt_min.GetValue())
+        xmax = float(self.txt_max.GetValue())
+        new_run.metadata["default_range"] = (xmin, xmax)
+        new_run.metadata["default_autorange"] = False
+        new_run.metadata["default_n_points"] = 500
+        new_run.metadata["raw_x_unit"] = "cm-1" if self.plot_type == "C" else "deg" # Infer from context
+
+        # Callback to MainFrame to add it and overlay it
+        self.on_run_created(new_run, overlay_target_run=self.source_run, overlay_plot_type=self.plot_type)
 
 
 class PlotConfigPanel(wx.Panel):
@@ -65,7 +658,7 @@ class PlotConfigPanel(wx.Panel):
         
         self._on_reset = on_reset
         
-        self.x_unit = 'cm-1' # Default unit
+        self.x_unit = config.get('unit', 'cm-1')
 
         sizer = wx.BoxSizer(wx.VERTICAL)
         
@@ -77,7 +670,10 @@ class PlotConfigPanel(wx.Panel):
         # Unit radio buttons
         self.rb_cm1 = wx.RadioButton(self, label="cm-1", style=wx.RB_GROUP)
         self.rb_mev = wx.RadioButton(self, label="meV")
-        self.rb_cm1.SetValue(True)
+        if self.x_unit == 'meV':
+            self.rb_mev.SetValue(True)
+        else:
+            self.rb_cm1.SetValue(True)
         unit_sizer = wx.BoxSizer(wx.HORIZONTAL)
         unit_sizer.Add(self.rb_cm1, 0, wx.RIGHT, 5)
         unit_sizer.Add(self.rb_mev, 0)
@@ -111,18 +707,78 @@ class PlotConfigPanel(wx.Panel):
         # Colormap selection
         cmap_sizer = wx.BoxSizer(wx.HORIZONTAL)
         cmap_sizer.Add(wx.StaticText(self, label="Colormap:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        self.choice_cmap = wx.Choice(self, choices=['OrRd', 'plasma', 'inferno', 'magma', 'cividis', 'gray', 'seismic', 'jet', 'hsv'])
-        self.choice_cmap.SetStringSelection('OrRd')
+        
+        self.cmaps_std = ['OrRd', 'rocket_r', 'inferno', 'magma_r', 'cividis', 'gray', 'seismic', 'jet', 'hsv']
+        self.cmaps_cmc = []
+        
+        if HAS_CMCRAMERI:
+            # Adding more continuous Crameri maps for Plot A
+            self.cmaps_cmc = [
+                'cmc.batlow', 'cmc.batlowW', 'cmc.batlowK', 
+                'cmc.glasgow', 'cmc.lipari', 'cmc.navia', 
+                'cmc.grayC', 'cmc.grayC_r',
+                'cmc.roma', 'cmc.roma_r',
+                'cmc.devon', 'cmc.devon_r',
+                'cmc.lajolla', 'cmc.lajolla_r', 
+                'cmc.bamako', 'cmc.bamako_r',
+                'cmc.davos', 'cmc.davos_r',
+                'cmc.bilbao', 'cmc.bilbao_r',
+                'cmc.oslo', 'cmc.oslo_r', 
+                'cmc.acton', 'cmc.acton_r', 
+                'cmc.turku', 'cmc.turku_r',
+                'cmc.tokyo', 'cmc.tokyo_r',
+                'cmc.lapaz', 'cmc.lapaz_r',
+                'cmc.nuuk', 'cmc.nuuk_r',
+                'cmc.imola', 'cmc.imola_r',
+                'cmc.berlin', 'cmc.berlin_r',
+                'cmc.lisbon', 'cmc.lisbon_r',
+                'cmc.broc', 'cmc.broc_r',
+                'cmc.cork', 'cmc.cork_r',
+                'cmc.vik', 'cmc.vik_r',
+                'cmc.buda', 'cmc.buda_r',
+            ]
+        
+        # Category Choice
+        cat_choices = ['Standard']
+        if self.cmaps_cmc:
+            cat_choices.append('CMCrameri')
+        self.choice_cat = wx.Choice(self, choices=cat_choices)
+        
+        # Map Choice
+        self.choice_cmap = wx.Choice(self) # Create empty, will be populated below
+
+        # Load saved colormap and populate choices
+        saved_cmap = config.get('colormap', 'OrRd')
+        if saved_cmap.startswith('cmc.') and self.cmaps_cmc:
+            self.choice_cat.SetStringSelection('CMCrameri')
+            self.choice_cmap.Set(self.cmaps_cmc)
+        else:
+            self.choice_cat.SetStringSelection('Standard')
+            self.choice_cmap.Set(self.cmaps_std)
+            
+        self.choice_cmap.SetStringSelection(saved_cmap)
+        if self.choice_cmap.GetSelection() == wx.NOT_FOUND and self.choice_cmap.GetCount() > 0:
+            self.choice_cmap.SetSelection(0)
+
+        cmap_sizer.Add(self.choice_cat, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
         cmap_sizer.Add(self.choice_cmap, 1, wx.EXPAND)
+        
         sizer.Add(cmap_sizer, 0, wx.EXPAND | wx.ALL, 5)
         
         # Contrast controls
-        sizer.Add(wx.StaticText(self, label="Contrast (percentiles)"), 0, wx.LEFT | wx.TOP, 5)
+        sizer.Add(wx.StaticText(self, label="Contrast"), 0, wx.LEFT | wx.TOP, 5)
         
+        # Header for Percentile vs Value
+        header_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        header_sizer.Add(wx.StaticText(self, label=""), 0, wx.RIGHT, 35) # spacing for 'min:' label
+        header_sizer.Add(wx.StaticText(self, label="Percentile (%)"), 1, wx.ALIGN_CENTER)
+        header_sizer.Add(wx.StaticText(self, label="Value (a.u.)"), 0, wx.ALIGN_CENTER | wx.LEFT, 10)
+        sizer.Add(header_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+
         vmin_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.vmin_label = wx.StaticText(self, label="min:")
         self.vmin_slider = wx.Slider(self, value=0, minValue=0, maxValue=100)
-        self.txt_vmin = wx.TextCtrl(self, value="0", size=(40, -1), style=wx.TE_PROCESS_ENTER)
+        self.txt_vmin = wx.TextCtrl(self, value="0", size=(60, -1), style=wx.TE_PROCESS_ENTER)
         
         vmin_sizer.Add(self.vmin_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         vmin_sizer.Add(self.vmin_slider, 1, wx.EXPAND | wx.RIGHT, 5)
@@ -132,16 +788,22 @@ class PlotConfigPanel(wx.Panel):
         vmax_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.vmax_label = wx.StaticText(self, label="max:")
         self.vmax_slider = wx.Slider(self, value=100, minValue=0, maxValue=100)
-        self.txt_vmax = wx.TextCtrl(self, value="100", size=(40, -1), style=wx.TE_PROCESS_ENTER)
+        self.txt_vmax = wx.TextCtrl(self, value="100", size=(60, -1), style=wx.TE_PROCESS_ENTER)
         
         vmax_sizer.Add(self.vmax_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         vmax_sizer.Add(self.vmax_slider, 1, wx.EXPAND | wx.RIGHT, 5)
         vmax_sizer.Add(self.txt_vmax, 0, wx.ALIGN_CENTER_VERTICAL)
         sizer.Add(vmax_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
 
-        # Reset button
+        # Action buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.reset_button = wx.Button(self, label="Reset Plot")
-        sizer.Add(self.reset_button, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+        self.btn_roi_vlim = wx.Button(self, label="Adjust color to this ROI")
+        
+        btn_sizer.Add(self.reset_button, 0, wx.ALL, 5)
+        btn_sizer.Add(self.btn_roi_vlim, 0, wx.ALL, 5)
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER)
 
         self.SetSizer(sizer)
 
@@ -158,8 +820,10 @@ class PlotConfigPanel(wx.Panel):
         self.txt_vmin.Bind(wx.EVT_TEXT_ENTER, self.on_vlim_text_enter)
         self.txt_vmax.Bind(wx.EVT_TEXT_ENTER, self.on_vlim_text_enter)
         
+        self.choice_cat.Bind(wx.EVT_CHOICE, self.on_cat_change)
         self.choice_cmap.Bind(wx.EVT_CHOICE, self.on_cmap_change)
         self.reset_button.Bind(wx.EVT_BUTTON, self.on_reset_button)
+        self.btn_roi_vlim.Bind(wx.EVT_BUTTON, self.on_roi_vlim_button)
 
         self.target_view: Optional["ViewPanel"] = None
         self.set_target_view(None)
@@ -168,16 +832,16 @@ class PlotConfigPanel(wx.Panel):
         self.target_view = view_panel
         if self.target_view is None:
             for widget in [self.rb_cm1, self.rb_mev, self.x_min_text, self.x_max_text,
-                           self.y_min_text, self.y_max_text, self.choice_cmap,
+                           self.y_min_text, self.y_max_text, self.choice_cat, self.choice_cmap,
                            self.vmin_slider, self.txt_vmin, self.vmax_slider, self.txt_vmax,
-                           self.reset_button]:
+                           self.reset_button, self.btn_roi_vlim]:
                 widget.Disable()
             return
 
         for widget in [self.rb_cm1, self.rb_mev, self.x_min_text, self.x_max_text,
-                       self.y_min_text, self.y_max_text, self.choice_cmap,
+                       self.y_min_text, self.y_max_text, self.choice_cat, self.choice_cmap,
                        self.vmin_slider, self.txt_vmin, self.vmax_slider, self.txt_vmax,
-                       self.reset_button]:
+                       self.reset_button, self.btn_roi_vlim]:
             widget.Enable()
 
         config = self.target_view.get_plot_config()
@@ -198,9 +862,31 @@ class PlotConfigPanel(wx.Panel):
         vmax_p = config.get('vmax_p', 100)
         self.set_vlim_range(vmin_p, vmax_p)
         
+        # Sync Absolute Contrast Values
+        v_abs = self.target_view.get_absolute_vlim_for_percentiles(vmin_p, vmax_p)
+        self.update_absolute_vlim_display(v_abs[0], v_abs[1])
+        
         # Sync Colormap
         cmap = config.get('cmap', 'OrRd')
         self.set_colormap(cmap)
+
+    def on_cat_change(self, event):
+        cat = self.choice_cat.GetStringSelection()
+        if cat == 'CMCrameri':
+            self.choice_cmap.Set(self.cmaps_cmc)
+            if self.cmaps_cmc:
+                self.choice_cmap.SetSelection(0)
+        else:
+            self.choice_cmap.Set(self.cmaps_std)
+            if 'OrRd' in self.cmaps_std:
+                self.choice_cmap.SetStringSelection('OrRd')
+            elif self.cmaps_std:
+                self.choice_cmap.SetSelection(0)
+        
+        # Optionally trigger map change immediately? 
+        # Better to wait for user to pick a map, or pick default?
+        # Let's pick default and trigger.
+        self.on_cmap_change(None)
 
     def on_unit_change(self, event):
         rb = event.GetEventObject()
@@ -208,6 +894,7 @@ class PlotConfigPanel(wx.Panel):
         if new_unit == self.x_unit:
             return
         self.x_unit = new_unit
+        config.set('unit', new_unit)
         
         if self.target_view:
             xlim_cm1, _ = self.target_view.get_plot_limits()
@@ -237,46 +924,49 @@ class PlotConfigPanel(wx.Panel):
                 wx.MessageBox("Invalid Y range. Please enter numeric values.", "Error", wx.OK | wx.ICON_ERROR)
 
     def on_vlim_slide(self, event):
-        vmin = self.vmin_slider.GetValue()
-        vmax = self.vmax_slider.GetValue()
+        vmin_p = self.vmin_slider.GetValue()
+        vmax_p = self.vmax_slider.GetValue()
         # Simple guard
-        if vmin > vmax:
+        if vmin_p > vmax_p:
             if event.GetEventObject() is self.vmin_slider:
-                vmax = vmin
-                self.vmax_slider.SetValue(vmax)
+                vmax_p = vmin_p
+                self.vmax_slider.SetValue(vmax_p)
             else:
-                vmin = vmax
-                self.vmin_slider.SetValue(vmin)
-        
-        self.txt_vmin.SetValue(str(vmin))
-        self.txt_vmax.SetValue(str(vmax))
+                vmin_p = vmax_p
+                self.vmin_slider.SetValue(vmin_p)
         
         if self.target_view:
-            self.target_view.set_vlim(vmin, vmax)
+            self.target_view.set_vlim(vmin_p, vmax_p)
+            # update_absolute_vlim_display is called by set_vlim via ViewPanel
 
     def on_vlim_text_enter(self, event):
         try:
-            vmin = int(float(self.txt_vmin.GetValue()))
-            vmax = int(float(self.txt_vmax.GetValue()))
-            
-            vmin = max(0, min(100, vmin))
-            vmax = max(0, min(100, vmax))
+            vmin = float(self.txt_vmin.GetValue())
+            vmax = float(self.txt_vmax.GetValue())
             
             if vmin > vmax:
-                vmax = vmin
-            
-            self.vmin_slider.SetValue(vmin)
-            self.vmax_slider.SetValue(vmax)
-            self.txt_vmin.SetValue(str(vmin))
-            self.txt_vmax.SetValue(str(vmax))
+                vmax = vmin + 1e-9
+                self.txt_vmax.SetValue(f"{vmax:.2f}")
             
             if self.target_view:
-                self.target_view.set_vlim(vmin, vmax)
+                self.target_view.set_vlim_absolute(vmin, vmax)
         except ValueError:
             pass
 
+    def update_absolute_vlim_display(self, vmin, vmax):
+        """Called by ViewPanel to update the absolute value text boxes."""
+        self.txt_vmin.ChangeValue(f"{vmin:.2f}")
+        self.txt_vmax.ChangeValue(f"{vmax:.2f}")
+
+    def on_roi_vlim_button(self, event):
+        if self.target_view:
+            vmin, vmax = self.target_view.get_roi_vlim()
+            self.target_view.set_vlim_absolute(vmin, vmax)
+            self.update_absolute_vlim_display(vmin, vmax)
+
     def on_cmap_change(self, event):
         cmap = self.choice_cmap.GetStringSelection()
+        config.set('colormap', cmap)
         if self.target_view:
             self.target_view.set_colormap(cmap)
     
@@ -305,155 +995,434 @@ class PlotConfigPanel(wx.Panel):
         return self.x_unit
 
 
+class StyleEditDialog(wx.Dialog):
+    """
+    Dialog to edit plot style: color, linestyle, linewidth, marker.
+    Includes a Crameri categorical palette selector.
+    """
+    def __init__(self, parent, style_str: str):
+        super().__init__(parent, title="Edit Style", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        
+        # Parse initial string: "color, linestyle, linewidth, marker, markersize"
+        parts = [p.strip() for p in style_str.split(",")]
+        self.color = parts[0] if len(parts) > 0 else "black"
+        self.linestyle = parts[1] if len(parts) > 1 else "-"
+        self.linewidth = parts[2] if len(parts) > 2 else "1.0"
+        self.marker = parts[3] if len(parts) > 3 else ""
+        self.markersize = parts[4] if len(parts) > 4 else "5.0"
+        
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # 1. Color Selection
+        color_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        color_sizer.Add(wx.StaticText(self, label="Color:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        
+        self.cp = wx.ColourPickerCtrl(self, colour=wx.Colour(self.color) if self.color.startswith("#") else wx.BLACK)
+        color_sizer.Add(self.cp, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        
+        self.txt_color = wx.TextCtrl(self, value=self.color)
+        color_sizer.Add(self.txt_color, 1, wx.EXPAND)
+        
+        main_sizer.Add(color_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        # 2. Crameri Section
+        if HAS_CMCRAMERI:
+            box = wx.StaticBox(self, label="Crameri Palettes")
+            box_sizer = wx.StaticBoxSizer(box, wx.VERTICAL)
+            
+            self.maps = [
+                'cmc.batlowS', 'cmc.lajollaS', 'cmc.romaS', 'cmc.devonS', 
+                'cmc.bilbaoS', 'cmc.osloS', 'cmc.actonS', 'cmc.bamakoS',
+                'cmc.davosS', 'cmc.grayS', 'cmc.hawaiiS', 'cmc.imolaS',
+                'cmc.lapazS', 'cmc.nuukS', 'cmc.tokyoS', 'cmc.turkuS'
+            ]
+            self.choice_map = wx.Choice(self, choices=self.maps)
+            self.choice_map.SetSelection(0)
+            box_sizer.Add(self.choice_map, 0, wx.EXPAND | wx.BOTTOM, 5)
+            
+            self.grid_sizer = wx.GridSizer(cols=8, vgap=2, hgap=2)
+            box_sizer.Add(self.grid_sizer, 1, wx.EXPAND)
+            
+            main_sizer.Add(box_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+            
+            self.choice_map.Bind(wx.EVT_CHOICE, self.on_map_change)
+            self.refresh_buttons()
+            
+        # 3. Line Style, Width, Marker
+        line_sizer = wx.FlexGridSizer(4, 2, 5, 5)
+        line_sizer.AddGrowableCol(1, 1)
+        
+        line_sizer.Add(wx.StaticText(self, label="Linestyle:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        # Change to ComboBox to allow user-defined text (e.g. tuple strings)
+        self.choice_ls = wx.ComboBox(self, choices=["-", "--", "-.", ":", "None", "solid", "dashed", "dashdot", "dotted"], style=wx.CB_DROPDOWN)
+        self.choice_ls.SetValue(self.linestyle)
+        line_sizer.Add(self.choice_ls, 1, wx.EXPAND)
+        
+        line_sizer.Add(wx.StaticText(self, label="Linewidth:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.txt_lw = wx.TextCtrl(self, value=self.linewidth)
+        line_sizer.Add(self.txt_lw, 1, wx.EXPAND)
+
+        line_sizer.Add(wx.StaticText(self, label="Marker:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.choice_mk = wx.ComboBox(self, choices=["", "o", ".", "x", "+", "v", "^", "<", ">", "s", "d", "*"], style=wx.CB_DROPDOWN)
+        self.choice_mk.SetValue(self.marker)
+        line_sizer.Add(self.choice_mk, 1, wx.EXPAND)
+        
+        line_sizer.Add(wx.StaticText(self, label="Marker Size:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.txt_ms = wx.TextCtrl(self, value=self.markersize)
+        line_sizer.Add(self.txt_ms, 1, wx.EXPAND)
+        
+        main_sizer.Add(line_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        # Buttons
+        btn_sizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
+        main_sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        self.SetSizer(main_sizer)
+        self.Fit()
+        
+        self.cp.Bind(wx.EVT_COLOURPICKER_CHANGED, self.on_cp_change)
+
+    def on_cp_change(self, event):
+        self.txt_color.SetValue(event.GetColour().GetAsString(wx.C2S_HTML_SYNTAX))
+
+    def on_map_change(self, event):
+        self.refresh_buttons()
+        self.Layout()
+        self.Fit()
+
+    def refresh_buttons(self):
+        self.grid_sizer.Clear(True)
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import to_hex
+        cmap = plt.get_cmap(self.choice_map.GetStringSelection())
+        colors = cmap.colors if hasattr(cmap, 'colors') else cmap(np.linspace(0, 1, cmap.N))
+        
+        for i in range(min(len(colors), 32)):
+            c_hex = to_hex(colors[i])
+            btn = wx.Button(self, size=(20, 20))
+            btn.SetBackgroundColour(wx.Colour(c_hex))
+            btn.Bind(wx.EVT_BUTTON, lambda e, h=c_hex: self.txt_color.SetValue(h))
+            self.grid_sizer.Add(btn, 0)
+
+    def GetStyleString(self):
+        color = self.txt_color.GetValue().strip()
+        ls = self.choice_ls.GetValue().strip() # Use GetValue for ComboBox
+        lw = self.txt_lw.GetValue().strip()
+        mk = self.choice_mk.GetValue().strip()
+        ms = self.txt_ms.GetValue().strip()
+        return f"{color}, {ls}, {lw}, {mk}, {ms}"
+
+
 class AppearancesPanel(wx.Panel):
     """
-    Appearance tab: Lists runs in the current view and their display settings.
+    Appearance tab: Table view of runs and plots.
+    Columns: Run, Plot, Style.
+    Each run has a separator row followed by its plot components.
     """
     def __init__(self, parent, on_rename_run=None, on_style_change=None):
         super().__init__(parent)
         self._on_rename_run = on_rename_run
-        self._on_style_change = on_style_change
+        self._on_style_change = on_style_change 
 
-        self.list_ctrl = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_VRULES | wx.LC_HRULES)
-        self.list_ctrl.InsertColumn(0, "Run", width=120)
-        self.list_ctrl.InsertColumn(1, "Type", width=80)
-        self.list_ctrl.InsertColumn(2, "Plots", width=80)
-        self.list_ctrl.InsertColumn(3, "Vis.", width=40)
-        self.list_ctrl.InsertColumn(4, "Style", width=150)
+        self.lc = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_VRULES | wx.LC_HRULES)
+        
+        self.lc.InsertColumn(0, "Run", width=150)
+        self.lc.InsertColumn(1, "Plot", width=100)
+        self.lc.InsertColumn(2, "Style", width=200)
 
         sizer = wx.BoxSizer(wx.VERTICAL)
-        sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 4)
+        sizer.Add(self.lc, 1, wx.EXPAND | wx.ALL, 4)
         self.SetSizer(sizer)
 
-        self.list_ctrl.Bind(wx.EVT_LEFT_DCLICK, self.on_double_click)
+        self.lc.Bind(wx.EVT_LEFT_DCLICK, self.on_dbl_click)
+        self.lc.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.on_right_click)
 
-        # State storage
         self.experiment: Optional[ExperimentSet] = None
         self.view_state: Optional[ViewState] = None
         
-        # Edit helpers
-        self._edit_ctrl: Optional[wx.TextCtrl] = None
-        self._edit_item_idx: int = -1
-        self._edit_col_idx: int = -1
+        # Map item index -> (run_id, component)
+        # component is None for separator row
+        self._row_map: Dict[int, Tuple[str, Optional[str]]] = {}
 
     def update_view(self, view_state: Optional[ViewState], experiment: Optional[ExperimentSet]):
         self.experiment = experiment
         self.view_state = view_state
-        self.list_ctrl.DeleteAllItems()
+        self.lc.DeleteAllItems()
+        self._row_map.clear()
+
         if not view_state or not experiment:
             return
 
-        for i, run_id in enumerate(view_state.run_ids):
+        # Identify primary runs by order (first 2 valid runs)
+        primary_run_ids = []
+        for rid in view_state.run_ids:
+            run = experiment.get_run(rid)
+            if run:
+                primary_run_ids.append(rid)
+                if len(primary_run_ids) >= 2: break
+        
+        for run_id in view_state.run_ids:
             run = experiment.get_run(run_id)
-            if not run:
-                continue
+            if not run: continue
             
             nickname = experiment.get_run_nickname(run_id)
-            # Handle RunType enum or string fallback
-            if isinstance(run.run_type, RunType):
-                run_type = run.run_type.value
-            else:
-                run_type = str(run.run_type)
-            
-            # Determine which plots (Logic from ViewPanel is: Run1 -> A1,B1,C1; Run2 -> A2,B2,C2)
-            if i == 0:
-                plots = "A1, B1, C1"
-            elif i == 1:
-                plots = "A2, B2, C2"
-            else:
-                plots = "None"
-            
-            # Style summary
-            # Use 'A' component style as representative
             run_config = view_state.get_run_config(run_id)
-            s = run_config.get_style("A")
-            visible_str = "Yes" if s.visible else "No"
-            style_str = f"{s.color}, {s.linestyle}, {s.linewidth}"
             
-            idx = self.list_ctrl.InsertItem(self.list_ctrl.GetItemCount(), nickname)
-            self.list_ctrl.SetItem(idx, 1, run_type)
-            self.list_ctrl.SetItem(idx, 2, plots)
-            self.list_ctrl.SetItem(idx, 3, visible_str)
-            self.list_ctrl.SetItem(idx, 4, style_str)
+            # Separator Row (Header)
+            idx = self.lc.InsertItem(self.lc.GetItemCount(), nickname)
+            self.lc.SetItemFont(idx, wx.Font(wx.FontInfo().Bold()))
+            self._row_map[idx] = (run_id, None)
             
-            # Store run_id as item data for retrieval
-            self.list_ctrl.SetItemData(idx, i) # Store index in run_ids list
+            # Determine Plot column label for Header
+            labels = []
+            if run_id in primary_run_ids:
+                slot = primary_run_ids.index(run_id) + 1
+                if run.intensity_2d is not None:
+                    labels.append(f"{slot}A, {slot}B, {slot}C")
+                else:
+                    # 1D Run
+                    x_unit = run.metadata.get("raw_x_unit", "").lower()
+                    if "deg" in x_unit or "angle" in x_unit:
+                        labels.append(f"{slot}B")
+                    else:
+                        labels.append(f"{slot}C")
+            
+            # If it's ONLY an overlay (not primary), show target in header
+            if not labels and run_config.overlay_target:
+                 labels.append(f">{run_config.overlay_target}")
+            
+            plot_label = " + ".join(labels) if labels else "No Plot"
+            self.lc.SetItem(idx, 1, plot_label)
+            
+            # Children
+            comps = []
+            
+            # Add standard components if it is a primary run
+            if run_id in primary_run_ids:
+                if run.intensity_2d is not None:
+                    comps.extend([("Map (A)", "A"), ("Angle (B)", "B"), ("Shift (C)", "C")])
+                else:
+                    # 1D Run - Determine which plot it sits on
+                    x_unit = run.metadata.get("raw_x_unit", "").lower()
+                    if "deg" in x_unit or "angle" in x_unit:
+                        comps.append(("Angle (B)", "B"))
+                    else:
+                        comps.append(("Shift (C)", "C"))
+            
+            # Add Overlay rows if targets are set
+            if run_config.overlay_target:
+                ov_targets = [t.strip() for t in run_config.overlay_target.split(",") if t.strip()]
+                for t in ov_targets:
+                    comps.append((f"Overlay (>{t})", "Overlay"))
+            
+            for label, code in comps:
+                s = run_config.get_style(code)
+                style_str = f"{s.color}, {s.linestyle}, {s.linewidth}, {s.marker}, {s.markersize}"
+                if not s.visible:
+                    style_str += " (Hidden)"
+                
+                c_idx = self.lc.InsertItem(self.lc.GetItemCount(), "")
+                self.lc.SetItem(c_idx, 1, label)
+                self.lc.SetItem(c_idx, 2, style_str)
+                self._row_map[c_idx] = (run_id, code)
+                
+                if not s.visible:
+                    self.lc.SetItemTextColour(c_idx, wx.LIGHT_GREY)
 
-    def on_double_click(self, event):
-        pt = event.GetPosition()
-        idx, flags = self.list_ctrl.HitTest(pt)
+    def on_dbl_click(self, event):
+        pos = event.GetPosition()
+        idx, flags = self.lc.HitTest(pos)
+        
         if idx == wx.NOT_FOUND:
             return
-
-        col_idx = self._get_column_from_point(pt.x)
-        if col_idx == 0: # Rename
-            self._start_edit(idx, 0)
-        elif col_idx == 4: # Style
-            self._start_edit(idx, 4)
             
-    def _get_column_from_point(self, x: int) -> int:
+        if idx not in self._row_map:
+            return
+            
+        run_id, component = self._row_map[idx]
+        col = self._get_column_from_x(pos.x)
+        
+        if col == 0 and component is None: # Separator Row Name
+            current_name = self.lc.GetItemText(idx, 0)
+            dlg = wx.TextEntryDialog(self, "Enter new run name:", "Rename Run", value=current_name)
+            if dlg.ShowModal() == wx.ID_OK:
+                new_name = dlg.GetValue().strip()
+                if new_name and self._on_rename_run:
+                    self._on_rename_run(run_id, new_name)
+            dlg.Destroy()
+            
+        elif col == 1 and component is None: # Separator Row Overlay Target
+            self._ask_overlay_target(run_id)
+
+        elif col == 2: # Style Edit
+            current_style = self.lc.GetItemText(idx, 2)
+            if "(Hidden)" in current_style:
+                current_style = current_style.replace(" (Hidden)", "")
+            
+            dlg = StyleEditDialog(self, current_style)
+            if dlg.ShowModal() == wx.ID_OK:
+                new_style = dlg.GetStyleString()
+                if new_style and self._on_style_change:
+                    self._on_style_change(run_id, "style_string", new_style, component=component)
+            dlg.Destroy()
+
+    def _ask_overlay_target(self, run_id):
+        if not self.view_state: return
+        run_config = self.view_state.get_run_config(run_id)
+        
+        choices = ["1B", "1C", "2B", "2C"]
+        current = run_config.overlay_target if run_config.overlay_target else ""
+        current_selections = [s.strip() for s in current.split(",") if s.strip()]
+        
+        dlg = wx.MultiChoiceDialog(self, f"Select plot(s) to overlay '{run_id}' onto:", "Overlay Target", choices)
+        
+        # Pre-select
+        selections = []
+        for i, c in enumerate(choices):
+            if c in current_selections:
+                selections.append(i)
+        dlg.SetSelections(selections)
+        
+        if dlg.ShowModal() == wx.ID_OK:
+            selections = dlg.GetSelections()
+            selected_strings = [choices[i] for i in selections]
+            result_str = ",".join(selected_strings)
+            
+            if self._on_style_change:
+                self._on_style_change(run_id, "overlay_target", result_str, component=None)
+        dlg.Destroy()
+
+    def _get_column_from_x(self, x):
         total_w = 0
-        for i in range(self.list_ctrl.GetColumnCount()):
-            w = self.list_ctrl.GetColumnWidth(i)
+        for i in range(self.lc.GetColumnCount()):
+            w = self.lc.GetColumnWidth(i)
             if x < total_w + w:
                 return i
             total_w += w
         return -1
 
-    def _start_edit(self, item_idx: int, col_idx: int):
-        # Clean up existing editor
-        if self._edit_ctrl:
-            self._edit_ctrl.Destroy()
-            self._edit_ctrl = None
-            
-        self._edit_item_idx = item_idx
-        self._edit_col_idx = col_idx
-        
-        # Get Item Rect
-        rect = self.list_ctrl.GetItemRect(item_idx)
-        
-        # Calculate x offset and width for the specific column
-        x_offset = 0
-        for i in range(col_idx):
-            x_offset += self.list_ctrl.GetColumnWidth(i)
-        col_width = self.list_ctrl.GetColumnWidth(col_idx)
-        
-        rect.x += x_offset
-        rect.width = col_width
-        
-        # Get current text
-        item = self.list_ctrl.GetItem(item_idx, col_idx)
-        text = item.GetText()
-        
-        self._edit_ctrl = wx.TextCtrl(self.list_ctrl, value=text, pos=(rect.x, rect.y), size=(rect.width, rect.height), style=wx.TE_PROCESS_ENTER)
-        self._edit_ctrl.SetFocus()
-        self._edit_ctrl.SelectAll()
-        
-        self._edit_ctrl.Bind(wx.EVT_TEXT_ENTER, self._on_edit_commit)
-        self._edit_ctrl.Bind(wx.EVT_KILL_FOCUS, self._on_edit_cancel)
-
-    def _on_edit_commit(self, event):
-        if not self._edit_ctrl:
+    def on_right_click(self, event):
+        idx = event.GetIndex()
+        if idx == wx.NOT_FOUND or idx not in self._row_map:
             return
             
-        new_text = self._edit_ctrl.GetValue()
+        run_id, component = self._row_map[idx]
         
-        # Retrieve run_id
-        run_idx = self.list_ctrl.GetItemData(self._edit_item_idx)
-        if self.view_state and 0 <= run_idx < len(self.view_state.run_ids):
-            run_id = self.view_state.run_ids[run_idx]
-            
-            if self._edit_col_idx == 0: # Rename
-                if self._on_rename_run:
-                    self._on_rename_run(run_id, new_text)
-            elif self._edit_col_idx == 4: # Style
-                if self._on_style_change:
-                    self._on_style_change(run_id, new_text)
+        menu = wx.Menu()
+        item_vis = menu.Append(wx.ID_ANY, "Toggle Visibility")
+        self.Bind(wx.EVT_MENU, lambda e: self._toggle_vis(run_id, component), item_vis)
         
-        self._edit_ctrl.Destroy()
-        self._edit_ctrl = None
+        item_ov = menu.Append(wx.ID_ANY, "Set Overlay Target...")
+        self.Bind(wx.EVT_MENU, lambda e: self._ask_overlay_target(run_id), item_ov)
+        
+        # Add Derived Run options if applicable
+        if self.experiment:
+            run = self.experiment.get_run(run_id)
+            if run and run.run_type == RunType.DERIVED:
+                menu.AppendSeparator()
+                item_derived = menu.Append(wx.ID_ANY, "Edit Derived Props...")
+                self.Bind(wx.EVT_MENU, lambda e: self._edit_derived_props(run_id), item_derived)
+        
+        self.PopupMenu(menu)
+        menu.Destroy()
 
-    def _on_edit_cancel(self, event):
-        # If we just click away, maybe we should commit? 
-        # Usually inline edit commits on focus loss.
-        self._on_edit_commit(event)
+    def _edit_derived_props(self, run_id):
+        if not self.view_state or not self.experiment: return
+        
+        run = self.experiment.get_run(run_id)
+        if not run: return
+        
+        run_config = self.view_state.get_run_config(run_id)
+        
+        # Get current or default values
+        current_n = run_config.derived_n_points or run.metadata.get("default_n_points", 100)
+        current_auto = run_config.derived_autorange
+        if current_auto is None: current_auto = run.metadata.get("default_autorange", False)
+        
+        current_range = run_config.derived_range or run.metadata.get("default_range", (0, 100))
+        
+        # Build Dialog
+        dlg = wx.Dialog(self, title=f"Derived Props: {run.nickname}")
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # N Points
+        gs = wx.FlexGridSizer(3, 2, 5, 5)
+        gs.Add(wx.StaticText(dlg, label="N Points:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        txt_n = wx.TextCtrl(dlg, value=str(current_n))
+        gs.Add(txt_n, 1, wx.EXPAND)
+        
+        # Auto Range
+        gs.Add(wx.StaticText(dlg, label="Auto Range:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        chk_auto = wx.CheckBox(dlg, label="Use Plot Limits")
+        chk_auto.SetValue(current_auto)
+        gs.Add(chk_auto, 1, wx.EXPAND)
+        
+        # Range
+        gs.Add(wx.StaticText(dlg, label="Manual Range:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        range_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        txt_min = wx.TextCtrl(dlg, value=str(current_range[0]))
+        txt_max = wx.TextCtrl(dlg, value=str(current_range[1]))
+        range_sizer.Add(txt_min, 1, wx.RIGHT, 5)
+        range_sizer.Add(txt_max, 1)
+        gs.Add(range_sizer, 1, wx.EXPAND)
+        
+        sizer.Add(gs, 1, wx.EXPAND | wx.ALL, 10)
+        
+        # Enable/Disable range inputs based on auto
+        def update_range_state(evt=None):
+            is_auto = chk_auto.GetValue()
+            txt_min.Enable(not is_auto)
+            txt_max.Enable(not is_auto)
+        
+        chk_auto.Bind(wx.EVT_CHECKBOX, update_range_state)
+        update_range_state()
+        
+        btns = dlg.CreateButtonSizer(wx.OK | wx.CANCEL)
+        sizer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        dlg.SetSizer(sizer)
+        dlg.Fit()
+        
+        if dlg.ShowModal() == wx.ID_OK:
+            try:
+                new_n = int(txt_n.GetValue())
+                new_auto = chk_auto.GetValue()
+                r_min = float(txt_min.GetValue())
+                r_max = float(txt_max.GetValue())
+                new_range = (r_min, r_max)
+                
+                # Update via callback
+                if self._on_style_change:
+                    # We reuse on_style_change, but maybe we need a more generic 'update_config'
+                    # For now, let's overload it or just call it 3 times?
+                    # The MainFrame.on_style_change handles "overlay_target", let's check if it handles derived props.
+                    # It doesn't yet. We need to add that logic to MainFrame or AppearancesPanel calling a new callback?
+                    # Or simpler: Just update run_config directly here? No, that bypasses MainFrame logic/redraw.
+                    # Let's emit events.
+                    
+                    # We'll use a hack: pass special attr names that MainFrame handles.
+                    # Wait, I need to update MainFrame.on_style_change first.
+                    pass 
+                    
+                    # Let's assume MainFrame will be updated to handle these keys:
+                    # 'derived_n_points', 'derived_autorange', 'derived_range'
+                    self._on_style_change(run_id, "derived_n_points", new_n)
+                    self._on_style_change(run_id, "derived_autorange", new_auto)
+                    self._on_style_change(run_id, "derived_range", new_range)
+                    
+            except ValueError:
+                wx.MessageBox("Invalid input.", "Error")
+        
+        dlg.Destroy()
+
+    def _toggle_vis(self, run_id, component):
+        if not self.view_state: return
+        
+        run_config = self.view_state.get_run_config(run_id)
+        target_comp = component if component else "A" 
+        s = run_config.get_style(target_comp)
+        new_vis = not s.visible
+        
+        if self._on_style_change:
+            self._on_style_change(run_id, "visible", new_vis, component)

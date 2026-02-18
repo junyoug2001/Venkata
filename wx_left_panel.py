@@ -26,6 +26,133 @@ from data_structure import (
 from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
 
 
+class DerivedRunFormulaDialog(wx.Dialog):
+    def __init__(self, parent, formula: str, params: Dict[str, float]):
+        super().__init__(parent, title="Edit Derived Run Formula", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        
+        self.formula = formula
+        self.params = params.copy()
+        
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Formula
+        sizer.Add(wx.StaticText(self, label="Formula (use 'x' as variable, 'np' for numpy):"), 0, wx.ALL, 5)
+        self.txt_formula = wx.TextCtrl(self, value=self.formula, size=(400, -1))
+        sizer.Add(self.txt_formula, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Parameters
+        sizer.Add(wx.StaticText(self, label="Parameters:"), 0, wx.ALL, 5)
+        self.param_grid = wx.FlexGridSizer(cols=2, hgap=5, vgap=5)
+        self.param_ctrls = {}
+        
+        self._build_param_grid()
+        sizer.Add(self.param_grid, 1, wx.EXPAND | wx.ALL, 5)
+        
+        # Add/Remove Param Buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_add = wx.Button(self, label="Add Param")
+        btn_add.Bind(wx.EVT_BUTTON, self.on_add_param)
+        btn_sizer.Add(btn_add, 0, wx.RIGHT, 5)
+        sizer.Add(btn_sizer, 0, wx.ALL, 5)
+        
+        # Dialog Buttons
+        btns = self.CreateButtonSizer(wx.OK | wx.CANCEL)
+        sizer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        self.SetSizer(sizer)
+        self.Fit()
+        
+    def _build_param_grid(self):
+        self.param_grid.Clear(True)
+        self.param_ctrls.clear()
+        
+        for name, val in self.params.items():
+            lbl = wx.StaticText(self, label=f"{name}:")
+            txt = wx.TextCtrl(self, value=str(val))
+            self.param_grid.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL)
+            self.param_grid.Add(txt, 1, wx.EXPAND)
+            self.param_ctrls[name] = txt
+            
+        self.Layout()
+        
+    def on_add_param(self, event):
+        dlg = wx.TextEntryDialog(self, "Enter parameter name:", "New Parameter")
+        if dlg.ShowModal() == wx.ID_OK:
+            name = dlg.GetValue().strip()
+            if name and name not in self.params:
+                self.params[name] = 1.0
+                self._build_param_grid()
+        dlg.Destroy()
+        
+    def get_values(self):
+        # Update params from text ctrls
+        for name, txt in self.param_ctrls.items():
+            try:
+                self.params[name] = float(txt.GetValue())
+            except ValueError:
+                pass
+        return self.txt_formula.GetValue(), self.params
+
+
+class DerivedRunPropsDialog(wx.Dialog):
+    def __init__(self, parent, n_points: int, autorange: bool, x_range: Tuple[float, float]):
+        super().__init__(parent, title="Edit Derived Run Properties", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        
+        self.n_points = n_points
+        self.autorange = autorange
+        self.x_range = x_range
+        
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        gs = wx.FlexGridSizer(3, 2, 5, 5)
+        
+        # N Points
+        gs.Add(wx.StaticText(self, label="N Points:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.txt_n = wx.TextCtrl(self, value=str(n_points))
+        gs.Add(self.txt_n, 1, wx.EXPAND)
+        
+        # Auto Range
+        gs.Add(wx.StaticText(self, label="Auto Range:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.chk_auto = wx.CheckBox(self, label="Use Plot Limits")
+        self.chk_auto.SetValue(autorange)
+        gs.Add(self.chk_auto, 1, wx.EXPAND)
+        
+        # Range
+        gs.Add(wx.StaticText(self, label="Default Range:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        range_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.txt_min = wx.TextCtrl(self, value=str(x_range[0]))
+        self.txt_max = wx.TextCtrl(self, value=str(x_range[1]))
+        range_sizer.Add(self.txt_min, 1, wx.RIGHT, 5)
+        range_sizer.Add(self.txt_max, 1)
+        gs.Add(range_sizer, 1, wx.EXPAND)
+        
+        sizer.Add(gs, 1, wx.EXPAND | wx.ALL, 10)
+        
+        # Enable/Disable range inputs based on auto
+        self.chk_auto.Bind(wx.EVT_CHECKBOX, self.update_range_state)
+        self.update_range_state()
+        
+        btns = self.CreateButtonSizer(wx.OK | wx.CANCEL)
+        sizer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        self.SetSizer(sizer)
+        self.Fit()
+        
+    def update_range_state(self, evt=None):
+        is_auto = self.chk_auto.GetValue()
+        self.txt_min.Enable(not is_auto)
+        self.txt_max.Enable(not is_auto)
+        
+    def get_values(self):
+        try:
+            n = int(self.txt_n.GetValue())
+            auto = self.chk_auto.GetValue()
+            r_min = float(self.txt_min.GetValue())
+            r_max = float(self.txt_max.GetValue())
+            return n, auto, (r_min, r_max)
+        except ValueError:
+            return self.n_points, self.autorange, self.x_range
+
+
 class FilesPanel(wx.Panel):
     """
     Simple file browser for the Files tab.
@@ -117,10 +244,12 @@ class RunsPanel(wx.Panel):
     """
     Experiment tab (formerly Runs):
 
-    - Upper section: list of runs in the current ExperimentSet (with checkboxes).
+    - Upper section: list of runs in the current ExperimentSet.
+        * Columns: Run Name, ID, Description.
+        * Supports multiple selection (Shift/Cmd click).
     - Lower section: list of views and which runs are attached to each view.
     - A splitter between runs and views allows adjusting their relative heights.
-    - Right-click on the runs checklist:
+    - Right-click on the runs list:
         * "Add to current view"
         * "Add to new view"
     - Right-click on the views list:
@@ -141,6 +270,7 @@ class RunsPanel(wx.Panel):
         on_export_run=None,
         on_update_from_file=None,
         on_remove_run=None,
+        on_edit_formula=None,
     ):
         super().__init__(parent)
         self._run_ids: List[str] = []
@@ -156,6 +286,7 @@ class RunsPanel(wx.Panel):
         self._on_export_run = on_export_run
         self._on_update_from_file = on_update_from_file
         self._on_remove_run = on_remove_run
+        self._on_edit_formula = on_edit_formula
 
         # Reference to the current ExperimentSet (for nicknames etc.).
         self._experiment: Optional[ExperimentSet] = None
@@ -180,8 +311,19 @@ class RunsPanel(wx.Panel):
         label_runs = wx.StaticText(top_panel, label="Runs in current experiment:")
         top_sizer.Add(label_runs, 0, wx.ALL, 4)
 
-        self.checklist = wx.CheckListBox(top_panel, choices=[])
-        top_sizer.Add(self.checklist, 1, wx.EXPAND | wx.ALL, 4)
+        self.run_list = wx.ListCtrl(
+            top_panel, 
+            style=wx.LC_REPORT | wx.LC_VRULES | wx.LC_HRULES
+        )
+        self.run_list.InsertColumn(0, "Run Name", width=100)
+        self.run_list.InsertColumn(1, "ID", width=120)
+        self.run_list.InsertColumn(2, "Description", width=200)
+
+        top_sizer.Add(self.run_list, 1, wx.EXPAND | wx.ALL, 4)
+
+        # Sorting state
+        self._sort_col = -1
+        self._sort_ascending = True
 
         # Bottom panel: views
         bottom_panel = wx.Panel(self.splitter)
@@ -201,11 +343,51 @@ class RunsPanel(wx.Panel):
         wx.CallAfter(self._set_initial_sash)
 
         # Context menus
-        self.checklist.Bind(wx.EVT_CONTEXT_MENU, self.on_context_menu_runs)
+        self.run_list.Bind(wx.EVT_LIST_ITEM_RIGHT_CLICK, self.on_context_menu_runs)
+        self.run_list.Bind(wx.EVT_LIST_COL_CLICK, self.on_column_click)
         self.views_list.Bind(wx.EVT_CONTEXT_MENU, self.on_context_menu_views)
 
-        # Key bindings for checklist
-        self.checklist.Bind(wx.EVT_KEY_DOWN, self.on_checklist_key_down)
+        # Key bindings for run list
+        self.run_list.Bind(wx.EVT_KEY_DOWN, self.on_run_list_key_down)
+
+    def on_column_click(self, event):
+        col = event.GetColumn()
+        if col == self._sort_col:
+            self._sort_ascending = not self._sort_ascending
+        else:
+            self._sort_col = col
+            self._sort_ascending = True
+        
+        self._sort_list()
+
+    def _sort_list(self):
+        if self._sort_col == -1:
+            return
+
+        # Collect data for sorting
+        items = []
+        for i in range(self.run_list.GetItemCount()):
+            items.append({
+                "col0": self.run_list.GetItemText(i, 0),
+                "col1": self.run_list.GetItemText(i, 1),
+                "col2": self.run_list.GetItemText(i, 2),
+                "run_id": self._run_ids[i]
+            })
+
+        # Sort
+        key_map = {0: "col0", 1: "col1", 2: "col2"}
+        sort_key = key_map[self._sort_col]
+        items.sort(key=lambda x: x[sort_key].lower(), reverse=not self._sort_ascending)
+
+        # Re-populate
+        self.run_list.DeleteAllItems()
+        self._run_ids.clear()
+        for item in items:
+            idx = self.run_list.InsertItem(self.run_list.GetItemCount(), item["col0"])
+            self.run_list.SetItem(idx, 1, item["col1"])
+            self.run_list.SetItem(idx, 2, item["col2"])
+            self._run_ids.append(item["run_id"])
+
 
     def _set_initial_sash(self):
         """Set an initial runs:views split of about 60%:40%."""
@@ -213,8 +395,8 @@ class RunsPanel(wx.Panel):
         if size.height > 0:
             self.splitter.SetSashPosition(int(size.height * 0.6))
 
-    def on_checklist_key_down(self, event):
-        """Handle key events on the runs checklist."""
+    def on_run_list_key_down(self, event):
+        """Handle key events on the runs list."""
         key = event.GetKeyCode()
 
         # Enter -> Rename
@@ -223,8 +405,6 @@ class RunsPanel(wx.Panel):
             return
         
         # Delete or Cmd+Backspace -> Remove
-        # Note: On Mac, Cmd+Backspace is often standard for delete.
-        # WXK_BACK is Backspace.
         if key == wx.WXK_DELETE or (key == wx.WXK_BACK and event.CmdDown()):
             self._on_context_remove_run(event)
             return
@@ -237,15 +417,17 @@ class RunsPanel(wx.Panel):
         """Rebuild the runs and views lists from the given ExperimentSet."""
         self._experiment = exp
         # Runs
-        self.checklist.Clear()
+        self.run_list.DeleteAllItems()
         self._run_ids.clear()
 
         for run_id, run in exp.runs.items():
-            base = os.path.basename(run.source_path)
             nickname = exp.get_run_nickname(run_id)
-            # Representative text: nickname (id) | filename
-            label = f"{nickname} ({run_id})  |  {base}"
-            self.checklist.Append(label)
+            base = os.path.basename(run.source_path)
+            
+            idx = self.run_list.InsertItem(self.run_list.GetItemCount(), nickname)
+            self.run_list.SetItem(idx, 1, run_id)
+            self.run_list.SetItem(idx, 2, base)
+            
             self._run_ids.append(run_id)
 
         # Views
@@ -272,11 +454,13 @@ class RunsPanel(wx.Panel):
 
     # --- internal helpers ---
 
-    def _get_checked_run_ids(self) -> List[str]:
+    def _get_selected_run_ids(self) -> List[str]:
         ids: List[str] = []
-        for i in range(self.checklist.GetCount()):
-            if self.checklist.IsChecked(i) and i < len(self._run_ids):
-                ids.append(self._run_ids[i])
+        item = self.run_list.GetFirstSelected()
+        while item != -1:
+            if item < len(self._run_ids):
+                ids.append(self._run_ids[item])
+            item = self.run_list.GetNextSelected(item)
         return ids
 
     def _get_selected_view_info(self):
@@ -299,6 +483,15 @@ class RunsPanel(wx.Panel):
         item_rename = menu.Append(wx.ID_ANY, "Rename run")
         item_update = menu.Append(wx.ID_ANY, "Update from file")
         item_export = menu.Append(wx.ID_ANY, "Export Run...")
+        
+        # Check if derived run is selected
+        run_ids = self._get_selected_run_ids()
+        if len(run_ids) == 1 and self._experiment:
+            run = self._experiment.get_run(run_ids[0])
+            if run and run.run_type == RunType.DERIVED:
+                item_formula = menu.Append(wx.ID_ANY, "Edit Formula...")
+                self.Bind(wx.EVT_MENU, self._on_context_edit_formula, item_formula)
+
         menu.AppendSeparator()
         item_remove = menu.Append(wx.ID_ANY, "Remove run")
 
@@ -312,16 +505,35 @@ class RunsPanel(wx.Panel):
         self.PopupMenu(menu)
         menu.Destroy()
 
+    def _on_context_edit_formula(self, event):
+        if self._on_edit_formula is None:
+            return
+        run_ids = self._get_selected_run_ids()
+        if len(run_ids) != 1:
+            return
+
+        run_id = run_ids[0]
+        if not self._experiment:
+            return
+
+        run = self._experiment.get_run(run_id)
+        if not run or run.run_type != RunType.DERIVED:
+            return
+
+        current_formula = run.metadata.get("formula", "")
+        current_params = run.metadata.get("formula_params", {})
+
+        dlg = DerivedRunFormulaDialog(self, current_formula, current_params)
+        if dlg.ShowModal() == wx.ID_OK:
+            new_formula, new_params = dlg.get_values()
+            self._on_edit_formula(run_id, new_formula, new_params)
+        dlg.Destroy()
+
     def _on_context_remove_run(self, event):
         if self._on_remove_run is None:
             return
         
-        run_ids = self._get_checked_run_ids()
-        if not run_ids:
-            # Fallback: use the selected item if any
-            idx = self.checklist.GetSelection()
-            if idx != wx.NOT_FOUND and idx < len(self._run_ids):
-                run_ids = [self._run_ids[idx]]
+        run_ids = self._get_selected_run_ids()
         
         if run_ids:
             # Confirm removal
@@ -335,44 +547,34 @@ class RunsPanel(wx.Panel):
         if self._on_export_run is None:
             return
 
-        checked_run_ids = self._get_checked_run_ids()
-        if not checked_run_ids:
-            wx.MessageBox("Please check one or more runs to export.", "No Runs Checked", wx.OK | wx.ICON_INFORMATION)
+        run_ids = self._get_selected_run_ids()
+        if not run_ids:
+            wx.MessageBox("Please select one or more runs to export.", "No Runs Selected", wx.OK | wx.ICON_INFORMATION)
             return
 
-        self._on_export_run(checked_run_ids)
+        self._on_export_run(run_ids)
 
     def _on_context_update_from_file(self, event):
         if self._on_update_from_file is None:
             return
         
-        run_ids = self._get_checked_run_ids()
-        if not run_ids:
-            # Fallback: use the selected item if any
-            idx = self.checklist.GetSelection()
-            if idx != wx.NOT_FOUND and idx < len(self._run_ids):
-                run_ids = [self._run_ids[idx]]
-        
+        run_ids = self._get_selected_run_ids()
         if run_ids:
             self._on_update_from_file(run_ids)
 
     def _on_context_rename_run(self, event):
         """
-        Request a run-rename operation for the selected (or first checked) run.
+        Request a run-rename operation for the selected run.
         The actual renaming is handled inline via a TextCtrl overlay.
         """
         if self._on_rename_run is None:
             return
 
-        # Prefer the currently selected item; if none, fall back to first checked.
-        idx = self.checklist.GetSelection()
-        if idx == wx.NOT_FOUND:
-            for i in range(self.checklist.GetCount()):
-                if self.checklist.IsChecked(i):
-                    idx = i
-                    break
+        idx = self.run_list.GetFirstSelected()
+        if idx == -1:
+            return
 
-        if idx == wx.NOT_FOUND or idx >= len(self._run_ids):
+        if idx >= len(self._run_ids):
             return
 
         self._begin_inline_rename(idx)
@@ -380,7 +582,7 @@ class RunsPanel(wx.Panel):
     def _begin_inline_rename(self, index: int) -> None:
         """
         Start inline renaming of the run at the given index by overlaying
-        a TextCtrl on top of the corresponding checklist item.
+        a TextCtrl on top of the corresponding run item.
         """
         if index < 0 or index >= len(self._run_ids):
             return
@@ -396,23 +598,20 @@ class RunsPanel(wx.Panel):
         if self._experiment is not None:
             current_name = self._experiment.get_run_nickname(run_id)
         else:
-            # Fallback: parse from the label before " (" if available.
-            label = self.checklist.GetString(index)
-            current_name = label.split("(", 1)[0].strip()
+            current_name = self.run_list.GetItemText(index)
 
-        # Approximate the item rectangle using the item index and font metrics,
-        # since wx.CheckListBox does not provide GetItemRect on all platforms.
-        client_rect = self.checklist.GetClientRect()
-        item_height = self.checklist.GetCharHeight() + 4  # small padding
-
-        x = client_rect.x + 2
-        y = client_rect.y + 2 + index * item_height
-        w = max(client_rect.width - 4, 40)
-        h = item_height
+        # Get item rectangle for column 0 (Run Name)
+        rect = self.run_list.GetItemRect(index, wx.LIST_RECT_LABEL)
+        
+        # Adjust position slightly for better visual alignment
+        x = rect.x
+        y = rect.y
+        w = rect.width
+        h = rect.height
 
         # Create a TextCtrl overlayed roughly on top of the item area.
         self._edit_ctrl = wx.TextCtrl(
-            self.checklist,
+            self.run_list,
             style=wx.TE_PROCESS_ENTER,
         )
         self._edit_ctrl.SetValue(current_name)
@@ -470,14 +669,14 @@ class RunsPanel(wx.Panel):
     def _on_context_add_to_current(self, event):
         if self._on_add_to_current_view is None:
             return
-        run_ids = self._get_checked_run_ids()
+        run_ids = self._get_selected_run_ids()
         if run_ids:
             self._on_add_to_current_view(run_ids)
 
     def _on_context_add_to_new(self, event):
         if self._on_add_to_new_view is None:
             return
-        run_ids = self._get_checked_run_ids()
+        run_ids = self._get_selected_run_ids()
         if run_ids:
             self._on_add_to_new_view(run_ids)
 
@@ -542,17 +741,24 @@ class ExperimentPanel(wx.Panel):
     Experiment tab: tree view of ExperimentSet metadata and runs.
     """
 
-    def __init__(self, parent):
+    def __init__(self, parent, on_edit_formula=None, on_edit_derived_props=None):
         super().__init__(parent)
+        self._on_edit_formula = on_edit_formula
+        self._on_edit_derived_props = on_edit_derived_props
+        self._experiment: Optional[ExperimentSet] = None
+        
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.tree = wx.TreeCtrl(self, style=wx.TR_HAS_BUTTONS | wx.TR_DEFAULT_STYLE)
         sizer.Add(self.tree, 1, wx.EXPAND | wx.ALL, 4)
 
         self.SetSizer(sizer)
+        
+        self.tree.Bind(wx.EVT_TREE_ITEM_RIGHT_CLICK, self.on_tree_right_click)
 
     def refresh_from_experiment(self, exp: ExperimentSet) -> None:
         """Rebuild the tree from the given ExperimentSet."""
+        self._experiment = exp
         self.tree.DeleteAllItems()
 
         root = self.tree.AddRoot(f"Experiment {exp.id}")
@@ -571,8 +777,9 @@ class ExperimentPanel(wx.Panel):
             for run_id, run in exp.runs.items():
                 nickname = exp.get_run_nickname(run_id)
                 run_item = self.tree.AppendItem(runs_node, nickname)
+                self.tree.SetItemData(run_item, run_id) # Store run_id for context menu
 
-                base = os.path.basename(run.source_path)
+                base = os.path.basename(run.source_path) if run.source_path else "(derived)"
                 self.tree.AppendItem(run_item, f"id: {run_id}")
                 self.tree.AppendItem(run_item, f"file: {base}")
 
@@ -580,7 +787,7 @@ class ExperimentPanel(wx.Panel):
                 if md:
                     md_node_run = self.tree.AppendItem(run_item, "metadata")
                     for k, v in md.items():
-                        # nickname은 이미 노드 이름으로 쓰였으므로 중복하지 않는다.
+                        # nickname already used as node label
                         if k == "nickname":
                             continue
                         self.tree.AppendItem(md_node_run, f"{k}: {v}")
@@ -607,6 +814,55 @@ class ExperimentPanel(wx.Panel):
             self.tree.AppendItem(views_node, "(no views)")
 
         self.tree.ExpandAll()
+
+    def on_tree_right_click(self, event):
+        item = event.GetItem()
+        if not item.IsOk():
+            return
+            
+        run_id = self.tree.GetItemData(item)
+        if not run_id or not self._experiment:
+            return
+            
+        run = self._experiment.get_run(run_id)
+        if not run or run.run_type != RunType.DERIVED:
+            return
+            
+        menu = wx.Menu()
+        item_formula = menu.Append(wx.ID_ANY, "Edit Formula...")
+        item_props = menu.Append(wx.ID_ANY, "Edit Derived Props...")
+        
+        self.Bind(wx.EVT_MENU, lambda e: self._on_menu_edit_formula(run_id), item_formula)
+        self.Bind(wx.EVT_MENU, lambda e: self._on_menu_edit_props(run_id), item_props)
+        
+        self.PopupMenu(menu)
+        menu.Destroy()
+
+    def _on_menu_edit_formula(self, run_id):
+        run = self._experiment.get_run(run_id)
+        current_formula = run.metadata.get("formula", "")
+        current_params = run.metadata.get("formula_params", {})
+        
+        dlg = DerivedRunFormulaDialog(self, current_formula, current_params)
+        if dlg.ShowModal() == wx.ID_OK:
+            new_formula, new_params = dlg.get_values()
+            if self._on_edit_formula:
+                self._on_edit_formula(run_id, new_formula, new_params)
+        dlg.Destroy()
+
+    def _on_menu_edit_props(self, run_id):
+        run = self._experiment.get_run(run_id)
+        # Use metadata values as base
+        current_n = run.metadata.get("default_n_points", 100)
+        current_auto = run.metadata.get("default_autorange", False)
+        current_range = run.metadata.get("default_range", (0, 100))
+        
+        dlg = DerivedRunPropsDialog(self, current_n, current_auto, current_range)
+        if dlg.ShowModal() == wx.ID_OK:
+            new_n, new_auto, new_range = dlg.get_values()
+            if self._on_edit_derived_props:
+                self._on_edit_derived_props(run_id, new_n, new_auto, new_range)
+        dlg.Destroy()
 
 
 class LogPanel(wx.Panel):

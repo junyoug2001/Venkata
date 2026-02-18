@@ -29,7 +29,7 @@ import argparse
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -47,7 +47,6 @@ class MergeDiscoverOptions:
 
     seed_file: str
     assume_xgrid_consistent: bool = True
-    dark_value: float = 0.0
 
 
 @dataclass
@@ -141,13 +140,14 @@ class MergePreviewResult:
     title: str = "Preview (corrected, Raman shift axis)"
 
 @dataclass
-class MergeCosmicResult(MergePreviewOptions):
-    """GUI-facing cosmic-ray detection result.
+class MergeCosmicOptions(MergeDiscoverResult):
+    dark_value: float = 600.0
+    intensity_thresh: float = 1200.0
+    comparison_factor: float = 20.0
+    z_thresh_fallback: float = 8.0
 
-    This *inherits* MergePreviewOptions so the GUI can carry options forward.
-    The GUI will decide which peaks to remove and send a selection mask back.
-    """
-
+@dataclass
+class MergeCosmicResult(MergeCosmicOptions):
     peaks: List[CosmicPeak] = field(default_factory=list)
     evidence: Dict[str, object] = field(default_factory=dict)
 
@@ -343,11 +343,16 @@ def build_raw_matrix_wavelength_axis(
             xs = x
         if assume_xgrid_consistent:
             n = min(xs.size, x.size, y.size)
-            if n != xs.size:
+            if n < xs.size:
                 xs = xs[:n]
+                # Trim all existing rows to the new minimum size
+                rows = [r[:n] for r in rows]
             rows.append(np.asarray(y[:n], float))
         else:
             n = min(xs.size, x.size, y.size)
+            if n < xs.size:
+                xs = xs[:n]
+                rows = [r[:n] for r in rows]
             rows.append(np.asarray(y[:n], float))
         xxxx, yyyy = _parse_xxxx_yyyy_from_path(p)
         ang = _angle_deg_from_filename(p, xxxx, default=idx)
@@ -559,6 +564,7 @@ def detect_cosmic_peaks_comparative(
     intensity_thresh: float = 1200.0,
     comparison_factor: float = 20.0,
     z_thresh_fallback: float = 8.0,
+    dark_value: float = 600.0,
 ) -> List[CosmicPeak]:
     """Detects cosmic rays using a comparative method.
     1. Finds peaks above `intensity_thresh`.
@@ -574,13 +580,16 @@ def detect_cosmic_peaks_comparative(
     )
 
     if use_raw:
-        I = discover_result.raw_intensity_matrix
+        I = np.asarray(discover_result.raw_intensity_matrix, dtype=float).copy()
+        I -= dark_value
+        I[I < 0] = 0
         angles = discover_result.raw_angle_values
         files = discover_result.raw_files
     else:
         # Fallback to primitive matrix if raw is not available/valid.
-        # The comparative logic will be limited in this case.
-        I = discover_result.intensity_matrix
+        I = np.asarray(discover_result.intensity_matrix, dtype=float).copy()
+        I -= dark_value
+        I[I < 0] = 0
         angles = discover_result.angle_values
         files = discover_result.files
 
@@ -591,11 +600,17 @@ def detect_cosmic_peaks_comparative(
     # Structure for reference lookups
     raw_rows_by_xxxx = discover_result.raw_rows_by_xxxx or {}
     primitive_xxxx = discover_result.primitive_xxxx or []
-    primitive_matrix = discover_result.primitive_matrix
+    
+    # Ensure primitive_matrix is also dark-subtracted if used as reference
+    primitive_matrix = None
+    if discover_result.primitive_matrix is not None:
+        primitive_matrix = np.asarray(discover_result.primitive_matrix, dtype=float).copy()
+        primitive_matrix -= dark_value
+        primitive_matrix[primitive_matrix < 0] = 0
 
     # 1. Find all candidate peaks above the intensity threshold
     for r in range(ny):
-        y = I[r, :]
+        y = I[r, :] # Already dark-subtracted
 
         # Find local maxima (y[i] > y[i-1] and y[i] >= y[i+1])
         y0 = np.nan_to_num(y, nan=-np.inf)
@@ -622,7 +637,7 @@ def detect_cosmic_peaks_comparative(
             if use_raw and row_xxxx and row_xxxx in raw_rows_by_xxxx:
                 rep_rows = [rr for rr in raw_rows_by_xxxx.get(row_xxxx, []) if rr != r]
                 if rep_rows:
-                    reference_intensity = np.nanmean(I[rep_rows, c])
+                    reference_intensity = np.nanmean(I[rep_rows, c]) # Already dark-subtracted
                     reference_type = "repetition"
 
             # Priority 2 & 3: Neighboring xxxx from primitive matrix
@@ -636,7 +651,7 @@ def detect_cosmic_peaks_comparative(
                     if prim_idx < len(primitive_xxxx) - 1: neighbor_prim_indices.append(prim_idx + 1)
 
                     if neighbor_prim_indices:
-                        reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices, c])
+                        reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices, c]) # Already dark-subtracted
                         reference_type = "neighbor"
 
                     # If still no good reference, try neighbors at distance 2
@@ -646,12 +661,14 @@ def detect_cosmic_peaks_comparative(
                         if prim_idx < len(primitive_xxxx) - 2: neighbor_prim_indices_2.append(prim_idx + 2)
                         
                         if neighbor_prim_indices_2:
-                            reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices_2, c])
+                            reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices_2, c]) # Already dark-subtracted
                             reference_type = "neighbor_dist_2"
 
                 except (ValueError, IndexError):
                     pass
-
+            
+            if reference_intensity <= 0:
+                reference_intensity = 0.1 # prevent division by zero
             # 3. Filter the peak and set the confirmation flag
             is_cosmic = False
             if np.isfinite(reference_intensity) and reference_intensity > 0:
@@ -704,12 +721,15 @@ def detect_cosmic_peaks_comparative(
     return peaks
 
 
-def apply_cosmic_removal_placeholder(
+def _apply_cosmic_removal_logic(
     discover_result: "MergeDiscoverResult",
     peaks: Sequence[CosmicPeak],
     remove_mask: Sequence[bool],
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Apply a placeholder cosmic removal by replacing peak neighborhoods.
+    """Core logic for applying a placeholder cosmic removal by replacing peak neighborhoods.
+
+    This function extracts the common logic for modifying the intensity matrix
+    and is used internally by `apply_cosmic_removal`.
 
     Replacement rule (as requested):
     - For a peak at (row r, center wavelength), compute a wavelength window
@@ -827,6 +847,69 @@ def apply_cosmic_removal_placeholder(
     }
     return I2, summary
 
+def apply_cosmic_removal(
+    cosmic_result: MergeCosmicResult,
+    remove_mask: Sequence[bool],
+) -> MergeDiscoverResult:
+    """Apply cosmic removals selected by GUI and return an updated MergeDiscoverResult.
+    """
+    discover_result = cosmic_result # MergeCosmicResult inherits from MergeDiscoverResult
+    peaks = cosmic_result.peaks
+
+    I2, summary = _apply_cosmic_removal_logic(
+        discover_result,
+        peaks,
+        remove_mask,
+    )
+
+    # If I2 is RAW (multiple repetitions per angle), we MUST average it
+    # down to a primitive matrix to maintain dimension consistency with angle_values.
+    is_raw = (
+        getattr(discover_result, "raw_intensity_matrix", None) is not None
+        and I2.shape[0] == len(getattr(discover_result, "raw_files", []))
+        and len(getattr(discover_result, "raw_files", [])) > len(discover_result.unique_xxxx)
+    )
+
+    if is_raw:
+        # Re-build primitive matrix from the corrected RAW matrix I2
+        raw_files = discover_result.raw_files
+        raw_angles = discover_result.raw_angle_values
+        _, primitive_angle_values_new, primitive_matrix, _ = build_primitive_matrix_by_xxxx(
+            raw_files,
+            discover_result.wavelength_nm,
+            raw_angles,
+            I2,
+            dark_value=0.0 # dark_value already subtracted or handled
+        )
+        intensity_matrix_out = primitive_matrix
+        angle_values_out = primitive_angle_values_new
+    else:
+        intensity_matrix_out = I2
+        angle_values_out = discover_result.angle_values
+
+    # Construct and return a new MergeDiscoverResult
+    return MergeDiscoverResult(
+        files=discover_result.files,
+        pattern_hint=discover_result.pattern_hint,
+        unique_xxxx=discover_result.unique_xxxx,
+        unique_yyyy=discover_result.unique_yyyy,
+        wavelength_nm=discover_result.wavelength_nm,
+        angle_values=angle_values_out,
+        # Use the corrected (and potentially averaged) intensity matrix
+        intensity_matrix=intensity_matrix_out,
+        title=f"{discover_result.title} (cosmic removed)",
+        candidate_laser_nm=discover_result.candidate_laser_nm,
+        raw_files=discover_result.raw_files,
+        raw_xxxx=discover_result.raw_xxxx,
+        raw_yyyy=discover_result.raw_yyyy,
+        raw_angle_values=discover_result.raw_angle_values,
+        raw_intensity_matrix=I2, # Keep the corrected RAW matrix here
+        raw_rows_by_xxxx=discover_result.raw_rows_by_xxxx,
+        primitive_xxxx=discover_result.primitive_xxxx,
+        primitive_matrix=intensity_matrix_out,
+        cosmic_matrix=I2, # Store corrected RAW matrix here if raw, else primitive
+    )
+
 
 # ============================================================================
 # Stage-1 and Stage-2 API
@@ -847,7 +930,7 @@ def discover_merge(options: MergeDiscoverOptions) -> MergeDiscoverResult:
         raw_yyyy.append(y)
     # Build primitive matrix (averaged over yyyy for each xxxx)
     primitive_xxxx, primitive_angle_values, primitive_matrix, raw_rows_by_xxxx = build_primitive_matrix_by_xxxx(
-        files, wavelength_nm, raw_angle_values, raw_intensity_matrix, dark_value=options.dark_value
+        files, wavelength_nm, raw_angle_values, raw_intensity_matrix
     )
     # For backward compatibility: angle_values = primitive_angle_values, intensity_matrix = primitive_matrix
 
@@ -1004,13 +1087,8 @@ def preview_merge(
 # ============================================================================
 
 
-def cosmic_discover_for_gui(
-    discover_result: MergeDiscoverResult,
-    options: MergePreviewOptions,
-    *,
-    intensity_thresh: float = 1200.0,
-    comparison_factor: float = 20.0,
-    z_thresh_fallback: float = 8.0,
+def discover_cosmics(
+    options: MergeCosmicOptions,
 ) -> MergeCosmicResult:
     """Detect cosmic rays and return a GUI-friendly result.
 
@@ -1018,27 +1096,44 @@ def cosmic_discover_for_gui(
     The GUI then calls `cosmic_apply_for_gui(...)` with the chosen mask.
     """
     peaks = detect_cosmic_peaks_comparative(
-        discover_result,
-        intensity_thresh=intensity_thresh,
-        comparison_factor=comparison_factor,
-        z_thresh_fallback=z_thresh_fallback,
+        options,
+        intensity_thresh=options.intensity_thresh,
+        comparison_factor=options.comparison_factor,
+        z_thresh_fallback=options.z_thresh_fallback,
+        dark_value=options.dark_value
     )
     # Use the raw matrix for evidence calculation if available, as that is what
     # the detection is primarily run on.
     matrix_for_evidence = (
-        discover_result.raw_intensity_matrix
-        if discover_result.raw_intensity_matrix is not None
-        else discover_result.intensity_matrix
+        options.raw_intensity_matrix
+        if options.raw_intensity_matrix is not None
+        else options.intensity_matrix
     )
     ev = cosmic_detect_evidence(matrix_for_evidence)
 
     return MergeCosmicResult(
-        seed_file=options.seed_file,
-        files=list(options.files),
-        cosmic_enable=options.cosmic_enable,
-        manual_laser_nm=options.manual_laser_nm,
-        interactive_confirm=options.interactive_confirm,
-        require_laser_nm=options.require_laser_nm,
+        files=options.files,
+        pattern_hint=options.pattern_hint,
+        unique_xxxx=options.unique_xxxx,
+        unique_yyyy=options.unique_yyyy,
+        wavelength_nm=options.wavelength_nm,
+        angle_values=options.angle_values,
+        intensity_matrix=options.intensity_matrix,
+        title=options.title,
+        candidate_laser_nm=options.candidate_laser_nm,
+        raw_files=options.raw_files,
+        raw_xxxx=options.raw_xxxx,
+        raw_yyyy=options.raw_yyyy,
+        raw_angle_values=options.raw_angle_values,
+        raw_intensity_matrix=options.raw_intensity_matrix,
+        raw_rows_by_xxxx=options.raw_rows_by_xxxx,
+        primitive_xxxx=options.primitive_xxxx,
+        primitive_matrix=options.primitive_matrix,
+        cosmic_matrix=options.cosmic_matrix,
+        dark_value=options.dark_value,
+        intensity_thresh=options.intensity_thresh,
+        comparison_factor=options.comparison_factor,
+        z_thresh_fallback=options.z_thresh_fallback,
         peaks=peaks,
         evidence=ev,
     )
@@ -1057,7 +1152,7 @@ def cosmic_apply_for_gui(
     with the corrected matrix embedded into a temporary discover_result.
     """
 
-    I2, summary = apply_cosmic_removal_placeholder(
+    I2, summary = _apply_cosmic_removal_logic(
         discover_result,
         cosmic_result.peaks,
         remove_mask,
@@ -1169,7 +1264,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     
     if prev_opts.cosmic_enable:
         prompt.info("\n--- Cosmic Ray Detection ---")
-        cosmic_result = cosmic_discover_for_gui(active_disc_result, prev_opts)
+        cosmic_options = MergeCosmicOptions(**asdict(active_disc_result),
+                                            dark_value=0.0, # Defaulting, will be set by GUI
+                                            intensity_thresh=1200.0, # Defaulting, will be set by GUI
+                                            comparison_factor=20.0, # Defaulting, will be set by GUI
+                                            z_thresh_fallback=8.0 # Defaulting, will be set by GUI
+                                            )
+        cosmic_result = discover_cosmics(cosmic_options)
         
         if not cosmic_result.peaks:
             prompt.info("No cosmic ray peaks detected.")
@@ -1197,31 +1298,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if any(full_remove_mask):
                 prompt.info("Applying cosmic ray corrections...")
                 # Apply corrections to the active_disc_result.intensity_matrix
-                corrected_preview_result = cosmic_apply_for_gui(active_disc_result, cosmic_result, full_remove_mask)
+                active_disc_result = apply_cosmic_removal(cosmic_result, full_remove_mask)
                 
-                # Update the active_disc_result with the corrected intensity matrix
                 # Note: cosmic_apply_for_gui returns a MergePreviewResult which has intensity_matrix on wavelength axis
                 # We need to transfer this corrected matrix back into a MergeDiscoverResult structure
                 # to be consumed by the final preview_merge which calculates Raman shift.
-                active_disc_result = MergeDiscoverResult(
-                    files=list(active_disc_result.files),
-                    pattern_hint=active_disc_result.pattern_hint,
-                    unique_xxxx=list(active_disc_result.unique_xxxx),
-                    unique_yyyy=list(active_disc_result.unique_yyyy),
-                    wavelength_nm=np.asarray(active_disc_result.wavelength_nm, float),
-                    angle_values=np.asarray(active_disc_result.angle_values, float),
-                    intensity_matrix=np.asarray(corrected_preview_result.intensity_matrix, float),
-                    title="Preview (cosmic removed, wavelength axis)",
-                    raw_files=list(active_disc_result.raw_files),
-                    raw_xxxx=list(active_disc_result.raw_xxxx),
-                    raw_yyyy=list(active_disc_result.raw_yyyy),
-                    raw_angle_values=np.asarray(active_disc_result.raw_angle_values, float),
-                    raw_intensity_matrix=np.asarray(active_disc_result.raw_intensity_matrix, float), # raw_intensity_matrix is not altered by apply_cosmic
-                    raw_rows_by_xxxx=active_disc_result.raw_rows_by_xxxx,
-                    primitive_xxxx=active_disc_result.primitive_xxxx,
-                    primitive_matrix=active_disc_result.primitive_matrix,
-                    cosmic_matrix=np.asarray(corrected_preview_result.intensity_matrix, float), # Store corrected matrix here
-                )
                 prompt.info("Cosmic ray corrections applied.")
             else:
                 prompt.info("No cosmic ray corrections confirmed by user.")

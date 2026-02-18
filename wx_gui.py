@@ -59,6 +59,7 @@ from data_structure import (
     EV_PER_CM1,
     new_experiment_id,
     new_view_id,
+    new_run_id,
     RunType
 )
 from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
@@ -66,6 +67,7 @@ from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
 from wx_left_panel import FilesPanel, RunsPanel, ExperimentPanel, LogPanel
 from wx_left_lower_panel import PreviewPanel, CurveFitPanel, PlotConfigPanel, AppearancesPanel
 from wx_right_panel import RamanToolbar, ViewPanel
+from config_manager import config
 
 
 # -----------------------------
@@ -75,10 +77,11 @@ from wx_right_panel import RamanToolbar, ViewPanel
 
 class MainFrame(wx.Frame):
     def __init__(self, initial_files: Optional[List[str]] = None):
+        size = config.get("window_size", [1400, 800])
         super().__init__(
             None,
             title="Venkata - GUI Based Raman Analysis",
-            size=(1400, 800),
+            size=(size[0], size[1]),
         )
 
         # Core experiment model
@@ -98,12 +101,25 @@ class MainFrame(wx.Frame):
         # Status bar
         self.CreateStatusBar()
 
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
         # Load any initial files passed from CLI
         if initial_files:
             self.load_initial_files(initial_files)
+        else:
+            last_dir = config.get("last_directory", "")
+            if last_dir and os.path.isdir(last_dir):
+                self.files_panel.set_directory(last_dir)
 
         self.Centre()
         self.Show()
+
+    def on_close(self, event):
+        """Save settings and close the app."""
+        size = self.GetSize()
+        config.set("window_size", [size.width, size.height])
+        config.save()
+        self.Destroy()
 
     # -------- menu --------
 
@@ -116,14 +132,18 @@ class MainFrame(wx.Frame):
         item_save = file_menu.Append(wx.ID_SAVE, "Save Experiment...\tCtrl-S")
         file_menu.AppendSeparator()
         item_import = file_menu.Append(wx.ID_ANY, "Import Run...\tCtrl-I")
+        item_new_formula = file_menu.Append(wx.ID_ANY, "New Formula Run...")
         item_merge = file_menu.Append(wx.ID_ANY, "Merge Run...\tCtrl-Shift-I")
+        item_calc = file_menu.Append(wx.ID_ANY, "Calculate from run...")
         file_menu.AppendSeparator()
         item_quit = file_menu.Append(wx.ID_EXIT, "Quit\tCtrl-Q")
         
         self.Bind(wx.EVT_MENU, self.on_open_experiment, item_open)
         self.Bind(wx.EVT_MENU, self.on_save_experiment, item_save)
         self.Bind(wx.EVT_MENU, self.on_import_run_dialog, item_import)
+        self.Bind(wx.EVT_MENU, self.on_new_formula_run, item_new_formula)
         self.Bind(wx.EVT_MENU, self.on_merge_run_dialog, item_merge)
+        self.Bind(wx.EVT_MENU, self.on_calculate_from_run, item_calc)
         self.Bind(wx.EVT_MENU, self.on_quit, item_quit)
         menubar.Append(file_menu, "&File")
 
@@ -148,23 +168,60 @@ class MainFrame(wx.Frame):
             self.experiment_panel.refresh_from_experiment(self.experiment)
         except Exception:
             pass
+        
+        # Refresh appearances panel if a view is active
+        try:
+            view_id = self._get_current_view_id()
+            if view_id:
+                view_state = self.experiment.get_view(view_id)
+                self.appearances_panel.update_view(view_state, self.experiment)
+            else:
+                self.appearances_panel.update_view(None, None)
+        except Exception:
+            pass
 
     def on_merge_run_dialog(self, event):
         """Open the merge-run dialog.
 
-        Note: wx.FileDialog cannot embed extra checkboxes in a cross-platform way.
-        Therefore merge options are collected inside the subsequent MergeRunsDialog.
+        Allows multiple file selection. If multiple files correspond to different
+        experiment seeds, the dialog is shown sequentially for each seed.
         """
         with wx.FileDialog(
             self,
-            message="Select a 1D run file to seed merging",
+            message="Select 1D run files to merge",
             wildcard="Data files (*.csv;*.txt)|*.csv;*.txt|All files (*.*)|*.*",
-            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
         ) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
-            seed_path = dlg.GetPath()
+            paths = dlg.GetPaths()
 
+        if not paths:
+            return
+
+        # Group paths by seed patterns to identify unique merge operations
+        unique_seeds = {}
+        for p in paths:
+            abs_p = os.path.abspath(p)
+            d = os.path.dirname(abs_p)
+            base = os.path.basename(abs_p)
+            m = analysis.IDX_RE.match(base)
+            if m:
+                # Experiment pattern: group by (dir, prefix, ext)
+                key = (d, m.group("prefix"), m.group("ext"))
+            else:
+                # Standalone file: each is its own seed
+                key = (d, base, "")
+            
+            if key not in unique_seeds:
+                unique_seeds[key] = abs_p
+
+        # Process each unique seed
+        for seed_path in unique_seeds.values():
+            self._run_merge_dialog_for_seed(seed_path)
+
+    def _run_merge_dialog_for_seed(self, seed_path: str):
+        """Helper to run MergeRunsDialog for a specific seed path."""
         md = MergeRunsDialog(self, [seed_path], log_cb=self.log_panel.append_log)
         try:
             if md.ShowModal() == wx.ID_OK and md.result_run:
@@ -172,14 +229,78 @@ class MainFrame(wx.Frame):
                 self.experiment.add_run(new_run)
                 nickname = self.experiment.get_run_nickname(new_run.id)
                 self.log_panel.append_log(
-                    f"Merged run created as {nickname} ({new_run.id})."
+                    f"Merged run created as {nickname} ({new_run.id}) from seed {os.path.basename(seed_path)}."
                 )
                 self._refresh_left_panels()
-                self._refresh_all_view_panels() # To update any open views
+                self._refresh_all_view_panels() 
             else:
-                self.log_panel.append_log("Merge operation cancelled.")
+                self.log_panel.append_log(f"Merge operation cancelled for seed {os.path.basename(seed_path)}.")
         finally:
             md.Destroy()
+
+    def on_calculate_from_run(self, event):
+        """
+        Open a dialog to select a run, then perform a calculation (currently angle summation).
+        """
+        # Get list of runs
+        run_ids = list(self.experiment.runs.keys())
+        if not run_ids:
+            wx.MessageBox("No runs available.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+
+        choices = [f"{self.experiment.get_run_nickname(rid)} ({rid})" for rid in run_ids]
+        
+        with wx.SingleChoiceDialog(self, "Select a run to calculate from:", "Calculate from Run", choices) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            selection = dlg.GetSelection()
+            run_id = run_ids[selection]
+        
+        run = self.experiment.get_run(run_id)
+        if not run:
+             return
+
+        # For now, we only support Angle Summation on 2D runs.
+        if not run.is_2d:
+             wx.MessageBox("Selected run is not a 2D run. Only angle summation of 2D runs is currently supported.", "Info", wx.OK | wx.ICON_INFORMATION)
+             return
+
+        # Perform summation
+        # intensity_2d shape is (angles, shifts)
+        # Sum along axis 0 to get (shifts,)
+        if run.intensity_2d is None:
+             return
+
+        summed_intensity = np.sum(run.intensity_2d, axis=0)
+        
+        new_nickname = f"{run.nickname}_summed"
+        
+        new_metadata = run.metadata.copy()
+        new_metadata["nickname"] = new_nickname
+        new_metadata["calculation"] = "angle_sum"
+        new_metadata["source_run_id"] = run.id
+        new_metadata["raw_dim"] = "1d"
+
+        new_run = Run(
+            id=new_run_id(prefix="calc"),
+            source_path=run.source_path, 
+            source_mtime=run.source_mtime,
+            wl_nm=run.wl_nm,
+            shift_cm1=run.shift_cm1,
+            energy_eV=run.energy_eV,
+            intensity=summed_intensity,
+            intensity_2d=None,
+            angle_values=None,
+            intensity_unit=run.intensity_unit,
+            angle_unit=run.angle_unit,
+            metadata=new_metadata,
+            run_type=RunType.RUN_1D,
+            raw_table=None
+        )
+
+        self.experiment.add_run(new_run)
+        self.log_panel.append_log(f"Created summed run: {new_nickname}")
+        self._refresh_left_panels()
 
     # -------- layout --------
 
@@ -224,8 +345,13 @@ class MainFrame(wx.Frame):
             on_export_run=self.on_export_run,
             on_update_from_file=self.on_update_run_from_file,
             on_remove_run=self.on_remove_run,
+            on_edit_formula=self.on_edit_formula,
         )
-        self.experiment_panel = ExperimentPanel(top_notebook)
+        self.experiment_panel = ExperimentPanel(
+            top_notebook,
+            on_edit_formula=self.on_edit_formula,
+            on_edit_derived_props=self.on_edit_derived_props
+        )
         self.log_panel = LogPanel(top_notebook)
 
         top_notebook.AddPage(self.files_panel, "Files")
@@ -237,7 +363,7 @@ class MainFrame(wx.Frame):
         bottom_notebook = wx.Notebook(self.left_splitter, style=wx.NB_TOP)
 
         self.preview_panel = PreviewPanel(bottom_notebook)
-        self.curvefit_panel = CurveFitPanel(bottom_notebook)
+        self.curvefit_panel = CurveFitPanel(bottom_notebook, on_run_created=self.on_run_created)
         self.plot_config_panel = PlotConfigPanel(bottom_notebook, 
                                                  on_reset=self.on_plot_reset)
         self.appearances_panel = AppearancesPanel(
@@ -277,10 +403,17 @@ class MainFrame(wx.Frame):
         wx.CallAfter(self._set_initial_split_ratio)
 
         # After layout, create the initial view tab and view state
-        wx.CallAfter(self.add_view_tab)
+        wx.CallAfter(self._init_view_tab)
         
         # Bind notebook page changed
         self.view_notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_view_page_changed)
+
+    def _init_view_tab(self):
+        self.add_view_tab()
+        # Manually trigger target setting for the initial view
+        panel = self.get_current_view_panel()
+        if panel:
+            self.plot_config_panel.set_target_view(panel)
 
     def _set_initial_split_ratio(self):
         """
@@ -328,12 +461,13 @@ class MainFrame(wx.Frame):
         self.experiment.metadata["num_runs"] = len(self.experiment.runs)
 
         # Refresh tabs
-        self.runs_panel.refresh_from_experiment(self.experiment)
-        self.experiment_panel.refresh_from_experiment(self.experiment)
+        self._refresh_left_panels()
 
         # Initialize Files tab directory to the first loaded directory
         if set_files_dir and loaded_dirs:
-            self.files_panel.set_directory(loaded_dirs[0])
+            target_dir = loaded_dirs[0]
+            self.files_panel.set_directory(target_dir)
+            config.set("last_directory", target_dir)
 
     def on_import_run_from_files_panel(self, path: str) -> None:
         """Called from FilesPanel context menu: import a single file as a run."""
@@ -360,6 +494,20 @@ class MainFrame(wx.Frame):
         self.import_runs_from_paths(list(paths), set_files_dir=True)
 
 
+    def on_new_formula_run(self, event):
+        """Create a new derived run with a default formula."""
+        # Create a default sine wave
+        new_run = Run.from_formula(
+            formula="np.sin(x/10.0 * freq) * amp",
+            params={"amp": 100.0, "freq": 1.0},
+            n_points=200,
+            x_range=(0, 500),
+            nickname="New Formula Run"
+        )
+        self.experiment.add_run(new_run)
+        self.log_panel.append_log(f"Created new formula run: {new_run.id}")
+        self._refresh_left_panels()
+        
     def on_export_run(self, run_ids: List[str]):
         if not run_ids:
             return
@@ -385,10 +533,6 @@ class MainFrame(wx.Frame):
                 failed_count += 1
                 continue
 
-            if not run.is_2d:
-                self.log_panel.append_log(f"Skipping export: Run '{run.nickname}' is not 2D.")
-                continue
-
             try:
                 run.export_csv(output_dir=output_dir)
                 exported_count += 1
@@ -400,6 +544,55 @@ class MainFrame(wx.Frame):
         self.log_panel.append_log(f"Successfully exported {exported_count} runs.")
         if failed_count > 0:
             self.log_panel.append_log(f"Failed to export {failed_count} runs.")
+
+    def on_edit_formula(self, run_id: str, new_formula: str, new_params: Dict[str, float]) -> None:
+        """
+        Update the formula and parameters for a Derived Run and refresh views.
+        """
+        run = self.experiment.get_run(run_id)
+        if not run or run.run_type != RunType.DERIVED:
+            return
+
+        run.metadata["formula"] = new_formula
+        run.metadata["formula_params"] = new_params
+        
+        nickname = self.experiment.get_run_nickname(run_id)
+        self.log_panel.append_log(f"Updated formula for derived run '{nickname}' ({run_id})")
+
+        # Refresh all views that might be displaying this run
+        for view_id, view_state in self.experiment.views.items():
+            if run_id in view_state.run_ids:
+                self._update_view_plot(view_id, preserve_state=True)
+        
+        # Also refresh metadata tree to show updated formula
+        self.experiment_panel.refresh_from_experiment(self.experiment)
+
+    def on_edit_derived_props(self, run_id: str, n_points: int, autorange: bool, x_range: Tuple[float, float]) -> None:
+        """
+        Update derived run properties and refresh views.
+        """
+        run = self.experiment.get_run(run_id)
+        if not run or run.run_type != RunType.DERIVED:
+            return
+            
+        run.metadata["default_n_points"] = n_points
+        run.metadata["default_autorange"] = autorange
+        run.metadata["default_range"] = x_range
+        
+        self.log_panel.append_log(f"Updated properties for derived run {run.nickname}")
+        
+        # Refresh views
+        for view_id, view_state in self.experiment.views.items():
+            if run_id in view_state.run_ids:
+                # Update run_config override if it exists, or just clear it to use metadata defaults?
+                # The logic in ViewPanel._update_run_plots uses run_config override OR metadata default.
+                # If run_config has an override, editing metadata won't change the plot unless we clear the override.
+                # For now, let's just refresh. If the user previously set a View-specific override in Appearance panel,
+                # that should probably persist. If they want to reset, they'd use Appearance panel.
+                # Here we are editing the "global" default for the Run.
+                self._update_view_plot(view_id, preserve_state=True)
+
+        self.experiment_panel.refresh_from_experiment(self.experiment)
 
     # -------- view-tab helpers --------
 
@@ -421,7 +614,9 @@ class MainFrame(wx.Frame):
 
         panel = ViewPanel(
             self.view_notebook,
-            view_label=title, plot_config_panel=self.plot_config_panel
+            view_label=title, plot_config_panel=self.plot_config_panel,
+            on_run_created=self.on_run_created,
+            on_fit_request=self.on_curve_fit_request
         )
         self.view_notebook.AddPage(panel, title, select=True)
 
@@ -435,6 +630,69 @@ class MainFrame(wx.Frame):
         # Update the Experiment tab's views list and metadata tree
         self.runs_panel.refresh_from_experiment(self.experiment)
         self.experiment_panel.refresh_from_experiment(self.experiment)
+    
+    def on_run_created(self, new_run: Run, overlay_target_run: Optional[Run] = None, overlay_plot_type: str = None) -> None:
+        """Callback from ViewPanel or CurveFitPanel when a new run is created."""
+        self.experiment.add_run(new_run)
+        nickname = self.experiment.get_run_nickname(new_run.id)
+        self.log_panel.append_log(
+            f"Created new run '{nickname}' ({new_run.id})."
+        )
+        
+        # Handle automatic overlay if requested
+        if overlay_target_run and overlay_plot_type:
+            view_id = self._get_current_view_id()
+            if view_id:
+                view_state = self.experiment.get_view(view_id)
+                # Check if target run is in this view
+                slot_prefix = None
+                if len(view_state.run_ids) > 0 and view_state.run_ids[0] == overlay_target_run.id:
+                    slot_prefix = "1"
+                elif len(view_state.run_ids) > 1 and view_state.run_ids[1] == overlay_target_run.id:
+                    slot_prefix = "2"
+                
+                if slot_prefix:
+                    target_code = f"{slot_prefix}{overlay_plot_type}"
+                    
+                    # Add new run to view if not present (it shouldn't be yet)
+                    if new_run.id not in view_state.run_ids:
+                        view_state.run_ids.append(new_run.id)
+                    
+                    # Set overlay config
+                    cfg = view_state.get_run_config(new_run.id)
+                    cfg.overlay_target = target_code
+                    
+                    # Also default the style color to red or something distinct?
+                    # For now default black is fine, or random.
+                    
+                    self.log_panel.append_log(f"Overlaying {nickname} onto {target_code}")
+
+        self._refresh_left_panels()
+        # If we modified the view, we need to refresh it
+        if overlay_target_run:
+            self._refresh_all_view_panels()
+
+    def on_curve_fit_request(self, source_run: Run, plot_type: str, x_data: np.ndarray, y_data: np.ndarray):
+        """
+        Handle request to fit a curve to the given data.
+        Switches to CurveFitPanel and loads data.
+        """
+        # 1. Switch Left Splitter to Bottom
+        # The sash position might hide it, but we can't easily force it open without sizing.
+        # Assuming user has it visible or we just focus the notebook.
+        
+        # 2. Select CurveFit tab (index 3 currently: Preview, PlotConfig, Appearance, CurveFit)
+        # Better to find by name or instance
+        for i in range(self.curvefit_panel.GetParent().GetPageCount()):
+            if self.curvefit_panel.GetParent().GetPage(i) == self.curvefit_panel:
+                self.curvefit_panel.GetParent().SetSelection(i)
+                break
+        
+        # 3. Load Data
+        self.curvefit_panel.set_data(source_run, plot_type, x_data, y_data)
+        self.log_panel.append_log(f"Started curve fit for {source_run.nickname} ({plot_type})")
+
+    
     # -------- view management helpers --------
 
     def _get_current_view_id(self) -> Optional[str]:
@@ -444,7 +702,7 @@ class MainFrame(wx.Frame):
             return None
         return self._view_page_to_id.get(page_index)
 
-    def _update_view_plot(self, view_id: str) -> None:
+    def _update_view_plot(self, view_id: str, preserve_state: bool = False) -> None:
         """
         Refresh the plotting for the specified view, if its panel exists.
         """
@@ -454,7 +712,7 @@ class MainFrame(wx.Frame):
         panel = self._view_id_to_panel.get(view_id)
         if panel is None:
             return
-        panel.set_view_model(self.experiment, view_state)
+        panel.set_view_model(self.experiment, view_state, preserve_state=preserve_state)
         # Also update appearances tab if relevant
         if view_id == self._get_current_view_id():
             self.appearances_panel.update_view(view_state, self.experiment)
@@ -468,7 +726,7 @@ class MainFrame(wx.Frame):
     def on_plot_reset(self):
         view_id = self._get_current_view_id()
         if view_id:
-            self._update_view_plot(view_id)
+            self._update_view_plot(view_id, preserve_state=False)
 
     def on_view_page_changed(self, event):
         view_panel = self.get_current_view_panel()
@@ -654,10 +912,12 @@ class MainFrame(wx.Frame):
         self._refresh_all_view_panels()
         self.log_panel.append_log(f"Renamed run {run_id} to {new_name}")
 
-    def on_style_change(self, run_id: str, new_style_str: str) -> None:
+    def on_style_change(self, run_id: str, attr: str, value: Any, component: Optional[str] = None) -> None:
         """
-        Parse and apply a new style string (color, linestyle, linewidth) for the given run
-        in the *current* view.
+        Update run style based on edits in AppearancesPanel.
+        attr: 'visible', 'color', 'linestyle', 'linewidth', 'style_string'
+        value: bool or str
+        component: "A", "B", "C" or None (apply to all)
         """
         view_id = self._get_current_view_id()
         if not view_id:
@@ -667,31 +927,53 @@ class MainFrame(wx.Frame):
         if not view_state:
             return
 
-        # Parse "color, linestyle, linewidth"
-        parts = [p.strip() for p in new_style_str.split(",")]
-        if not parts:
-            return
-        
-        # Defaults
-        color = parts[0] if len(parts) > 0 else "black"
-        linestyle = parts[1] if len(parts) > 1 else "-"
-        try:
-            linewidth = float(parts[2]) if len(parts) > 2 else 1.0
-        except ValueError:
-            linewidth = 1.0
-
-        # Update configuration
         run_config = view_state.get_run_config(run_id)
         
-        # Apply to all sub-plots (A, B, C) for simplicity, or just A
-        for comp in ["A", "B", "C"]:
-            s = run_config.get_style(comp)
-            s.color = color
-            s.linestyle = linestyle
-            s.linewidth = linewidth
+        # Determine targets: specific component or all
+        targets = [component] if component else ["A", "B", "C"]
         
-        self.log_panel.append_log(f"Updated style for run {run_id}: {new_style_str}")
-        self._update_view_plot(view_id)
+        for comp in targets:
+            style = run_config.get_style(comp)
+            if attr == "style_string":
+                parts = [p.strip() for p in str(value).split(",")]
+                if len(parts) > 0 and parts[0]: style.color = parts[0]
+                if len(parts) > 1 and parts[1]: style.linestyle = parts[1]
+                if len(parts) > 2 and parts[2]:
+                    try:
+                        style.linewidth = float(parts[2])
+                    except ValueError: pass
+                if len(parts) > 3: style.marker = parts[3]
+                if len(parts) > 4 and parts[4]:
+                    try:
+                        style.markersize = float(parts[4])
+                    except ValueError: pass
+            elif attr == "visible":
+                style.visible = bool(value)
+            elif attr == "color":
+                style.color = str(value)
+            elif attr == "linestyle":
+                style.linestyle = str(value)
+            elif attr == "linewidth":
+                try:
+                    style.linewidth = float(value)
+                except ValueError:
+                    pass
+            elif attr == "overlay_target":
+                run_config.overlay_target = str(value) if str(value) != "None" else None
+            elif attr == "derived_n_points":
+                run_config.derived_n_points = int(value)
+            elif attr == "derived_autorange":
+                run_config.derived_autorange = bool(value)
+            elif attr == "derived_range":
+                if isinstance(value, (tuple, list)) and len(value) == 2:
+                    run_config.derived_range = tuple(value)
+        
+        self.log_panel.append_log(f"Updated style '{attr}' for run {run_id} (comp={component or 'all'})")
+        # If overlay_target changed, we might need a full redraw because the primary run list might change
+        if attr in ["overlay_target", "derived_n_points", "derived_autorange", "derived_range"]:
+            self._update_view_plot(view_id, preserve_state=True)
+        else:
+            self._update_view_plot(view_id, preserve_state=True)
 
     def on_update_run_from_file(self, run_ids: List[str]) -> None:
         """
@@ -783,13 +1065,21 @@ class MainFrame(wx.Frame):
             panel = ViewPanel(
                 self.view_notebook,
                 view_label=vstate.title,
-                plot_config_panel=self.plot_config_panel
+                plot_config_panel=self.plot_config_panel,
+                on_run_created=self.on_run_created,
+                on_fit_request=self.on_curve_fit_request
             )
             self.view_notebook.AddPage(panel, vstate.title)
             page_index = self.view_notebook.GetPageCount() - 1
             self._view_page_to_id[page_index] = vid
             self._view_id_to_panel[vid] = panel
             panel.set_view_model(self.experiment, vstate)
+        
+        # Ensure panels are connected to the current (first) view
+        if self.view_notebook.GetPageCount() > 0:
+            # Manually trigger updates as if the page changed
+            self.view_notebook.SetSelection(0)
+            self.on_view_page_changed(wx.BookCtrlEvent(wx.EVT_NOTEBOOK_PAGE_CHANGED.typeId, 0, 0))
 
     def _refresh_all_view_panels(self) -> None:
         for view_id in list(self.experiment.views.keys()):
@@ -852,6 +1142,8 @@ class MainFrame(wx.Frame):
 
 
 
+
+
 # -----------------------------
 # App entry
 # -----------------------------
@@ -874,3 +1166,5 @@ if __name__ == "__main__":
     filenames = sys.argv[1:]
     app = RamanApp(filenames)
     app.MainLoop()
+
+

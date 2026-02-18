@@ -23,6 +23,7 @@ from data_structure import (
     new_view_id,
 )
 from plotting import RamanPlotter2d, SlicePlotter
+from config_manager import config
 
 class CosmicReviewDialog(wx.Dialog):
     """Cosmic-ray review dialog.
@@ -43,6 +44,14 @@ class CosmicReviewDialog(wx.Dialog):
         self._x_centers = np.asarray(cosmic_result.wavelength_nm, dtype=float)
         self._y_centers = np.asarray(cosmic_result.angle_values, dtype=float)
         self._I = np.asarray(cosmic_result.intensity_matrix, dtype=float) - cosmic_result.dark_value
+        
+        # Check for shape mismatch
+        ny, nx = self._I.shape
+        ly = len(self._y_centers)
+        lx = len(self._x_centers)
+        if ny != ly or nx != lx:
+             raise ValueError(f"Shape Mismatch: Data ({ny}, {nx}) vs Axes")
+
         self._raw_I = (
             np.asarray(cosmic_result.raw_intensity_matrix, dtype=float)
             if cosmic_result.raw_intensity_matrix is not None
@@ -76,6 +85,7 @@ class CosmicReviewDialog(wx.Dialog):
         self._general_evidence = self._evidence
         self._contrast_percent = (float(contrast_percent[0]), float(contrast_percent[1]))
         self._dark_value = cosmic_result.dark_value
+        self._cosmic_result = cosmic_result # Store for re-detection
 
         self._sel_row = 0
         self._sel_col = 0
@@ -124,6 +134,26 @@ class CosmicReviewDialog(wx.Dialog):
         )
         self.txt_evidence.SetMinSize((340, 90))
         box_ev.Add(self.txt_evidence, 1, wx.EXPAND | wx.ALL, 4)
+
+        # Detection Threshold Control
+        box_thresh = wx.StaticBoxSizer(wx.StaticBox(ctrl_panel, label="Detection Threshold"), wx.VERTICAL)
+        ctrl_sizer.Add(box_thresh, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        row_inputs = wx.BoxSizer(wx.HORIZONTAL)
+        
+        self.txt_threshold = wx.TextCtrl(ctrl_panel, value=f"{cosmic_result.intensity_thresh:.1f}", size=(70, -1))
+        self.txt_ratio = wx.TextCtrl(ctrl_panel, value=f"{cosmic_result.comparison_factor:.1f}", size=(70, -1))
+        self.btn_detect = wx.Button(ctrl_panel, label="Detect")
+        
+        row_inputs.Add(wx.StaticText(ctrl_panel, label="Min Height:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
+        row_inputs.Add(self.txt_threshold, 1, wx.EXPAND | wx.ALL, 2)
+        row_inputs.Add(wx.StaticText(ctrl_panel, label="Ratio:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
+        row_inputs.Add(self.txt_ratio, 1, wx.EXPAND | wx.ALL, 2)
+        row_inputs.Add(self.btn_detect, 0, wx.ALL, 2)
+        
+        box_thresh.Add(row_inputs, 0, wx.EXPAND)
+        
+        self.Bind(wx.EVT_BUTTON, self._on_re_detect, self.btn_detect)
 
         # Candidate list
         box_list = wx.StaticBoxSizer(wx.StaticBox(ctrl_panel, label="Candidates (checked = remove)"), wx.VERTICAL)
@@ -189,6 +219,64 @@ class CosmicReviewDialog(wx.Dialog):
         sorted_by_original_index = sorted(self._candidates, key=lambda c: c['original_index'])
         return [c['is_checked'] for c in sorted_by_original_index]
 
+    def get_cosmic_result(self) -> "analysis.MergeCosmicResult":
+        return self._cosmic_result
+
+    def _on_re_detect(self, event):
+        try:
+            h_val = float(self.txt_threshold.GetValue())
+            r_val = float(self.txt_ratio.GetValue())
+        except ValueError:
+            wx.MessageBox("Invalid values. Please enter numbers for Height and Ratio.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+
+        self._cosmic_result.intensity_thresh = h_val
+        self._cosmic_result.comparison_factor = r_val
+        
+        # Save to global config
+        config.set("cosmic_threshold", h_val)
+        config.set("cosmic_ratio", r_val)
+        
+        try:
+            new_res = analysis.discover_cosmics(self._cosmic_result)
+        except Exception as e:
+            wx.MessageBox(f"Detection failed: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            return
+            
+        # Store for return
+        self._cosmic_result = new_res
+
+        # Re-populate candidates
+        self._candidates = []
+        for i, p in enumerate(new_res.peaks):
+            self._candidates.append(
+                {
+                    "row_index": p.row_index,
+                    "col_index": p.col_index,
+                    "is_confirmed_cosmic": p.is_confirmed_cosmic,
+                    "xxxx": p.xxxx,
+                    "yyyy": p.yyyy,
+                    "angle_deg": p.angle_deg,
+                    "center_wavelength_nm": p.center_wavelength_nm,
+                    "intensity": p.intensity,
+                    "fwhm_nm": p.fwhm_nm,
+                    "test_results": p.test_results,
+                    "original_index": i,
+                    "is_checked": bool(p.is_confirmed_cosmic) # Use the logic-based flag
+                }
+            )
+        
+        self._evidence = new_res.evidence
+        self._general_evidence = self._evidence
+        self.txt_evidence.SetValue(self._format_evidence(self._evidence))
+        self._selected_candidate_info = None
+        
+        self._sort_and_refresh_list()
+        self._render_matrix()
+        self._update_point_highlights()
+        self._update_highlight_and_slice()
+        self.Layout()
+
     def _sort_and_refresh_list(self):
         # Sort the internal list
         if self.chk_sort_prominence.IsChecked():
@@ -214,6 +302,25 @@ class CosmicReviewDialog(wx.Dialog):
         idx = event.GetSelection()
         if 0 <= idx < len(self._candidates):
             self._candidates[idx]['is_checked'] = self.chk_list.IsChecked(idx)
+            self._update_point_highlights()
+
+    def _update_point_highlights(self):
+        """Send coordinates of checked candidates to the 2D plotter for visualization."""
+        if not self.plotterA:
+            return
+            
+        x_hlts = []
+        y_hlts = []
+        for c in self._candidates:
+            if c.get('is_checked'):
+                wl = c.get("center_wavelength_nm")
+                ang = c.get("angle_deg")
+                if wl is not None and ang is not None:
+                    x_hlts.append(wl)
+                    y_hlts.append(ang)
+        
+        # Use Turquoise (#40E0D0) for blue-greenish highlight
+        self.plotterA.set_points(x_hlts, y_hlts, color="#40E0D0", size=40)
 
 
     def get_contrast_percent(self) -> Tuple[float, float]:
@@ -323,6 +430,7 @@ class CosmicReviewDialog(wx.Dialog):
             xlabel="Wavelength (nm)",
             ylabel="Angle (deg)"
         )
+        self._update_point_highlights()
         self._apply_contrast_from_sliders()
         self.figure.tight_layout()
         self.canvas.draw_idle()
