@@ -40,6 +40,7 @@ from __future__ import annotations
 import os
 import analysis
 from merge_runs_gui import MergeRunsDialog
+from two_d_map_fitting_gui import MapFittingDialog
 from typing import List, Optional, Dict, Any, Tuple
 
 import wx
@@ -155,6 +156,12 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_new_view, item_new_view)
         self.Bind(wx.EVT_MENU, self.on_close_current_view, item_close_view)
         menubar.Append(view_menu, "&View")
+
+        # Tools menu
+        tools_menu = wx.Menu()
+        item_2d_fit = tools_menu.Append(wx.ID_ANY, "2D Map Fitting...")
+        self.Bind(wx.EVT_MENU, self.on_2d_map_fitting, item_2d_fit)
+        menubar.Append(tools_menu, "&Tools")
 
         self.SetMenuBar(menubar)
 
@@ -301,6 +308,34 @@ class MainFrame(wx.Frame):
         self.experiment.add_run(new_run)
         self.log_panel.append_log(f"Created summed run: {new_nickname}")
         self._refresh_left_panels()
+
+    def on_2d_map_fitting(self, event):
+        """
+        Open the 2D map fitting tool. Requires exactly two 2D runs to be selected.
+        """
+        run_ids = self.runs_panel._get_selected_run_ids()
+        if len(run_ids) != 2:
+            wx.MessageBox("Please select exactly two 2D runs in the Experiment tab.", "Selection Error", wx.OK | wx.ICON_ERROR)
+            return
+            
+        run1 = self.experiment.get_run(run_ids[0])
+        run2 = self.experiment.get_run(run_ids[1])
+        
+        if not (run1.is_2d and run2.is_2d):
+            wx.MessageBox("Both selected runs must be 2D runs.", "Selection Error", wx.OK | wx.ICON_ERROR)
+            return
+            
+        dlg = MapFittingDialog(self, run1, run2)
+        dlg.ShowModal()
+            
+        # Add any result runs to experiment
+        if dlg.result_runs:
+            for r in dlg.result_runs:
+                self.experiment.add_run(r)
+            self.log_panel.append_log(f"Added {len(dlg.result_runs)} reconstruction runs to experiment.")
+            self._refresh_left_panels()
+            
+        dlg.Destroy()
 
     # -------- layout --------
 

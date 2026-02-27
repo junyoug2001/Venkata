@@ -1,5 +1,5 @@
 {
-    "colormap": "OrRd",
+    "colormap": "magma_r",
     "unit": "cm-1",
     "dark_value": 600.0,
     "cosmic_threshold": 1200.0,
@@ -8,5 +8,5 @@
         1400,
         800
     ],
-    "last_directory": ""
+    "last_directory": "/Users/joonyounglee/Library/Mobile Documents/com~apple~CloudDocs/01_Data/260119_RbPdS"
 }

@@ -912,6 +912,333 @@ def apply_cosmic_removal(
 
 
 # ============================================================================
+# 2D Map Fitting Logic
+# ============================================================================
+
+from scipy.optimize import curve_fit
+
+def _deg2rad(x): return np.deg2rad(x)
+def _abs2(x): return np.abs(x)**2
+
+class SelectionRules:
+    @staticmethod
+    def D2h_Ag(theta, config, a, b, phi):
+        th = _deg2rad(theta - phi)
+        if config == 'parallel':
+            return _abs2(a * np.cos(th)**2 + b * np.sin(th)**2)
+        else:
+            return _abs2(0.5 * (a - b) * np.sin(2 * th))
+
+    @staticmethod
+    def D2h_B1g(theta, config, d, phi):
+        th = _deg2rad(theta - phi)
+        if config == 'parallel':
+            return _abs2(d * np.sin(2 * th))
+        else:
+            return _abs2(d * np.cos(2 * th))
+
+    @staticmethod
+    def D6h_A1g(theta, config, a):
+        if config == 'parallel': return np.full_like(theta, a**2)
+        return np.zeros_like(theta)
+
+    @staticmethod
+    def D6h_E2g(theta, config, d):
+        return np.full_like(theta, d**2)
+
+    @staticmethod
+    def Linear_Background(theta, offset, slope):
+        return offset + slope * theta
+
+RULE_METADATA = {
+    "D2h_Ag":  {"func": SelectionRules.D2h_Ag,  "params": ["a", "b", "phi"]},
+    "D2h_B1g": {"func": SelectionRules.D2h_B1g, "params": ["d", "phi"]},
+    "D6h_A1g": {"func": SelectionRules.D6h_A1g, "params": ["a"]},
+    "D6h_E2g": {"func": SelectionRules.D6h_E2g, "params": ["d"]},
+}
+
+def lorentzian_normalized(x, x0, gamma):
+    g = np.abs(gamma) + 1e-9
+    return (1 / np.pi) * (g / ((x - x0)**2 + g**2))
+
+class MapFittingEngine:
+    def __init__(self):
+        self.datasets = [
+            {"label": "Parallel (XX)", "config": "parallel", "x": None, "ang": None, "z": None, "nickname": "XX"},
+            {"label": "Cross (YX)",    "config": "cross",    "x": None, "ang": None, "z": None, "nickname": "YX"}
+        ]
+        self.peaks = [] 
+        self.bg_params = {
+            "offset": [0.0, -np.inf, np.inf],
+            "slope":  [0.0, -np.inf, np.inf]
+        }
+        self.x_min_limit = -np.inf
+        self.x_max_limit = np.inf
+        
+    def set_data(self, index, x, ang, z, nickname="Run"):
+        self.datasets[index]["x"] = x
+        self.datasets[index]["ang"] = ang
+        self.datasets[index]["z"] = z
+        self.datasets[index]["nickname"] = nickname
+        
+        if index == 0:
+            self.x_min_limit = x.min()
+            self.x_max_limit = x.max()
+
+    def add_peak(self, name="New Peak", rule_name="D2h_B1g", center=None):
+        if center is None:
+            center = 300.0
+            if self.datasets[0]["x"] is not None:
+                center = np.median(self.datasets[0]["x"])
+            
+        spec_params = { "x0": [center, 0.0, 5000.0], "gamma": [2.0, 0.1, 50.0] }
+        ang_params = {}
+        for p in RULE_METADATA[rule_name]["params"]:
+            ang_params[p] = [10.0, -np.inf, np.inf]
+            if p == "phi": ang_params[p] = [0.0, -180, 180]
+
+        self.peaks.append({ "name": name, "rule": rule_name, "spec_params": spec_params, "ang_params": ang_params })
+
+    def get_mask(self, dataset_index):
+        ds = self.datasets[dataset_index]
+        if ds["x"] is None: return None
+        return (ds["x"] >= self.x_min_limit) & (ds["x"] <= self.x_max_limit)
+
+    def reconstruct(self, dataset_index):
+        ds = self.datasets[dataset_index]
+        if ds["z"] is None: return np.zeros((10, 10))
+        XX, YY = np.meshgrid(ds["x"], ds["ang"])
+        flat_params = self.flatten_params(which_val=0)
+        z_flat = self._calc_single_config(XX.ravel(), YY.ravel(), ds["config"], flat_params)
+        return z_flat.reshape(ds["z"].shape)
+
+    def _calc_single_config(self, x_flat, theta_flat, config_mode, params):
+        bg_off, bg_slope = params[0], params[1]
+        intensity = SelectionRules.Linear_Background(theta_flat, bg_off, bg_slope)
+        idx = 2
+        for peak in self.peaks:
+            x0, gamma = params[idx], params[idx+1]
+            idx += 2
+            rule_def = RULE_METADATA[peak["rule"]]
+            n_ang = len(rule_def["params"])
+            ang_p = params[idx : idx+n_ang]
+            idx += n_ang
+            I_val = rule_def["func"](theta_flat, config_mode, *ang_p)
+            area = I_val / (np.abs(gamma) + 1e-9)
+            intensity += area * lorentzian_normalized(x_flat, x0, gamma)
+        return intensity
+
+    def _joint_model_func(self, xy_tuple, *params):
+        x1, th1, x2, th2 = xy_tuple
+        z1 = self._calc_single_config(x1, th1, "parallel", params)
+        z2 = self._calc_single_config(x2, th2, "cross", params)
+        return np.concatenate([z1, z2])
+
+    def flatten_params(self, which_val=0): 
+        p = [self.bg_params["offset"] [which_val], self.bg_params["slope"] [which_val]]
+        for peak in self.peaks:
+            p.extend([peak["spec_params"]["x0"] [which_val], peak["spec_params"]["gamma"] [which_val]])
+            for name in RULE_METADATA[peak["rule"]]["params"]:
+                p.append(peak["ang_params"] [name] [which_val])
+        return p
+
+    def update_params_from_fit(self, popt):
+        idx = 0
+        self.bg_params["offset"] [0], self.bg_params["slope"] [0] = popt[idx], popt[idx+1]
+        idx = 2
+        for peak in self.peaks:
+            peak["spec_params"]["x0"] [0], peak["spec_params"]["gamma"] [0] = popt[idx], popt[idx+1]
+            idx += 2
+            for name in RULE_METADATA[peak["rule"]]["params"]:
+                peak["ang_params"] [name] [0] = popt[idx]; idx += 1
+
+    def run_optimization(self):
+        if self.datasets[0]["z"] is None or self.datasets[1]["z"] is None:
+            return False, "Data missing"
+        
+        d1 = self.datasets[0]
+        XX1, YY1 = np.meshgrid(d1["x"], d1["ang"])
+        mask1 = np.tile(self.get_mask(0), (len(d1["ang"]), 1)).ravel()
+        x1_fit = XX1.ravel()[mask1]
+        th1_fit = YY1.ravel()[mask1]
+        z1_fit = d1["z"].ravel()[mask1]
+        
+        d2 = self.datasets[1]
+        XX2, YY2 = np.meshgrid(d2["x"], d2["ang"])
+        mask2 = np.tile(self.get_mask(1), (len(d2["ang"]), 1)).ravel()
+        x2_fit = XX2.ravel()[mask2]
+        th2_fit = YY2.ravel()[mask2]
+        z2_fit = d2["z"].ravel()[mask2]
+        
+        if len(z1_fit) == 0 or len(z2_fit) == 0:
+            return False, "No data points in range for one or both datasets."
+
+        z_combined = np.concatenate([z1_fit, z2_fit])
+        p0, lower, upper = self.flatten_params(0), self.flatten_params(1), self.flatten_params(2)
+        
+        try:
+            popt, _ = curve_fit(self._joint_model_func, (x1_fit, th1_fit, x2_fit, th2_fit), z_combined, 
+                                p0=p0, bounds=(lower, upper), maxfev=5000)
+            self.update_params_from_fit(popt)
+            return True, "Success"
+        except Exception as e:
+            return False, str(e)
+
+    def validate_row_by_row(self):
+        """Perform row-by-row fitting and return results."""
+        if self.datasets[0]["z"] is None: return False, "No Data", None
+        
+        validation_results = []
+        
+        for ds_idx, ds in enumerate(self.datasets):
+            rows_params = []
+            rec_matrix = []
+            
+            config_mode = ds["config"]
+            x_full = ds["x"]
+            mask = self.get_mask(ds_idx)
+            x_fit = x_full[mask]
+            
+            headers = ["Angle", "BG_Const"]
+            for i, p in enumerate(self.peaks):
+                headers.extend([f"P{i+1}_Area", f"P{i+1}_Gamma", f"P{i+1}_Height"])
+            
+            for r in range(len(ds["ang"])):
+                angle = ds["ang"][r]
+                z_row = ds["z"][r, :]
+                z_fit_data = z_row[mask]
+                
+                if len(z_fit_data) == 0:
+                    rows_params.append([angle, np.nan] + [np.nan]*(3*len(self.peaks)))
+                    rec_matrix.append(np.zeros_like(x_full))
+                    continue
+
+                bg_guess = self.bg_params["offset"][0] + self.bg_params["slope"][0] * angle
+                p0_row = [bg_guess]
+                bounds_low = [-np.inf]
+                bounds_high = [np.inf]
+                
+                for peak in self.peaks:
+                    g_guess = peak["spec_params"]["gamma"][0]
+                    g_min = peak["spec_params"]["gamma"][1]
+                    g_max = peak["spec_params"]["gamma"][2]
+                    
+                    rule_def = RULE_METADATA[peak["rule"]]
+                    ang_p = [peak["ang_params"][pn][0] for pn in rule_def["params"]]
+                    I_val = rule_def["func"](np.array([angle]), config_mode, *ang_p)[0]
+                    area_guess = I_val / (np.abs(g_guess) + 1e-9)
+                    
+                    p0_row.extend([area_guess, g_guess])
+                    bounds_low.extend([0, g_min])
+                    bounds_high.extend([np.inf, g_max])
+                
+                def fit_func(x, *p):
+                    y = np.full_like(x, p[0])
+                    idx = 1
+                    for k in range(len(self.peaks)):
+                        area, gamma = p[idx], p[idx+1]
+                        idx += 2
+                        x0 = self.peaks[k]["spec_params"]["x0"][0] 
+                        y += area * lorentzian_normalized(x, x0, gamma)
+                    return y
+
+                try:
+                    popt, _ = curve_fit(fit_func, x_fit, z_fit_data, p0=p0_row, bounds=(bounds_low, bounds_high), maxfev=2000)
+                    row_res = [angle, popt[0]]
+                    idx = 1
+                    for k in range(len(self.peaks)):
+                        area, gamma = popt[idx], popt[idx+1]
+                        idx += 2
+                        height = area * (1.0 / (np.pi * gamma))
+                        row_res.extend([area, gamma, height])
+                    rows_params.append(row_res)
+                    z_rec_row = fit_func(x_full, *popt)
+                    rec_matrix.append(z_rec_row)
+                except Exception as e:
+                    row_res = [angle, np.nan] + [np.nan]*(3*len(self.peaks))
+                    rows_params.append(row_res)
+                    rec_matrix.append(np.zeros_like(x_full))
+
+            validation_results.append({
+                "label": ds["label"],
+                "x": ds["x"],
+                "ang": ds["ang"],
+                "z_raw": ds["z"],
+                "z_rec": np.array(rec_matrix),
+                "params": rows_params,
+                "headers": headers
+            })
+            
+        return True, "Validation Complete", validation_results
+
+    def get_peak_reconstructions(self):
+        """Generate matrices for individual peaks and background."""
+        if self.datasets[0]["z"] is None: return []
+
+        results = []
+        flat_params = self.flatten_params(which_val=0) 
+
+        for ds_idx, ds in enumerate(self.datasets):
+            XX, YY = np.meshgrid(ds["x"], ds["ang"])
+            x_flat = XX.ravel()
+            theta_flat = YY.ravel()
+            
+            # Background
+            bg_off, bg_slope = flat_params[0], flat_params[1]
+            z_bg_flat = SelectionRules.Linear_Background(theta_flat, bg_off, bg_slope)
+            z_bg = z_bg_flat.reshape(ds["z"].shape)
+            
+            results.append({
+                "dataset_idx": ds_idx,
+                "name": "Background",
+                "matrix": z_bg
+            })
+
+            current_idx = 2
+            for i, peak in enumerate(self.peaks):
+                x0 = flat_params[current_idx]
+                gamma = flat_params[current_idx+1]
+                current_idx += 2
+                
+                rule_def = RULE_METADATA[peak["rule"]]
+                n_ang = len(rule_def["params"])
+                ang_p = flat_params[current_idx : current_idx+n_ang]
+                current_idx += n_ang
+                
+                I_val = rule_def["func"](theta_flat, ds["config"], *ang_p)
+                area = I_val / (np.abs(gamma) + 1e-9)
+                z_peak_flat = area * lorentzian_normalized(x_flat, x0, gamma)
+                z_peak = z_peak_flat.reshape(ds["z"].shape)
+                
+                results.append({
+                    "dataset_idx": ds_idx,
+                    "name": peak["name"],
+                    "matrix": z_peak
+                })
+        
+        return results
+
+    def export_parameters_text(self):
+        """Return a string summary of parameters."""
+        lines = []
+        lines.append(f"# Joint Fit Export")
+        lines.append(f"# Range: {self.x_min_limit} - {self.x_max_limit}")
+        lines.append(f"[Background]")
+        lines.append(f"Offset: {self.bg_params['offset'][0]} [{self.bg_params['offset'][1]}, {self.bg_params['offset'][2]}]")
+        lines.append(f"Slope: {self.bg_params['slope'][0]} [{self.bg_params['slope'][1]}, {self.bg_params['slope'][2]}]")
+        lines.append("")
+        for i, p in enumerate(self.peaks):
+            lines.append(f"[Peak {i+1}: {p['name']}]")
+            lines.append(f"Rule: {p['rule']}")
+            lines.append(f"Center (x0): {p['spec_params']['x0'][0]} [{p['spec_params']['x0'][1]}, {p['spec_params']['x0'][2]}]")
+            lines.append(f"Width (Gamma): {p['spec_params']['gamma'][0]} [{p['spec_params']['gamma'][1]}, {p['spec_params']['gamma'][2]}]")
+            for k, v in p['ang_params'].items(): 
+                lines.append(f"{k}: {v[0]} [{v[1]}, {v[2]}]")
+            lines.append("")
+        return "\n".join(lines)
+
+
+# ============================================================================
 # Stage-1 and Stage-2 API
 # ============================================================================
 
