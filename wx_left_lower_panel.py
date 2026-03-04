@@ -62,6 +62,10 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.colors import LinearSegmentedColormap, to_hex, to_rgba
+
 class CurveFitPanel(wx.Panel):
     """
     Curve Fit tab: 1D curve fitting implementation.
@@ -652,6 +656,264 @@ class CurveFitPanel(wx.Panel):
         self.on_run_created(new_run, overlay_target_run=self.source_run, overlay_plot_type=self.plot_type)
 
 
+
+class CustomColorbarsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Custom Colormaps", size=(500, 450), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        
+        # Load from config
+        self.custom_cmaps = config.get('custom_colormaps', {})
+        if not self.custom_cmaps:
+            self.custom_cmaps = {"MyCustomMap": [[0.0, "#000000"], [1.0, "#FFFFFF"]]}
+            
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Top: Chooser and New/Delete
+        top_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        top_sizer.Add(wx.StaticText(self, label="Colormap:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        
+        self.choice_cmap = wx.Choice(self)
+        top_sizer.Add(self.choice_cmap, 1, wx.EXPAND | wx.ALL, 5)
+        
+        self.btn_new = wx.Button(self, label="New")
+        self.btn_copy = wx.Button(self, label="Copy Existing")
+        self.btn_reverse = wx.Button(self, label="Reverse")
+        self.btn_delete = wx.Button(self, label="Delete")
+        
+        top_sizer.Add(self.btn_new, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        top_sizer.Add(self.btn_copy, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        top_sizer.Add(self.btn_reverse, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        top_sizer.Add(self.btn_delete, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        
+        main_sizer.Add(top_sizer, 0, wx.EXPAND)
+        
+        # Nodes editor
+        self.lc = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.lc.InsertColumn(0, "Position (0-1)", width=100)
+        self.lc.InsertColumn(1, "Color", width=100)
+        main_sizer.Add(self.lc, 1, wx.EXPAND | wx.ALL, 5)
+        
+        edit_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.slider_pos = wx.Slider(self, value=0, minValue=0, maxValue=1000)
+        self.txt_pos = wx.TextCtrl(self, size=(50, -1))
+        self.cp = wx.ColourPickerCtrl(self)
+        self.btn_update = wx.Button(self, label="Update Node")
+        self.btn_add = wx.Button(self, label="Add Node")
+        self.btn_remove = wx.Button(self, label="Remove Node")
+        
+        edit_sizer.Add(wx.StaticText(self, label="Pos:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        edit_sizer.Add(self.slider_pos, 1, wx.EXPAND | wx.ALL, 5)
+        edit_sizer.Add(self.txt_pos, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        edit_sizer.Add(self.cp, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        edit_sizer.Add(self.btn_update, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        edit_sizer.Add(self.btn_add, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        edit_sizer.Add(self.btn_remove, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        main_sizer.Add(edit_sizer, 0, wx.EXPAND)
+        
+        # Preview
+        self.fig = Figure(figsize=(4, 0.5))
+        self.canvas = FigureCanvas(self, -1, self.fig)
+        self.ax = self.fig.add_axes([0.05, 0.2, 0.9, 0.6])
+        self.ax.set_yticks([])
+        main_sizer.Add(self.canvas, 0, wx.EXPAND | wx.ALL, 5)
+        
+        btn_sizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
+        main_sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        self.SetSizer(main_sizer)
+        
+        # Bindings
+        self.choice_cmap.Bind(wx.EVT_CHOICE, self.on_cmap_select)
+        self.btn_new.Bind(wx.EVT_BUTTON, self.on_new)
+        self.btn_copy.Bind(wx.EVT_BUTTON, self.on_copy_existing)
+        self.btn_reverse.Bind(wx.EVT_BUTTON, self.on_reverse)
+        self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
+        self.lc.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_node_select)
+        self.slider_pos.Bind(wx.EVT_SLIDER, self.on_slider_scroll)
+        self.btn_update.Bind(wx.EVT_BUTTON, self.on_update_node)
+        self.btn_add.Bind(wx.EVT_BUTTON, self.on_add_node)
+        self.btn_remove.Bind(wx.EVT_BUTTON, self.on_remove_node)
+        
+        self.refresh_cmap_list()
+        
+    def refresh_cmap_list(self):
+        names = list(self.custom_cmaps.keys())
+        self.choice_cmap.Set(names)
+        if names:
+            self.choice_cmap.SetSelection(0)
+            self.load_nodes(names[0])
+        else:
+            self.lc.DeleteAllItems()
+            self.ax.clear()
+            self.canvas.draw_idle()
+
+    def load_nodes(self, name):
+        nodes = self.custom_cmaps.get(name, [])
+        # Ensure sorted
+        nodes.sort(key=lambda x: x[0])
+        self.custom_cmaps[name] = nodes
+        
+        self.lc.DeleteAllItems()
+        for pos, col in nodes:
+            idx = self.lc.InsertItem(self.lc.GetItemCount(), f"{pos:.3f}")
+            self.lc.SetItem(idx, 1, col)
+            # Use color for background, contrast for text
+            c = wx.Colour(col)
+            self.lc.SetItemBackgroundColour(idx, c)
+            lum = 0.299*c.Red() + 0.587*c.Green() + 0.114*c.Blue()
+            self.lc.SetItemTextColour(idx, wx.BLACK if lum > 128 else wx.WHITE)
+            
+        self.update_preview()
+        
+    def update_preview(self):
+        self.ax.clear()
+        self.ax.set_yticks([])
+        name = self.choice_cmap.GetStringSelection()
+        nodes = self.custom_cmaps.get(name, [])
+        
+        if len(nodes) >= 2:
+            # Sort just in case
+            sorted_nodes = sorted(nodes, key=lambda x: x[0])
+            positions = [float(p) for p, c in sorted_nodes]
+            colors = [c for p, c in sorted_nodes]
+            
+            # Matplotlib requires exactly 0 and 1 at the ends
+            span = positions[-1] - positions[0]
+            if span > 0:
+                positions = [(p - positions[0]) / span for p in positions]
+            
+            positions[0] = 0.0
+            positions[-1] = 1.0
+                
+            try:
+                cmap = LinearSegmentedColormap.from_list("preview", list(zip(positions, colors)))
+                cb = self.fig.colorbar(cm.ScalarMappable(cmap=cmap), cax=self.ax, orientation='horizontal')
+                self.canvas.draw_idle()
+            except Exception as e:
+                pass
+
+    def get_current_name(self):
+        return self.choice_cmap.GetStringSelection()
+
+    def on_cmap_select(self, event):
+        self.load_nodes(self.get_current_name())
+        
+    def on_new(self, event):
+        dlg = wx.TextEntryDialog(self, "New colormap name:", "New Colormap")
+        if dlg.ShowModal() == wx.ID_OK:
+            name = dlg.GetValue().strip()
+            if name and name not in self.custom_cmaps:
+                self.custom_cmaps[name] = [[0.0, "#000000"], [1.0, "#FFFFFF"]]
+                self.refresh_cmap_list()
+                self.choice_cmap.SetStringSelection(name)
+                self.load_nodes(name)
+        dlg.Destroy()
+        
+    def on_delete(self, event):
+        name = self.get_current_name()
+        if name in self.custom_cmaps:
+            del self.custom_cmaps[name]
+            self.refresh_cmap_list()
+
+    def on_copy_existing(self, event):
+        cmaps = ['OrRd', 'rocket_r', 'inferno', 'magma_r', 'cividis', 'gray', 'seismic', 'jet', 'hsv']
+        if HAS_CMCRAMERI:
+            cmaps.extend(['cmc.batlow', 'cmc.roma', 'cmc.lajolla', 'cmc.oslo', 'cmc.tokyo'])
+        dlg = wx.SingleChoiceDialog(self, "Select base colormap to copy:", "Copy Existing", cmaps)
+        if dlg.ShowModal() == wx.ID_OK:
+            base = dlg.GetStringSelection()
+            name_dlg = wx.TextEntryDialog(self, "New custom colormap name:", "Name", value=f"{base}_custom")
+            if name_dlg.ShowModal() == wx.ID_OK:
+                name = name_dlg.GetValue().strip()
+                if name:
+                    try:
+                        cmap = plt.get_cmap(base)
+                    except Exception:
+                        cmap = plt.get_cmap('OrRd')
+                    
+                    nodes = []
+                    # Sample 5 points from the colormap
+                    for p in np.linspace(0, 1, 5):
+                        c = to_hex(cmap(p))
+                        nodes.append([float(p), c])
+                    
+                    self.custom_cmaps[name] = nodes
+                    self.refresh_cmap_list()
+                    self.choice_cmap.SetStringSelection(name)
+                    self.load_nodes(name)
+            name_dlg.Destroy()
+        dlg.Destroy()
+
+    def on_reverse(self, event):
+        name = self.get_current_name()
+        if not name: return
+        nodes = self.custom_cmaps[name]
+        new_nodes = []
+        for pos, col in nodes:
+            new_nodes.append([1.0 - pos, col])
+        new_nodes.sort(key=lambda x: x[0])
+        self.custom_cmaps[name] = new_nodes
+        self.load_nodes(name)
+            
+    def on_node_select(self, event):
+        idx = event.GetIndex()
+        name = self.get_current_name()
+        if not name: return
+        pos, col = self.custom_cmaps[name][idx]
+        self.txt_pos.SetValue(f"{pos:.3f}")
+        self.slider_pos.SetValue(int(pos * 1000))
+        self.cp.SetColour(wx.Colour(col))
+        
+    def on_slider_scroll(self, event):
+        val = self.slider_pos.GetValue() / 1000.0
+        self.txt_pos.SetValue(f"{val:.3f}")
+        # update visually without re-selecting
+        self.on_update_node(None)
+        
+    def on_update_node(self, event):
+        idx = self.lc.GetFirstSelected()
+        name = self.get_current_name()
+        if idx >= 0 and name:
+            try:
+                pos = float(self.txt_pos.GetValue())
+                col = self.cp.GetColour().GetAsString(wx.C2S_HTML_SYNTAX)
+                
+                self.custom_cmaps[name][idx] = [pos, col]
+                self.load_nodes(name)
+                
+                # Re-select the updated node
+                new_idx = -1
+                for i, (p, c) in enumerate(self.custom_cmaps[name]):
+                    if p == pos and c == col:
+                        new_idx = i
+                        break
+                if new_idx >= 0:
+                    self.lc.Select(new_idx)
+                
+            except ValueError:
+                wx.MessageBox("Invalid position")
+                
+    def on_add_node(self, event):
+        name = self.get_current_name()
+        if not name: return
+        try:
+            pos = float(self.txt_pos.GetValue())
+            col = self.cp.GetColour().GetAsString(wx.C2S_HTML_SYNTAX)
+            self.custom_cmaps[name].append([pos, col])
+            self.load_nodes(name)
+        except ValueError:
+            wx.MessageBox("Invalid position")
+            
+    def on_remove_node(self, event):
+        idx = self.lc.GetFirstSelected()
+        name = self.get_current_name()
+        if idx >= 0 and name and len(self.custom_cmaps[name]) > 2:
+            self.custom_cmaps[name].pop(idx)
+            self.load_nodes(name)
+            
+    def get_results(self):
+        return self.custom_cmaps
+
 class PlotConfigPanel(wx.Panel):
     def __init__(self, parent, on_reset=None):
         super().__init__(parent)
@@ -708,11 +970,18 @@ class PlotConfigPanel(wx.Panel):
         cmap_sizer = wx.BoxSizer(wx.HORIZONTAL)
         cmap_sizer.Add(wx.StaticText(self, label="Colormap:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         
-        self.cmaps_std = ['OrRd', 'rocket_r', 'inferno', 'magma_r', 'cividis', 'gray', 'seismic', 'jet', 'hsv']
-        self.cmaps_cmc = []
+        # Ensure seaborn is imported so its cmaps are registered
+        try:
+            import seaborn as sns
+        except ImportError:
+            pass
+
+        # Get all matplotlib colormaps (including registered ones like seaborn)
+        self.cmaps_std = sorted([m for m in plt.colormaps() if not m.startswith('cmc.')])
+        self.cmaps_cmc = sorted([m for m in plt.colormaps() if m.startswith('cmc.')])
         
-        if HAS_CMCRAMERI:
-            # Adding more continuous Crameri maps for Plot A
+        if HAS_CMCRAMERI and not self.cmaps_cmc:
+            # Fallback if cmcrameri didn't auto-register
             self.cmaps_cmc = [
                 'cmc.batlow', 'cmc.batlowW', 'cmc.batlowK', 
                 'cmc.glasgow', 'cmc.lipari', 'cmc.navia', 
@@ -742,23 +1011,17 @@ class PlotConfigPanel(wx.Panel):
         cat_choices = ['Standard']
         if self.cmaps_cmc:
             cat_choices.append('CMCrameri')
+        cat_choices.append('Custom...')
         self.choice_cat = wx.Choice(self, choices=cat_choices)
         
-        # Map Choice
-        self.choice_cmap = wx.Choice(self) # Create empty, will be populated below
+        # Map Choice - Using ComboBox for searchability
+        self.choice_cmap = wx.ComboBox(self, style=wx.CB_DROPDOWN) 
+        
+        self._register_custom_cmaps()
 
         # Load saved colormap and populate choices
         saved_cmap = config.get('colormap', 'OrRd')
-        if saved_cmap.startswith('cmc.') and self.cmaps_cmc:
-            self.choice_cat.SetStringSelection('CMCrameri')
-            self.choice_cmap.Set(self.cmaps_cmc)
-        else:
-            self.choice_cat.SetStringSelection('Standard')
-            self.choice_cmap.Set(self.cmaps_std)
-            
-        self.choice_cmap.SetStringSelection(saved_cmap)
-        if self.choice_cmap.GetSelection() == wx.NOT_FOUND and self.choice_cmap.GetCount() > 0:
-            self.choice_cmap.SetSelection(0)
+        self.set_colormap(saved_cmap)
 
         cmap_sizer.Add(self.choice_cat, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
         cmap_sizer.Add(self.choice_cmap, 1, wx.EXPAND)
@@ -821,10 +1084,12 @@ class PlotConfigPanel(wx.Panel):
         self.txt_vmax.Bind(wx.EVT_TEXT_ENTER, self.on_vlim_text_enter)
         
         self.choice_cat.Bind(wx.EVT_CHOICE, self.on_cat_change)
-        self.choice_cmap.Bind(wx.EVT_CHOICE, self.on_cmap_change)
+        self.choice_cmap.Bind(wx.EVT_COMBOBOX, self.on_cmap_change)
+        self.choice_cmap.Bind(wx.EVT_TEXT, self.on_cmap_text)
         self.reset_button.Bind(wx.EVT_BUTTON, self.on_reset_button)
         self.btn_roi_vlim.Bind(wx.EVT_BUTTON, self.on_roi_vlim_button)
 
+        self._filtering = False
         self.target_view: Optional["ViewPanel"] = None
         self.set_target_view(None)
 
@@ -872,21 +1137,76 @@ class PlotConfigPanel(wx.Panel):
 
     def on_cat_change(self, event):
         cat = self.choice_cat.GetStringSelection()
-        if cat == 'CMCrameri':
+        self._filtering = True
+        
+        # If Custom, we want to disable search/typing so user can see and modify directly
+        if cat == 'Custom...':
+            # Note: We can't easily change style, but we can clear and disable text part
+            cmaps = list(config.get('custom_colormaps', {}).keys())
+            self.choice_cmap.Set(cmaps + ['Edit Custom...'])
+            if cmaps:
+                self.choice_cmap.SetSelection(0)
+            # Try to disable typing
+            try:
+                self.choice_cmap.GetTextCtrl().SetEditable(False)
+            except Exception:
+                pass
+        elif cat == 'CMCrameri':
             self.choice_cmap.Set(self.cmaps_cmc)
             if self.cmaps_cmc:
                 self.choice_cmap.SetSelection(0)
-        else:
+            try:
+                self.choice_cmap.GetTextCtrl().SetEditable(True)
+            except Exception:
+                pass
+        else: # Standard
             self.choice_cmap.Set(self.cmaps_std)
             if 'OrRd' in self.cmaps_std:
                 self.choice_cmap.SetStringSelection('OrRd')
             elif self.cmaps_std:
                 self.choice_cmap.SetSelection(0)
-        
-        # Optionally trigger map change immediately? 
-        # Better to wait for user to pick a map, or pick default?
-        # Let's pick default and trigger.
+            try:
+                self.choice_cmap.GetTextCtrl().SetEditable(True)
+            except Exception:
+                pass
+                
+        self._filtering = False
         self.on_cmap_change(None)
+
+    def on_cmap_text(self, event):
+        """Filter the ComboBox list based on user input."""
+        if self._filtering:
+            return
+            
+        cat = self.choice_cat.GetStringSelection()
+        if cat == 'Custom...':
+            # Skip filtering for Custom category so they always see all items
+            return
+            
+        txt = self.choice_cmap.GetValue().lower()
+        if not txt:
+            return
+            
+        if cat == 'Standard':
+            base_list = self.cmaps_std
+        elif cat == 'CMCrameri':
+            base_list = self.cmaps_cmc
+        else: # Should not happen given the return above
+            base_list = list(config.get('custom_colormaps', {}).keys()) + ['Edit Custom...']
+            
+        filtered = [m for m in base_list if txt in m.lower()]
+        
+        if filtered:
+            self._filtering = True
+            current_val = self.choice_cmap.GetValue()
+            insertion_point = self.choice_cmap.GetInsertionPoint()
+            
+            self.choice_cmap.Set(filtered)
+            self.choice_cmap.SetValue(current_val)
+            self.choice_cmap.SetInsertionPoint(insertion_point)
+            
+            # self.choice_cmap.Popup() # Optional: auto-popup
+            self._filtering = False
 
     def on_unit_change(self, event):
         rb = event.GetEventObject()
@@ -964,10 +1284,102 @@ class PlotConfigPanel(wx.Panel):
             self.target_view.set_vlim_absolute(vmin, vmax)
             self.update_absolute_vlim_display(vmin, vmax)
 
+    def _register_custom_cmaps(self):
+        custom_maps = config.get('custom_colormaps', {})
+        for name, nodes in custom_maps.items():
+            if len(nodes) < 2: continue
+            
+            # Sort just in case
+            sorted_nodes = sorted(nodes, key=lambda x: x[0])
+            positions = [float(p) for p, c in sorted_nodes]
+            colors = [c for p, c in sorted_nodes]
+            
+            # Matplotlib requires exactly 0 and 1 at the ends
+            span = positions[-1] - positions[0]
+            if span > 0:
+                positions = [(p - positions[0]) / span for p in positions]
+            
+            positions[0] = 0.0
+            positions[-1] = 1.0
+            
+            try:
+                cmap = LinearSegmentedColormap.from_list(name, list(zip(positions, colors)))
+                try:
+                    plt.colormaps.register(cmap=cmap, force=True)
+                except AttributeError:
+                    plt.register_cmap(cmap=cmap)
+            except Exception as e:
+                pass
+
     def on_cmap_change(self, event):
-        cmap = self.choice_cmap.GetStringSelection()
+        cmap = self.choice_cmap.GetValue()
+        if not cmap: return
+        
+        previous_cmap = config.get('colormap', 'OrRd')
+
+        if cmap == 'Edit Custom...':
+            dlg = CustomColorbarsDialog(self)
+            
+            # Try to pre-select previous if it's custom
+            base_previous = previous_cmap[:-2] if previous_cmap.endswith('_r') else previous_cmap
+            if base_previous in config.get('custom_colormaps', {}):
+                dlg.choice_cmap.SetStringSelection(base_previous)
+                dlg.load_nodes(base_previous)
+                
+            if dlg.ShowModal() == wx.ID_OK:
+                config.set('custom_colormaps', dlg.get_results())
+                self._register_custom_cmaps()
+                
+                new_cmap = dlg.get_current_name()
+                custom_cmaps = list(config.get('custom_colormaps', {}).keys())
+                self._filtering = True
+                self.choice_cmap.Set(custom_cmaps + ['Edit Custom...'])
+                
+                if new_cmap in custom_cmaps:
+                    self.choice_cmap.SetValue(new_cmap)
+                    cmap = new_cmap
+                elif custom_cmaps:
+                    self.choice_cmap.SetSelection(0)
+                    cmap = self.choice_cmap.GetValue()
+                else:
+                    self.choice_cat.SetSelection(0)
+                    self._filtering = False
+                    self.on_cat_change(None)
+                    return
+                self._filtering = False
+            else:
+                # Cancelled, revert
+                custom_cmaps = list(config.get('custom_colormaps', {}).keys())
+                self._filtering = True
+                self.choice_cmap.Set(custom_cmaps + ['Edit Custom...'])
+                if previous_cmap in custom_cmaps:
+                    self.choice_cmap.SetValue(previous_cmap)
+                    cmap = previous_cmap
+                elif custom_cmaps:
+                    self.choice_cmap.SetSelection(0)
+                    cmap = self.choice_cmap.GetValue()
+                else:
+                    self.choice_cat.SetSelection(0)
+                    self._filtering = False
+                    self.on_cat_change(None)
+                    return
+                self._filtering = False
+            dlg.Destroy()
+
+        # Verify it exists in matplotlib
+        try:
+            plt.get_cmap(cmap)
+        except Exception:
+            # If not found, maybe it was a custom map that we just didn't register yet
+            # Try to register all custom maps again just in case
+            self._register_custom_cmaps()
+            try:
+                plt.get_cmap(cmap)
+            except Exception:
+                return
+
         config.set('colormap', cmap)
-        if self.target_view:
+        if self.target_view and cmap != 'Edit Custom...':
             self.target_view.set_colormap(cmap)
     
     def on_reset_button(self, event):
@@ -989,7 +1401,22 @@ class PlotConfigPanel(wx.Panel):
         self.txt_vmax.SetValue(str(int(vmax)))
 
     def set_colormap(self, cmap_name):
-        self.choice_cmap.SetStringSelection(cmap_name)
+        # Switch category if needed
+        custom_maps = config.get('custom_colormaps', {})
+        if cmap_name in custom_maps or (cmap_name.endswith('_r') and cmap_name[:-2] in custom_maps):
+            if self.choice_cat.GetStringSelection() != 'Custom...':
+                self.choice_cat.SetStringSelection('Custom...')
+                self.choice_cmap.Set(list(custom_maps.keys()) + ['Edit Custom...'])
+        elif cmap_name.startswith('cmc.') and self.cmaps_cmc:
+            if self.choice_cat.GetStringSelection() != 'CMCrameri':
+                self.choice_cat.SetStringSelection('CMCrameri')
+                self.choice_cmap.Set(self.cmaps_cmc)
+        else:
+            if self.choice_cat.GetStringSelection() != 'Standard':
+                self.choice_cat.SetStringSelection('Standard')
+                self.choice_cmap.Set(self.cmaps_std)
+        
+        self.choice_cmap.SetValue(cmap_name)
 
     def get_x_unit(self):
         return self.x_unit

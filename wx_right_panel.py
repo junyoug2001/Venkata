@@ -123,7 +123,6 @@ class ViewPanel(wx.Panel):
         self.SetSizer(sizer)
 
         self._init_empty_figure()
-        self.canvas.Bind(wx.EVT_CONTEXT_MENU, self._on_context_menu)
 
     def _refresh_after_home(self) -> None:
         self._apply_selection_from_indices(reason="home")
@@ -803,56 +802,22 @@ class ViewPanel(wx.Panel):
         self.canvas.draw_idle()
 
     def _on_canvas_click(self, event):
-        if event.button == 3: # Right click
-            # Plot B: Angular Slice (Angle vs Intensity)
-            if (self.plotterB1 and event.inaxes == self.plotterB1.ax) or \
-               (self.plotterB2 and event.inaxes == self.plotterB2.ax):
-                
-                # Identify which run/plotter
-                target_plotter = self.plotterB1 if event.inaxes == self.plotterB1.ax else self.plotterB2
-                target_run = self.current_run if target_plotter == self.plotterB1 else self._second_run
-                
-                menu = wx.Menu()
-                
-                # Submenu for slice type
-                sub = wx.Menu()
-                item_cart = sub.AppendRadioItem(wx.ID_ANY, "Cartesian")
-                item_polar = sub.AppendRadioItem(wx.ID_ANY, "Polar")
-                if self.angle_slice_type == "polar": item_polar.Check(True)
-                else: item_cart.Check(True)
-                self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("cartesian"), item_cart)
-                self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("polar"), item_polar)
-                menu.AppendSubMenu(sub, "Angle slice type")
-                
-                # Item for creating separate run
-                menu.AppendSeparator()
-                item_create = menu.Append(wx.ID_ANY, "Create separate run")
-                self.Bind(wx.EVT_MENU, lambda e: self._create_run_from_trace(target_plotter, target_run, "B"), item_create)
-                
-                item_fit = menu.Append(wx.ID_ANY, "Curve Fit...")
-                self.Bind(wx.EVT_MENU, lambda e: self._request_curve_fit(target_plotter, target_run, "B"), item_fit)
-                
-                self.PopupMenu(menu)
-                menu.Destroy()
-                return
+        # 0. Handle Right Click on Background (outside axes)
+        if event.button == 3 and event.inaxes is None:
+            menu = wx.Menu()
+            highlight_menu = wx.Menu()
+            modes = ["none", "click", "line_profile", "peak_fit"]
+            for m in modes:
+                item = highlight_menu.AppendRadioItem(wx.ID_ANY, m.capitalize())
+                if self.highlight_mode == m: item.Check(True)
+                self.Bind(wx.EVT_MENU, lambda e, mode=m: self._set_highlight_mode(mode), item)
+            menu.AppendSubMenu(highlight_menu, "Highlight")
+            self.PopupMenu(menu)
+            menu.Destroy()
+            return
 
-            # Plot C: Spectral Slice (Shift vs Intensity)
-            if (self.plotterC1 and event.inaxes == self.plotterC1.ax) or \
-               (self.plotterC2 and event.inaxes == self.plotterC2.ax):
-                
-                target_plotter = self.plotterC1 if event.inaxes == self.plotterC1.ax else self.plotterC2
-                target_run = self.current_run if target_plotter == self.plotterC1 else self._second_run
-                
-                menu = wx.Menu()
-                item_create = menu.Append(wx.ID_ANY, "Create separate run")
-                self.Bind(wx.EVT_MENU, lambda e: self._create_run_from_trace(target_plotter, target_run, "C"), item_create)
-
-                item_fit = menu.Append(wx.ID_ANY, "Curve Fit...")
-                self.Bind(wx.EVT_MENU, lambda e: self._request_curve_fit(target_plotter, target_run, "C"), item_fit)
-                
-                self.PopupMenu(menu)
-                menu.Destroy()
-                return
+        if event.inaxes is None:
+            return
 
         # Determine which plotter was clicked
         clicked_plotter = None
@@ -864,35 +829,89 @@ class ViewPanel(wx.Panel):
         elif self.plotterA2 and event.inaxes == self.plotterA2.ax:
             clicked_plotter = self.plotterA2
             is_run1 = False
+        elif self.plotterB1 and event.inaxes == self.plotterB1.ax:
+            clicked_plotter = self.plotterB1
+            is_run1 = True
+        elif self.plotterB2 and event.inaxes == self.plotterB2.ax:
+            clicked_plotter = self.plotterB2
+            is_run1 = False
+        elif self.plotterC1 and event.inaxes == self.plotterC1.ax:
+            clicked_plotter = self.plotterC1
+            is_run1 = True
+        elif self.plotterC2 and event.inaxes == self.plotterC2.ax:
+            clicked_plotter = self.plotterC2
+            is_run1 = False
         
         if not clicked_plotter:
             return
 
-        if event.button == 3: # Right click on Map
+        # 1. Update selection indices if we clicked on Plot A
+        if clicked_plotter in [self.plotterA1, self.plotterA2]:
+            indices = clicked_plotter.get_index_at(event.xdata, event.ydata)
+            if indices:
+                ix, iy = indices
+                if is_run1:
+                    self._sel_idx1 = (ix, iy)
+                    self._sel_idx2 = (ix, iy) # Simple sync
+                else:
+                    self._sel_idx2 = (ix, iy)
+                    self._sel_idx1 = (ix, iy)
+                self._apply_selection_from_indices(reason="click")
+
+        # 2. Handle Right Click Menu
+        if event.button == 3:
             menu = wx.Menu()
-            item_fit = menu.Append(wx.ID_ANY, "Curve Fit (Row-by-Row)...")
-            target_run = self.current_run if is_run1 else self._second_run
-            self.Bind(wx.EVT_MENU, lambda e: self._request_2d_fit(target_run), item_fit)
+            
+            # Helper to add Highlight mode submenu
+            highlight_menu = wx.Menu()
+            modes = ["none", "click", "line_profile", "peak_fit"]
+            for m in modes:
+                item = highlight_menu.AppendRadioItem(wx.ID_ANY, m.capitalize())
+                if self.highlight_mode == m: item.Check(True)
+                self.Bind(wx.EVT_MENU, lambda e, mode=m: self._set_highlight_mode(mode), item)
+            menu.AppendSubMenu(highlight_menu, "Highlight")
+            menu.AppendSeparator()
+
+            # Plot B: Angular Slice (Angle vs Intensity)
+            if clicked_plotter in [self.plotterB1, self.plotterB2]:
+                target_run = self.current_run if is_run1 else self._second_run
+                
+                # Submenu for slice type
+                sub = wx.Menu()
+                item_cart = sub.AppendRadioItem(wx.ID_ANY, "Cartesian")
+                item_polar = sub.AppendRadioItem(wx.ID_ANY, "Polar")
+                if self.angle_slice_type == "polar": item_polar.Check(True)
+                else: item_cart.Check(True)
+                self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("cartesian"), item_cart)
+                self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("polar"), item_polar)
+                menu.AppendSubMenu(sub, "Angle slice type")
+                
+                menu.AppendSeparator()
+                item_create = menu.Append(wx.ID_ANY, "Create separate run")
+                self.Bind(wx.EVT_MENU, lambda e: self._create_run_from_trace(clicked_plotter, target_run, "B"), item_create)
+                
+                item_fit = menu.Append(wx.ID_ANY, "Curve Fit...")
+                self.Bind(wx.EVT_MENU, lambda e: self._request_curve_fit(clicked_plotter, target_run, "B"), item_fit)
+                
+            # Plot C: Spectral Slice (Shift vs Intensity)
+            elif clicked_plotter in [self.plotterC1, self.plotterC2]:
+                target_run = self.current_run if is_run1 else self._second_run
+                
+                item_create = menu.Append(wx.ID_ANY, "Create separate run")
+                self.Bind(wx.EVT_MENU, lambda e: self._create_run_from_trace(clicked_plotter, target_run, "C"), item_create)
+
+                item_fit = menu.Append(wx.ID_ANY, "Curve Fit...")
+                self.Bind(wx.EVT_MENU, lambda e: self._request_curve_fit(clicked_plotter, target_run, "C"), item_fit)
+
+            # Plot A: Map
+            elif clicked_plotter in [self.plotterA1, self.plotterA2]:
+                item_fit = menu.Append(wx.ID_ANY, "Curve Fit (Row-by-Row)...")
+                target_run = self.current_run if is_run1 else self._second_run
+                self.Bind(wx.EVT_MENU, lambda e: self._request_2d_fit(target_run), item_fit)
+            
             self.PopupMenu(menu)
             menu.Destroy()
             return
-
-        # Get indices from plotter
-        indices = clicked_plotter.get_index_at(event.xdata, event.ydata)
-        if not indices:
-            return
-        ix, iy = indices
-
-        # Update Indices state
-        if is_run1:
-            self._sel_idx1 = (ix, iy)
-            # Optional: Map to idx2 via physical coords if needed
-            self._sel_idx2 = (ix, iy) # Simple sync for now
-        else:
-            self._sel_idx2 = (ix, iy)
-            self._sel_idx1 = (ix, iy) # Simple sync
-
-        self._apply_selection_from_indices(reason="click")
 
     def _request_2d_fit(self, source_run: Run):
         """
@@ -1041,20 +1060,6 @@ class ViewPanel(wx.Panel):
         # Re-draw everything because axes projection needs to change
         self._draw_runs(self._last_drawn_runs)
         self._apply_selection_from_indices()
-
-    def _on_context_menu(self, event):
-        menu = wx.Menu()
-        highlight_menu = wx.Menu()
-        
-        modes = ["none", "click", "line_profile", "peak_fit"]
-        for m in modes:
-            item = highlight_menu.AppendRadioItem(wx.ID_ANY, m.capitalize())
-            if self.highlight_mode == m: item.Check(True)
-            self.Bind(wx.EVT_MENU, lambda e, mode=m: self._set_highlight_mode(mode), item)
-            
-        menu.AppendSubMenu(highlight_menu, "Highlight")
-        self.PopupMenu(menu)
-        menu.Destroy()
 
     def _set_highlight_mode(self, mode: str):
         self.highlight_mode = mode

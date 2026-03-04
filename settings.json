@@ -1,12 +1,68 @@
 {
-    "colormap": "magma_r",
+    "colormap": "cmc.lajolla_custom",
     "unit": "cm-1",
     "dark_value": 600.0,
-    "cosmic_threshold": 1200.0,
-    "cosmic_ratio": 20.0,
+    "cosmic_threshold": 100.0,
+    "cosmic_ratio": 2.0,
     "window_size": [
         1400,
         800
     ],
-    "last_directory": "/Users/joonyounglee/Library/Mobile Documents/com~apple~CloudDocs/01_Data/260119_RbPdS"
+    "last_directory": "/Users/joonyounglee/Library/CloudStorage/Dropbox/QMASS-Data/Raman Spectroscopy/260216_CsPtS",
+    "custom_colormaps": {
+        "MyCustomMap": [
+            [
+                0.0,
+                "#000000"
+            ],
+            [
+                1.0,
+                "#FFFFFF"
+            ]
+        ],
+        "magma_r_custom": [
+            [
+                0.0,
+                "#fcfdbf"
+            ],
+            [
+                0.7,
+                "#FB8761"
+            ],
+            [
+                0.8,
+                "#B5367A"
+            ],
+            [
+                0.9,
+                "#4F127B"
+            ],
+            [
+                1.0,
+                "#000004"
+            ]
+        ],
+        "cmc.lajolla_custom": [
+            [
+                0.0,
+                "#FFFECB"
+            ],
+            [
+                0.5,
+                "#EDAE54"
+            ],
+            [
+                0.6,
+                "#D9604E"
+            ],
+            [
+                0.8,
+                "#67342A"
+            ],
+            [
+                0.9,
+                "#191900"
+            ]
+        ]
+    }
 }

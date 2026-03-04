@@ -41,6 +41,7 @@ import os
 import analysis
 from merge_runs_gui import MergeRunsDialog
 from two_d_map_fitting_gui import MapFittingDialog
+from normalization_gui import NormalizeDialog
 from typing import List, Optional, Dict, Any, Tuple
 
 import wx
@@ -160,7 +161,9 @@ class MainFrame(wx.Frame):
         # Tools menu
         tools_menu = wx.Menu()
         item_2d_fit = tools_menu.Append(wx.ID_ANY, "2D Map Fitting...")
+        item_normalize = tools_menu.Append(wx.ID_ANY, "Normalize...")
         self.Bind(wx.EVT_MENU, self.on_2d_map_fitting, item_2d_fit)
+        self.Bind(wx.EVT_MENU, self.on_normalize, item_normalize)
         menubar.Append(tools_menu, "&Tools")
 
         self.SetMenuBar(menubar)
@@ -335,6 +338,40 @@ class MainFrame(wx.Frame):
             self.log_panel.append_log(f"Added {len(dlg.result_runs)} reconstruction runs to experiment.")
             self._refresh_left_panels()
             
+        dlg.Destroy()
+
+    def on_normalize(self, event):
+        """
+        Open the normalization tool. Requires a 2D run to be selected.
+        """
+        # Get list of runs
+        run_ids = list(self.experiment.runs.keys())
+        if not run_ids:
+            wx.MessageBox("No runs available.", "Error", wx.OK | wx.ICON_ERROR)
+            return
+
+        choices = [f"{self.experiment.get_run_nickname(rid)} ({rid})" for rid in run_ids]
+        
+        with wx.SingleChoiceDialog(self, "Select a run to normalize:", "Normalization", choices) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            selection = dlg.GetSelection()
+            run_id = run_ids[selection]
+        
+        run = self.experiment.get_run(run_id)
+        if not run:
+             return
+
+        if not run.is_2d:
+             wx.MessageBox("Selected run is not a 2D run.", "Info", wx.OK | wx.ICON_INFORMATION)
+             return
+
+        dlg = NormalizeDialog(self, run)
+        if dlg.ShowModal() == wx.ID_OK:
+            if dlg.result_run:
+                self.experiment.add_run(dlg.result_run)
+                self.log_panel.append_log(f"Normalized run created: {dlg.result_run.nickname}")
+                self._refresh_left_panels()
         dlg.Destroy()
 
     # -------- layout --------
