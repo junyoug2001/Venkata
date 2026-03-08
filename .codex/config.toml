@@ -1,0 +1,20 @@
+# Important: do not let Codex walk upward to a parent .git folder.
+# The directory where you launch `codex` becomes the project root.
+project_root_markers = []
+
+# Start Codex with this custom permission profile.
+default_permissions = "only_launch_dir"
+sandbox_mode = "workspace-write"
+
+# Ask before risky operations.
+approval_policy = "on-request"
+
+[permissions.only_launch_dir.filesystem]
+# Required minimal macOS/tool reads.
+":minimal" = "read"
+
+# Allow Codex to read/write only under the current project root.
+":project_roots" = { "." = "write" }
+
+[permissions.only_launch_dir.network]
+enabled = false

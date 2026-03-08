@@ -17,13 +17,14 @@ from data_structure import (
     ExperimentSet,
     Run,
     ViewState,
-    EV_PER_CM1,
     new_experiment_id,
     new_view_id,
-    RunType
+    RunType,
+    normalize_spectral_unit,
 )
 from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
-from config_manager import config
+from config_manager import DEFAULT_SETTINGS, config
+from fit_overlay import normalize_fit_overlay_mode
 
 try:
     import cmcrameri.cm
@@ -55,6 +56,7 @@ class PreviewPanel(wx.Panel):
         self.preview.SetValue(text)
 
 
+import colorsys
 import re
 try:
     from scipy.optimize import curve_fit
@@ -122,6 +124,17 @@ class CurveFitPanel(wx.Panel):
         model_sizer.Add(self.btn_parse, 0)
         
         controls_sizer.Add(model_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        peak_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.peak_list = wx.ListBox(self, size=(-1, 64))
+        peak_btn_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.btn_add_peak = wx.Button(self, label="Add Peak")
+        self.btn_remove_peak = wx.Button(self, label="Remove Peak")
+        peak_btn_sizer.Add(self.btn_add_peak, 0, wx.EXPAND | wx.BOTTOM, 3)
+        peak_btn_sizer.Add(self.btn_remove_peak, 0, wx.EXPAND)
+        peak_sizer.Add(self.peak_list, 1, wx.EXPAND | wx.RIGHT, 5)
+        peak_sizer.Add(peak_btn_sizer, 0, wx.EXPAND)
+        controls_sizer.Add(peak_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         
         # Parameter Grid (Scrolled)
         self.scrolled = wx.ScrolledWindow(self, style=wx.VSCROLL)
@@ -165,14 +178,50 @@ class CurveFitPanel(wx.Panel):
         self.btn_fit.Bind(wx.EVT_BUTTON, self.on_fit)
         self.btn_create.Bind(wx.EVT_BUTTON, self.on_create_curve)
         self.btn_batch.Bind(wx.EVT_BUTTON, self.on_batch_fit)
+        self.btn_add_peak.Bind(wx.EVT_BUTTON, self.on_add_peak)
+        self.btn_remove_peak.Bind(wx.EVT_BUTTON, self.on_remove_peak)
         
         # Init UI state
         self.param_controls = {} # name -> dict with 'value', 'fixed', 'min', 'max'
         self.on_model_change(None)
 
-    def set_data(self, run: Run, plot_type: str, x_data: np.ndarray, y_data: np.ndarray):
+    def _refresh_peak_list(self):
+        if not hasattr(self, "peak_list"):
+            return
+        self.peak_list.Clear()
+        model = self.choice_model.GetStringSelection()
+        if model == "Sum of Lorentzian":
+            for i in range(1, self.spin_peaks.GetValue() + 1):
+                label = f"Peak {i}"
+                if f"x0_{i}" in self.param_controls:
+                    label += f" @ {self.param_controls[f'x0_{i}']['value'].GetValue()}"
+                self.peak_list.Append(label)
+            if self.peak_list.GetCount():
+                self.peak_list.SetSelection(0)
+        elif model == "Lorentzian":
+            label = "Peak 1"
+            if "x0" in self.param_controls:
+                label += f" @ {self.param_controls['x0']['value'].GetValue()}"
+            self.peak_list.Append(label)
+            self.peak_list.SetSelection(0)
+
+    def on_add_peak(self, event):
+        self.choice_model.SetSelection(self.choice_model.FindString("Sum of Lorentzian"))
+        self.spin_peaks.SetValue(min(self.spin_peaks.GetValue() + 1, self.spin_peaks.GetMax()))
+        self.on_model_change(None)
+
+    def on_remove_peak(self, event):
+        if self.choice_model.GetStringSelection() != "Sum of Lorentzian":
+            return
+        self.spin_peaks.SetValue(max(self.spin_peaks.GetValue() - 1, self.spin_peaks.GetMin()))
+        if self.spin_peaks.GetValue() == 1:
+            self.choice_model.SetSelection(self.choice_model.FindString("Lorentzian"))
+        self.on_model_change(None)
+
+    def set_data(self, run: Run, plot_type: str, x_data: np.ndarray, y_data: np.ndarray, x_label: Optional[str] = None):
         self.source_run = run
         self.plot_type = plot_type
+        self.x_label = x_label or ("Angle (deg)" if plot_type == "B" else "Raman shift (cm-1)" if plot_type in {"A", "C"} else "x")
         self.data_x = x_data
         
         # Check for 2D data (Batch Mode)
@@ -297,6 +346,7 @@ class CurveFitPanel(wx.Panel):
             
         self.scrolled.Layout()
         self.scrolled.FitInside()
+        self._refresh_peak_list()
 
     def _get_param_values(self):
         vals = {}
@@ -582,7 +632,7 @@ class CurveFitPanel(wx.Panel):
             self.ax.plot(self.fit_result_curve[0], self.fit_result_curve[1], 'r-', linewidth=1.5, label='Fit')
             
         self.ax.legend()
-        self.ax.set_xlabel("X")
+        self.ax.set_xlabel(self.x_label)
         self.ax.set_ylabel("Intensity")
         self.canvas.draw()
 
@@ -650,165 +700,378 @@ class CurveFitPanel(wx.Panel):
         new_run.metadata["default_range"] = (xmin, xmax)
         new_run.metadata["default_autorange"] = False
         new_run.metadata["default_n_points"] = 500
-        new_run.metadata["raw_x_unit"] = "cm-1" if self.plot_type == "C" else "deg" # Infer from context
+        new_run.metadata["raw_x_unit"] = self.x_label if self.plot_type in {"A", "C"} else "deg"
 
         # Callback to MainFrame to add it and overlay it
         self.on_run_created(new_run, overlay_target_run=self.source_run, overlay_plot_type=self.plot_type)
 
 
 
+class GradientStopsPanel(wx.Panel):
+    """A compact draggable gradient-stop editor."""
+
+    def __init__(self, parent, on_change=None):
+        super().__init__(parent, size=(-1, 112), style=wx.BORDER_SIMPLE)
+        self.stops = [[0.0, "#000000"], [1.0, "#FFFFFF"]]
+        self.selected_index = 0
+        self.on_change = on_change
+        self._dragging = False
+
+        self.SetMinSize((-1, 112))
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+        self.Bind(wx.EVT_LEFT_DOWN, self.on_left_down)
+        self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
+        self.Bind(wx.EVT_MOTION, self.on_motion)
+
+    def set_stops(self, stops):
+        cleaned = []
+        for pos, color in stops:
+            cleaned.append([float(np.clip(pos, 0.0, 1.0)), str(color)])
+        self.stops = sorted(cleaned or [[0.0, "#000000"], [1.0, "#FFFFFF"]], key=lambda x: x[0])
+        self.selected_index = min(self.selected_index, len(self.stops) - 1)
+        self.Refresh()
+        self._emit_change()
+
+    def get_stops(self):
+        return [[float(p), str(c)] for p, c in sorted(self.stops, key=lambda x: x[0])]
+
+    def get_selected_stop(self):
+        if not self.stops:
+            return None
+        return self.stops[self.selected_index]
+
+    def set_selected_position(self, pos):
+        if not self.stops:
+            return
+        stop = self.stops[self.selected_index]
+        stop[0] = float(np.clip(pos, 0.0, 1.0))
+        self.stops.sort(key=lambda x: x[0])
+        self.selected_index = next((i for i, s in enumerate(self.stops) if s is stop), 0)
+        self.Refresh()
+        self._emit_change()
+
+    def set_selected_color(self, color):
+        if not self.stops:
+            return
+        self.stops[self.selected_index][1] = color
+        self.Refresh()
+        self._emit_change()
+
+    def add_stop(self, pos=None, color=None):
+        if pos is None:
+            selected = self.get_selected_stop()
+            pos = selected[0] if selected else 0.5
+            larger = [p for p, _ in self.stops if p > pos]
+            if larger:
+                pos = (pos + larger[0]) / 2.0
+            else:
+                pos = min(1.0, pos + 0.1)
+        if color is None:
+            color = self._color_at(float(pos))
+        stop = [float(np.clip(pos, 0.0, 1.0)), color]
+        self.stops.append(stop)
+        self.stops.sort(key=lambda x: x[0])
+        self.selected_index = next((i for i, s in enumerate(self.stops) if s is stop), 0)
+        self.Refresh()
+        self._emit_change()
+
+    def remove_selected(self):
+        if len(self.stops) <= 2:
+            return
+        self.stops.pop(self.selected_index)
+        self.selected_index = min(self.selected_index, len(self.stops) - 1)
+        self.Refresh()
+        self._emit_change()
+
+    def _bar_rect(self):
+        w, _ = self.GetClientSize()
+        left = 18
+        top = 24
+        return wx.Rect(left, top, max(10, w - 36), 42)
+
+    def _hex_to_rgb(self, color):
+        c = wx.Colour(color)
+        if not c.IsOk():
+            c = wx.BLACK
+        return c.Red(), c.Green(), c.Blue()
+
+    def _rgb_to_hex(self, rgb):
+        return "#{:02X}{:02X}{:02X}".format(
+            int(np.clip(rgb[0], 0, 255)),
+            int(np.clip(rgb[1], 0, 255)),
+            int(np.clip(rgb[2], 0, 255)),
+        )
+
+    def _color_at(self, pos):
+        stops = self.get_stops()
+        if pos <= stops[0][0]:
+            return stops[0][1]
+        if pos >= stops[-1][0]:
+            return stops[-1][1]
+        for (p0, c0), (p1, c1) in zip(stops[:-1], stops[1:]):
+            if p0 <= pos <= p1:
+                span = max(p1 - p0, 1e-9)
+                t = (pos - p0) / span
+                rgb0 = np.array(self._hex_to_rgb(c0), dtype=float)
+                rgb1 = np.array(self._hex_to_rgb(c1), dtype=float)
+                return self._rgb_to_hex(rgb0 * (1.0 - t) + rgb1 * t)
+        return stops[-1][1]
+
+    def _x_for_pos(self, pos):
+        rect = self._bar_rect()
+        return rect.x + int(round(float(pos) * rect.width))
+
+    def _pos_for_x(self, x):
+        rect = self._bar_rect()
+        return float(np.clip((x - rect.x) / max(rect.width, 1), 0.0, 1.0))
+
+    def _hit_stop(self, point):
+        if not self.stops:
+            return None
+        rect = self._bar_rect()
+        y_min = rect.GetBottom() - 4
+        y_max = rect.GetBottom() + 30
+        if point.y < y_min or point.y > y_max:
+            return None
+        distances = [(abs(point.x - self._x_for_pos(pos)), idx) for idx, (pos, _) in enumerate(self.stops)]
+        dist, idx = min(distances)
+        return idx if dist <= 14 else None
+
+    def _emit_change(self):
+        if self.on_change:
+            self.on_change()
+
+    def on_paint(self, event):
+        dc = wx.PaintDC(self)
+        dc.SetBackground(wx.Brush(self.GetBackgroundColour()))
+        dc.Clear()
+
+        rect = self._bar_rect()
+        for i in range(rect.width):
+            color = wx.Colour(self._color_at(i / max(rect.width - 1, 1)))
+            dc.SetPen(wx.Pen(color))
+            dc.DrawLine(rect.x + i, rect.y, rect.x + i, rect.GetBottom())
+
+        dc.SetPen(wx.Pen(wx.Colour(140, 140, 140)))
+        dc.SetBrush(wx.TRANSPARENT_BRUSH)
+        dc.DrawRectangle(rect)
+
+        for idx, (pos, color) in enumerate(self.stops):
+            x = self._x_for_pos(pos)
+            selected = idx == self.selected_index
+            border = wx.Colour(255, 128, 0) if selected else wx.Colour(150, 160, 170)
+            fill = wx.Colour(color)
+
+            triangle = [
+                wx.Point(x, rect.GetBottom() + 1),
+                wx.Point(x - 8, rect.GetBottom() + 10),
+                wx.Point(x + 8, rect.GetBottom() + 10),
+            ]
+            dc.SetPen(wx.Pen(border, 2 if selected else 1))
+            dc.SetBrush(wx.Brush(wx.WHITE))
+            dc.DrawPolygon(triangle)
+            dc.SetBrush(wx.Brush(fill))
+            dc.DrawRectangle(x - 8, rect.GetBottom() + 10, 16, 16)
+            dc.SetBrush(wx.TRANSPARENT_BRUSH)
+            dc.DrawRectangle(x - 8, rect.GetBottom() + 10, 16, 16)
+
+    def on_left_down(self, event):
+        idx = self._hit_stop(event.GetPosition())
+        if idx is None:
+            idx = min(range(len(self.stops)), key=lambda i: abs(event.GetX() - self._x_for_pos(self.stops[i][0])))
+        self.selected_index = idx
+        self._dragging = True
+        self.CaptureMouse()
+        self.Refresh()
+        self._emit_change()
+
+    def on_left_up(self, event):
+        if self._dragging and self.HasCapture():
+            self.ReleaseMouse()
+        self._dragging = False
+
+    def on_motion(self, event):
+        if self._dragging and event.Dragging() and event.LeftIsDown():
+            self.set_selected_position(self._pos_for_x(event.GetX()))
+
+
 class CustomColorbarsDialog(wx.Dialog):
     def __init__(self, parent):
-        super().__init__(parent, title="Custom Colormaps", size=(500, 450), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        
-        # Load from config
-        self.custom_cmaps = config.get('custom_colormaps', {})
+        super().__init__(parent, title="Custom Colormaps", size=(680, 360), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+
+        raw_maps = config.get('custom_colormaps', {})
+        self.custom_cmaps = {
+            name: [[float(p), str(c)] for p, c in nodes]
+            for name, nodes in raw_maps.items()
+        }
         if not self.custom_cmaps:
             self.custom_cmaps = {"MyCustomMap": [[0.0, "#000000"], [1.0, "#FFFFFF"]]}
-            
+        self._original_cmaps = {
+            name: [[float(p), str(c)] for p, c in nodes]
+            for name, nodes in self.custom_cmaps.items()
+        }
+        self._updating_controls = False
+
         main_sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        # Top: Chooser and New/Delete
+
         top_sizer = wx.BoxSizer(wx.HORIZONTAL)
         top_sizer.Add(wx.StaticText(self, label="Colormap:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        
         self.choice_cmap = wx.Choice(self)
         top_sizer.Add(self.choice_cmap, 1, wx.EXPAND | wx.ALL, 5)
-        
+
         self.btn_new = wx.Button(self, label="New")
         self.btn_copy = wx.Button(self, label="Copy Existing")
         self.btn_reverse = wx.Button(self, label="Reverse")
         self.btn_delete = wx.Button(self, label="Delete")
-        
-        top_sizer.Add(self.btn_new, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        top_sizer.Add(self.btn_copy, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        top_sizer.Add(self.btn_reverse, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        top_sizer.Add(self.btn_delete, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        
+        for btn in (self.btn_new, self.btn_copy, self.btn_reverse, self.btn_delete):
+            top_sizer.Add(btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         main_sizer.Add(top_sizer, 0, wx.EXPAND)
-        
-        # Nodes editor
-        self.lc = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.lc.InsertColumn(0, "Position (0-1)", width=100)
-        self.lc.InsertColumn(1, "Color", width=100)
-        main_sizer.Add(self.lc, 1, wx.EXPAND | wx.ALL, 5)
-        
-        edit_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.slider_pos = wx.Slider(self, value=0, minValue=0, maxValue=1000)
-        self.txt_pos = wx.TextCtrl(self, size=(50, -1))
+
+        stops_header = wx.BoxSizer(wx.HORIZONTAL)
+        stops_header.Add(wx.StaticText(self, label="Gradient stops"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 8)
+        stops_header.AddStretchSpacer(1)
+        self.btn_add = wx.Button(self, label="+", size=(34, -1))
+        self.btn_remove = wx.Button(self, label="-", size=(34, -1))
+        stops_header.Add(self.btn_add, 0, wx.RIGHT, 4)
+        stops_header.Add(self.btn_remove, 0, wx.RIGHT, 8)
+        main_sizer.Add(stops_header, 0, wx.EXPAND | wx.TOP, 4)
+
+        self.stops_panel = GradientStopsPanel(self, on_change=self.on_stops_changed)
+        main_sizer.Add(self.stops_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        edit_sizer = wx.FlexGridSizer(2, 4, 6, 8)
+        edit_sizer.AddGrowableCol(2, 1)
+        edit_sizer.Add(wx.StaticText(self, label="Color"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.cp = wx.ColourPickerCtrl(self)
-        self.btn_update = wx.Button(self, label="Update Node")
-        self.btn_add = wx.Button(self, label="Add Node")
-        self.btn_remove = wx.Button(self, label="Remove Node")
-        
-        edit_sizer.Add(wx.StaticText(self, label="Pos:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        edit_sizer.Add(self.slider_pos, 1, wx.EXPAND | wx.ALL, 5)
-        edit_sizer.Add(self.txt_pos, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        edit_sizer.Add(self.cp, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        edit_sizer.Add(self.btn_update, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        edit_sizer.Add(self.btn_add, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        edit_sizer.Add(self.btn_remove, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
-        main_sizer.Add(edit_sizer, 0, wx.EXPAND)
-        
-        # Preview
-        self.fig = Figure(figsize=(4, 0.5))
-        self.canvas = FigureCanvas(self, -1, self.fig)
-        self.ax = self.fig.add_axes([0.05, 0.2, 0.9, 0.6])
-        self.ax.set_yticks([])
-        main_sizer.Add(self.canvas, 0, wx.EXPAND | wx.ALL, 5)
-        
+        edit_sizer.Add(self.cp, 0, wx.ALIGN_CENTER_VERTICAL)
+        edit_sizer.Add(wx.StaticText(self, label="Position (%)"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+        self.txt_pos = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
+        edit_sizer.Add(self.txt_pos, 0, wx.EXPAND)
+
+        edit_sizer.Add(wx.StaticText(self, label="Brightness"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.slider_brightness = wx.Slider(self, value=50, minValue=0, maxValue=100)
+        edit_sizer.Add(self.slider_brightness, 1, wx.EXPAND)
+        self.lbl_brightness = wx.StaticText(self, label="50%")
+        edit_sizer.Add(self.lbl_brightness, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+        edit_sizer.Add(wx.StaticText(self, label=""), 0)
+        main_sizer.Add(edit_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
         btn_sizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
         main_sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
-        
         self.SetSizer(main_sizer)
-        
-        # Bindings
+
         self.choice_cmap.Bind(wx.EVT_CHOICE, self.on_cmap_select)
         self.btn_new.Bind(wx.EVT_BUTTON, self.on_new)
         self.btn_copy.Bind(wx.EVT_BUTTON, self.on_copy_existing)
         self.btn_reverse.Bind(wx.EVT_BUTTON, self.on_reverse)
         self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
-        self.lc.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_node_select)
-        self.slider_pos.Bind(wx.EVT_SLIDER, self.on_slider_scroll)
-        self.btn_update.Bind(wx.EVT_BUTTON, self.on_update_node)
         self.btn_add.Bind(wx.EVT_BUTTON, self.on_add_node)
         self.btn_remove.Bind(wx.EVT_BUTTON, self.on_remove_node)
-        
+        self.cp.Bind(wx.EVT_COLOURPICKER_CHANGED, self.on_color_change)
+        self.txt_pos.Bind(wx.EVT_TEXT_ENTER, self.on_position_enter)
+        self.txt_pos.Bind(wx.EVT_KILL_FOCUS, self.on_position_enter)
+        self.slider_brightness.Bind(wx.EVT_SLIDER, self.on_brightness_change)
+
         self.refresh_cmap_list()
-        
-    def refresh_cmap_list(self):
+
+    def _normalize_nodes(self, nodes):
+        cleaned = [[float(np.clip(pos, 0.0, 1.0)), str(col)] for pos, col in nodes]
+        cleaned.sort(key=lambda x: x[0])
+        return cleaned
+
+    def refresh_cmap_list(self, select_name=None):
         names = list(self.custom_cmaps.keys())
         self.choice_cmap.Set(names)
-        if names:
-            self.choice_cmap.SetSelection(0)
-            self.load_nodes(names[0])
+        if not names:
+            self.stops_panel.set_stops([[0.0, "#000000"], [1.0, "#FFFFFF"]])
+            return
+        if select_name in names:
+            self.choice_cmap.SetStringSelection(select_name)
         else:
-            self.lc.DeleteAllItems()
-            self.ax.clear()
-            self.canvas.draw_idle()
+            self.choice_cmap.SetSelection(0)
+        self.load_nodes(self.get_current_name())
 
     def load_nodes(self, name):
-        nodes = self.custom_cmaps.get(name, [])
-        # Ensure sorted
-        nodes.sort(key=lambda x: x[0])
-        self.custom_cmaps[name] = nodes
-        
-        self.lc.DeleteAllItems()
-        for pos, col in nodes:
-            idx = self.lc.InsertItem(self.lc.GetItemCount(), f"{pos:.3f}")
-            self.lc.SetItem(idx, 1, col)
-            # Use color for background, contrast for text
-            c = wx.Colour(col)
-            self.lc.SetItemBackgroundColour(idx, c)
-            lum = 0.299*c.Red() + 0.587*c.Green() + 0.114*c.Blue()
-            self.lc.SetItemTextColour(idx, wx.BLACK if lum > 128 else wx.WHITE)
-            
-        self.update_preview()
-        
-    def update_preview(self):
-        self.ax.clear()
-        self.ax.set_yticks([])
-        name = self.choice_cmap.GetStringSelection()
-        nodes = self.custom_cmaps.get(name, [])
-        
-        if len(nodes) >= 2:
-            # Sort just in case
-            sorted_nodes = sorted(nodes, key=lambda x: x[0])
-            positions = [float(p) for p, c in sorted_nodes]
-            colors = [c for p, c in sorted_nodes]
-            
-            # Matplotlib requires exactly 0 and 1 at the ends
-            span = positions[-1] - positions[0]
-            if span > 0:
-                positions = [(p - positions[0]) / span for p in positions]
-            
-            positions[0] = 0.0
-            positions[-1] = 1.0
-                
-            try:
-                cmap = LinearSegmentedColormap.from_list("preview", list(zip(positions, colors)))
-                cb = self.fig.colorbar(cm.ScalarMappable(cmap=cmap), cax=self.ax, orientation='horizontal')
-                self.canvas.draw_idle()
-            except Exception as e:
-                pass
+        if not name:
+            return
+        self.custom_cmaps[name] = self._normalize_nodes(self.custom_cmaps.get(name, []))
+        self.stops_panel.set_stops(self.custom_cmaps[name])
+        self.sync_controls_from_selection()
 
     def get_current_name(self):
         return self.choice_cmap.GetStringSelection()
 
     def on_cmap_select(self, event):
         self.load_nodes(self.get_current_name())
-        
+
+    def on_stops_changed(self):
+        name = self.get_current_name()
+        if name:
+            self.custom_cmaps[name] = self.stops_panel.get_stops()
+        self.sync_controls_from_selection()
+
+    def sync_controls_from_selection(self):
+        stop = self.stops_panel.get_selected_stop()
+        if not stop:
+            return
+        self._updating_controls = True
+        try:
+            pos, color = stop
+            self.txt_pos.ChangeValue(f"{pos * 100:.1f}")
+            self.cp.SetColour(wx.Colour(color))
+
+            r, g, b = [v / 255.0 for v in self.stops_panel._hex_to_rgb(color)]
+            _, lightness, _ = colorsys.rgb_to_hls(r, g, b)
+            brightness = int(round(lightness * 100))
+            self.slider_brightness.SetValue(brightness)
+            self.lbl_brightness.SetLabel(f"{brightness}%")
+        finally:
+            self._updating_controls = False
+
+    def on_position_enter(self, event):
+        if self._updating_controls:
+            if event:
+                event.Skip()
+            return
+        try:
+            pos = float(self.txt_pos.GetValue().replace("%", "").strip()) / 100.0
+        except ValueError:
+            wx.MessageBox("Position must be a number from 0 to 100.", "Invalid position")
+            return
+        self.stops_panel.set_selected_position(pos)
+        if event:
+            event.Skip()
+
+    def on_color_change(self, event):
+        if self._updating_controls:
+            return
+        color = self.cp.GetColour().GetAsString(wx.C2S_HTML_SYNTAX)
+        self.stops_panel.set_selected_color(color)
+
+    def on_brightness_change(self, event):
+        if self._updating_controls:
+            return
+        stop = self.stops_panel.get_selected_stop()
+        if not stop:
+            return
+        color = wx.Colour(stop[1])
+        r, g, b = color.Red() / 255.0, color.Green() / 255.0, color.Blue() / 255.0
+        h, _, s = colorsys.rgb_to_hls(r, g, b)
+        new_lightness = self.slider_brightness.GetValue() / 100.0
+        nr, ng, nb = colorsys.hls_to_rgb(h, new_lightness, s)
+        new_color = "#{:02X}{:02X}{:02X}".format(int(nr * 255), int(ng * 255), int(nb * 255))
+        self.lbl_brightness.SetLabel(f"{self.slider_brightness.GetValue()}%")
+        self.stops_panel.set_selected_color(new_color)
+
     def on_new(self, event):
         dlg = wx.TextEntryDialog(self, "New colormap name:", "New Colormap")
         if dlg.ShowModal() == wx.ID_OK:
             name = dlg.GetValue().strip()
             if name and name not in self.custom_cmaps:
                 self.custom_cmaps[name] = [[0.0, "#000000"], [1.0, "#FFFFFF"]]
-                self.refresh_cmap_list()
-                self.choice_cmap.SetStringSelection(name)
-                self.load_nodes(name)
+                self.refresh_cmap_list(name)
         dlg.Destroy()
-        
+
     def on_delete(self, event):
         name = self.get_current_name()
         if name in self.custom_cmaps:
@@ -830,89 +1093,199 @@ class CustomColorbarsDialog(wx.Dialog):
                         cmap = plt.get_cmap(base)
                     except Exception:
                         cmap = plt.get_cmap('OrRd')
-                    
-                    nodes = []
-                    # Sample 5 points from the colormap
-                    for p in np.linspace(0, 1, 5):
-                        c = to_hex(cmap(p))
-                        nodes.append([float(p), c])
-                    
-                    self.custom_cmaps[name] = nodes
-                    self.refresh_cmap_list()
-                    self.choice_cmap.SetStringSelection(name)
-                    self.load_nodes(name)
+                    self.custom_cmaps[name] = [[float(p), to_hex(cmap(p))] for p in np.linspace(0, 1, 5)]
+                    self.refresh_cmap_list(name)
             name_dlg.Destroy()
         dlg.Destroy()
 
     def on_reverse(self, event):
         name = self.get_current_name()
-        if not name: return
-        nodes = self.custom_cmaps[name]
-        new_nodes = []
-        for pos, col in nodes:
-            new_nodes.append([1.0 - pos, col])
-        new_nodes.sort(key=lambda x: x[0])
-        self.custom_cmaps[name] = new_nodes
+        if not name:
+            return
+        self.custom_cmaps[name] = sorted([[1.0 - pos, col] for pos, col in self.custom_cmaps[name]], key=lambda x: x[0])
         self.load_nodes(name)
-            
-    def on_node_select(self, event):
-        idx = event.GetIndex()
-        name = self.get_current_name()
-        if not name: return
-        pos, col = self.custom_cmaps[name][idx]
-        self.txt_pos.SetValue(f"{pos:.3f}")
-        self.slider_pos.SetValue(int(pos * 1000))
-        self.cp.SetColour(wx.Colour(col))
-        
-    def on_slider_scroll(self, event):
-        val = self.slider_pos.GetValue() / 1000.0
-        self.txt_pos.SetValue(f"{val:.3f}")
-        # update visually without re-selecting
-        self.on_update_node(None)
-        
-    def on_update_node(self, event):
-        idx = self.lc.GetFirstSelected()
-        name = self.get_current_name()
-        if idx >= 0 and name:
-            try:
-                pos = float(self.txt_pos.GetValue())
-                col = self.cp.GetColour().GetAsString(wx.C2S_HTML_SYNTAX)
-                
-                self.custom_cmaps[name][idx] = [pos, col]
-                self.load_nodes(name)
-                
-                # Re-select the updated node
-                new_idx = -1
-                for i, (p, c) in enumerate(self.custom_cmaps[name]):
-                    if p == pos and c == col:
-                        new_idx = i
-                        break
-                if new_idx >= 0:
-                    self.lc.Select(new_idx)
-                
-            except ValueError:
-                wx.MessageBox("Invalid position")
-                
+
     def on_add_node(self, event):
-        name = self.get_current_name()
-        if not name: return
-        try:
-            pos = float(self.txt_pos.GetValue())
-            col = self.cp.GetColour().GetAsString(wx.C2S_HTML_SYNTAX)
-            self.custom_cmaps[name].append([pos, col])
-            self.load_nodes(name)
-        except ValueError:
-            wx.MessageBox("Invalid position")
-            
+        self.stops_panel.add_stop()
+
     def on_remove_node(self, event):
-        idx = self.lc.GetFirstSelected()
-        name = self.get_current_name()
-        if idx >= 0 and name and len(self.custom_cmaps[name]) > 2:
-            self.custom_cmaps[name].pop(idx)
-            self.load_nodes(name)
-            
+        self.stops_panel.remove_selected()
+
     def get_results(self):
-        return self.custom_cmaps
+        return {name: self._normalize_nodes(nodes) for name, nodes in self.custom_cmaps.items()}
+
+    def get_changed_names(self):
+        result = self.get_results()
+        names = set(result.keys()) | set(self._original_cmaps.keys())
+        return [name for name in names if result.get(name) != self._original_cmaps.get(name)]
+
+
+class PreferencesPanel(wx.Panel):
+    """App-wide defaults applied to new views and newly imported ambiguous runs."""
+
+    def __init__(self, parent, on_use_current_view=None):
+        super().__init__(parent)
+        self._on_use_current_view = on_use_current_view
+        self._loading = False
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        grid = wx.FlexGridSizer(0, 2, 6, 8)
+        grid.AddGrowableCol(1, 1)
+
+        unit_choices = ["meV", "cm-1"]
+        self.choice_unit = wx.Choice(self, choices=unit_choices)
+        grid.Add(wx.StaticText(self, label="Default unit"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.choice_unit, 0, wx.EXPAND)
+
+        cmap_choices = sorted(set(list(plt.colormaps()) + list(config.get("custom_colormaps", {}).keys())))
+        self.choice_cmap = wx.ComboBox(self, choices=cmap_choices, style=wx.CB_DROPDOWN)
+        grid.Add(wx.StaticText(self, label="Default colormap"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.choice_cmap, 1, wx.EXPAND)
+
+        self.spin_vmin = wx.SpinCtrlDouble(self, min=0, max=100, inc=1)
+        self.spin_vmax = wx.SpinCtrlDouble(self, min=0, max=100, inc=1)
+        contrast_row = wx.BoxSizer(wx.HORIZONTAL)
+        contrast_row.Add(self.spin_vmin, 0, wx.RIGHT, 5)
+        contrast_row.Add(self.spin_vmax, 0)
+        grid.Add(wx.StaticText(self, label="Default contrast (%)"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(contrast_row, 0, wx.EXPAND)
+
+        self.choice_angle = wx.Choice(self, choices=["polar", "cartesian"])
+        grid.Add(wx.StaticText(self, label="Angle slice"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.choice_angle, 0, wx.EXPAND)
+
+        bin_row = wx.BoxSizer(wx.HORIZONTAL)
+        spin_style = wx.SP_ARROW_KEYS | wx.TE_PROCESS_ENTER
+        self.spin_default_bin_x = wx.SpinCtrl(self, min=1, max=999, initial=1, size=(62, -1), style=spin_style)
+        self.spin_default_bin_y = wx.SpinCtrl(self, min=1, max=999, initial=1, size=(62, -1), style=spin_style)
+        self.chk_default_box_binning = wx.CheckBox(self, label="Box")
+        bin_row.Add(wx.StaticText(self, label="X"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 3)
+        bin_row.Add(self.spin_default_bin_x, 0, wx.RIGHT, 6)
+        bin_row.Add(wx.StaticText(self, label="Y"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 3)
+        bin_row.Add(self.spin_default_bin_y, 0, wx.RIGHT, 8)
+        bin_row.Add(self.chk_default_box_binning, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(wx.StaticText(self, label="Default binning"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(bin_row, 0, wx.EXPAND)
+
+        self.chk_secondary = wx.CheckBox(self, label="Show alternate unit axis")
+        grid.AddSpacer(1)
+        grid.Add(self.chk_secondary, 0, wx.EXPAND)
+
+        self.chk_highlight_modifier = wx.CheckBox(self, label="Ctrl/Cmd-click moves highlight")
+        grid.AddSpacer(1)
+        grid.Add(self.chk_highlight_modifier, 0, wx.EXPAND)
+
+        self.choice_unknown_1d = wx.Choice(self, choices=unit_choices)
+        grid.Add(wx.StaticText(self, label="Unknown 1D unit"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.choice_unknown_1d, 0, wx.EXPAND)
+
+        self.choice_unknown_2d = wx.Choice(self, choices=unit_choices)
+        grid.Add(wx.StaticText(self, label="Unknown 2D unit"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.choice_unknown_2d, 0, wx.EXPAND)
+
+        sizer.Add(grid, 0, wx.ALL | wx.EXPAND, 8)
+
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_use_current = wx.Button(self, label="Use Current View")
+        self.btn_reset = wx.Button(self, label="Reset Defaults")
+        btn_row.Add(self.btn_use_current, 0, wx.RIGHT, 6)
+        btn_row.Add(self.btn_reset, 0)
+        sizer.Add(btn_row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.SetSizer(sizer)
+
+        for ctrl in (self.choice_unit, self.choice_angle, self.choice_unknown_1d, self.choice_unknown_2d):
+            ctrl.Bind(wx.EVT_CHOICE, self.on_change)
+        for ctrl in (self.spin_vmin, self.spin_vmax):
+            ctrl.Bind(wx.EVT_SPINCTRLDOUBLE, self.on_change)
+            ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_change)
+        for ctrl in (self.spin_default_bin_x, self.spin_default_bin_y):
+            ctrl.Bind(wx.EVT_SPINCTRL, self.on_change)
+            ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_change)
+            ctrl.Bind(wx.EVT_TEXT, self.on_change)
+        self.chk_default_box_binning.Bind(wx.EVT_CHECKBOX, self.on_change)
+        self.chk_secondary.Bind(wx.EVT_CHECKBOX, self.on_change)
+        self.chk_highlight_modifier.Bind(wx.EVT_CHECKBOX, self.on_change)
+        self.choice_cmap.Bind(wx.EVT_COMBOBOX, self.on_change)
+        self.choice_cmap.Bind(wx.EVT_TEXT, self.on_change)
+        self.btn_use_current.Bind(wx.EVT_BUTTON, self.on_use_current_view)
+        self.btn_reset.Bind(wx.EVT_BUTTON, self.on_reset_defaults)
+
+        self.refresh_from_config()
+
+    def _set_choice(self, choice: wx.Choice, value: str) -> None:
+        if choice.SetStringSelection(value):
+            return
+        if choice.GetCount():
+            choice.SetSelection(0)
+
+    def _coerce_binning(self, value: Any) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 1
+
+    def refresh_from_config(self):
+        self._loading = True
+        try:
+            self._set_choice(self.choice_unit, normalize_spectral_unit(config.get("default_spectral_unit", config.get("unit", "meV"))))
+            self.choice_cmap.SetValue(config.get("default_colormap", config.get("colormap", "OrRd")))
+            self.spin_vmin.SetValue(float(config.get("default_vmin_percent", 0.0)))
+            self.spin_vmax.SetValue(float(config.get("default_vmax_percent", 100.0)))
+            self._set_choice(self.choice_angle, str(config.get("default_angle_slice_type", "polar")))
+            self.spin_default_bin_x.SetValue(self._coerce_binning(config.get("default_slice_x_binning", 1)))
+            self.spin_default_bin_y.SetValue(self._coerce_binning(config.get("default_slice_y_binning", 1)))
+            self.chk_default_box_binning.SetValue(str(config.get("default_slice_binning_mode", "cross")).lower() == "box")
+            self.chk_secondary.SetValue(bool(config.get("show_secondary_unit_axis", True)))
+            self.chk_highlight_modifier.SetValue(bool(config.get("highlight_requires_modifier", False)))
+            self._set_choice(self.choice_unknown_1d, normalize_spectral_unit(config.get("default_unknown_1d_spectral_unit", "meV")))
+            self._set_choice(self.choice_unknown_2d, normalize_spectral_unit(config.get("default_unknown_2d_spectral_unit", "meV")))
+        finally:
+            self._loading = False
+
+    def _save_values(self):
+        if self._loading:
+            return
+        vmin = float(self.spin_vmin.GetValue())
+        vmax = float(self.spin_vmax.GetValue())
+        if vmax < vmin:
+            vmax = vmin
+            self.spin_vmax.SetValue(vmax)
+        config.set("default_spectral_unit", normalize_spectral_unit(self.choice_unit.GetStringSelection()))
+        config.set("default_colormap", self.choice_cmap.GetValue() or "OrRd")
+        config.set("default_vmin_percent", vmin)
+        config.set("default_vmax_percent", vmax)
+        config.set("default_angle_slice_type", self.choice_angle.GetStringSelection() or "polar")
+        config.set("default_slice_x_binning", self._coerce_binning(self.spin_default_bin_x.GetValue()))
+        config.set("default_slice_y_binning", self._coerce_binning(self.spin_default_bin_y.GetValue()))
+        config.set("default_slice_binning_mode", "box" if self.chk_default_box_binning.GetValue() else "cross")
+        config.set("show_secondary_unit_axis", self.chk_secondary.GetValue())
+        config.set("highlight_requires_modifier", self.chk_highlight_modifier.GetValue())
+        config.set("default_unknown_1d_spectral_unit", normalize_spectral_unit(self.choice_unknown_1d.GetStringSelection()))
+        config.set("default_unknown_2d_spectral_unit", normalize_spectral_unit(self.choice_unknown_2d.GetStringSelection()))
+
+    def on_change(self, event):
+        self._save_values()
+        if event:
+            event.Skip()
+
+    def on_use_current_view(self, event):
+        if self._on_use_current_view:
+            self._on_use_current_view()
+        self.refresh_from_config()
+
+    def on_reset_defaults(self, event):
+        for key in (
+            "default_spectral_unit", "default_colormap", "default_vmin_percent",
+            "default_vmax_percent", "default_angle_slice_type",
+            "default_slice_x_binning", "default_slice_y_binning",
+            "default_slice_binning_mode",
+            "show_secondary_unit_axis", "highlight_requires_modifier",
+            "default_unknown_1d_spectral_unit",
+            "default_unknown_2d_spectral_unit",
+        ):
+            config.set(key, DEFAULT_SETTINGS[key])
+        self.refresh_from_config()
+
 
 class PlotConfigPanel(wx.Panel):
     def __init__(self, parent, on_reset=None):
@@ -920,7 +1293,7 @@ class PlotConfigPanel(wx.Panel):
         
         self._on_reset = on_reset
         
-        self.x_unit = config.get('unit', 'cm-1')
+        self.x_unit = normalize_spectral_unit(config.get('default_spectral_unit', config.get('unit', 'meV')))
 
         sizer = wx.BoxSizer(wx.VERTICAL)
         
@@ -932,10 +1305,7 @@ class PlotConfigPanel(wx.Panel):
         # Unit radio buttons
         self.rb_cm1 = wx.RadioButton(self, label="cm-1", style=wx.RB_GROUP)
         self.rb_mev = wx.RadioButton(self, label="meV")
-        if self.x_unit == 'meV':
-            self.rb_mev.SetValue(True)
-        else:
-            self.rb_cm1.SetValue(True)
+        self._set_unit_controls(self.x_unit)
         unit_sizer = wx.BoxSizer(wx.HORIZONTAL)
         unit_sizer.Add(self.rb_cm1, 0, wx.RIGHT, 5)
         unit_sizer.Add(self.rb_mev, 0)
@@ -965,6 +1335,31 @@ class PlotConfigPanel(wx.Panel):
         range_sizer.Add(wx.StaticText(self, label="deg"), 0, wx.ALIGN_CENTER_VERTICAL)
 
         sizer.Add(range_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Slice binning controls
+        bin_box = wx.StaticBoxSizer(wx.StaticBox(self, label="Slice binning"), wx.VERTICAL)
+        bin_grid = wx.FlexGridSizer(2, 4, 4, 6)
+        for label in ("X", "Y", "All"):
+            bin_grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER)
+        bin_grid.Add(wx.StaticText(self, label="Mode"), 0, wx.ALIGN_CENTER)
+
+        spin_style = wx.SP_ARROW_KEYS | wx.TE_PROCESS_ENTER
+        self.spin_bin_x = wx.SpinCtrl(self, min=1, max=999, initial=1, size=(64, -1), style=spin_style)
+        self.spin_bin_y = wx.SpinCtrl(self, min=1, max=999, initial=1, size=(64, -1), style=spin_style)
+        self.spin_bin_all = wx.SpinCtrl(self, min=1, max=999, initial=1, size=(64, -1), style=spin_style)
+        self.btn_box_binning = wx.ToggleButton(self, label="Cross")
+        bin_grid.Add(self.spin_bin_x, 0, wx.EXPAND)
+        bin_grid.Add(self.spin_bin_y, 0, wx.EXPAND)
+        bin_grid.Add(self.spin_bin_all, 0, wx.EXPAND)
+        bin_grid.Add(self.btn_box_binning, 0, wx.EXPAND)
+        bin_box.Add(bin_grid, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(bin_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        fit_overlay_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        fit_overlay_sizer.Add(wx.StaticText(self, label="Fit overlay:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.choice_fit_overlay = wx.Choice(self, choices=["Off", "Global", "Row", "Both"])
+        fit_overlay_sizer.Add(self.choice_fit_overlay, 1, wx.EXPAND)
+        sizer.Add(fit_overlay_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         
         # Colormap selection
         cmap_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -1016,11 +1411,12 @@ class PlotConfigPanel(wx.Panel):
         
         # Map Choice - Using ComboBox for searchability
         self.choice_cmap = wx.ComboBox(self, style=wx.CB_DROPDOWN) 
+        self._filtering = False
         
         self._register_custom_cmaps()
 
         # Load saved colormap and populate choices
-        saved_cmap = config.get('colormap', 'OrRd')
+        saved_cmap = config.get('default_colormap', config.get('colormap', 'OrRd'))
         self.set_colormap(saved_cmap)
 
         cmap_sizer.Add(self.choice_cat, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 5)
@@ -1086,12 +1482,30 @@ class PlotConfigPanel(wx.Panel):
         self.choice_cat.Bind(wx.EVT_CHOICE, self.on_cat_change)
         self.choice_cmap.Bind(wx.EVT_COMBOBOX, self.on_cmap_change)
         self.choice_cmap.Bind(wx.EVT_TEXT, self.on_cmap_text)
+        if hasattr(wx, "EVT_COMBOBOX_DROPDOWN"):
+            self.choice_cmap.Bind(wx.EVT_COMBOBOX_DROPDOWN, self.on_cmap_dropdown)
         self.reset_button.Bind(wx.EVT_BUTTON, self.on_reset_button)
         self.btn_roi_vlim.Bind(wx.EVT_BUTTON, self.on_roi_vlim_button)
+        for ctrl in (self.spin_bin_x, self.spin_bin_y):
+            ctrl.Bind(wx.EVT_SPINCTRL, self.on_binning_change)
+            ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_binning_change)
+            ctrl.Bind(wx.EVT_TEXT, self.on_binning_change)
+        self.spin_bin_all.Bind(wx.EVT_SPINCTRL, self.on_all_binning_change)
+        self.spin_bin_all.Bind(wx.EVT_TEXT_ENTER, self.on_all_binning_change)
+        self.spin_bin_all.Bind(wx.EVT_TEXT, self.on_all_binning_change)
+        self.btn_box_binning.Bind(wx.EVT_TOGGLEBUTTON, self.on_binning_mode_change)
+        self.choice_fit_overlay.Bind(wx.EVT_CHOICE, self.on_fit_overlay_change)
 
-        self._filtering = False
         self.target_view: Optional["ViewPanel"] = None
+        self._syncing_binning_controls = False
         self.set_target_view(None)
+
+    def _set_unit_controls(self, unit: str):
+        self.x_unit = normalize_spectral_unit(unit)
+        if self.x_unit == 'meV':
+            self.rb_mev.SetValue(True)
+        else:
+            self.rb_cm1.SetValue(True)
 
     def set_target_view(self, view_panel: Optional["ViewPanel"]):
         self.target_view = view_panel
@@ -1099,32 +1513,33 @@ class PlotConfigPanel(wx.Panel):
             for widget in [self.rb_cm1, self.rb_mev, self.x_min_text, self.x_max_text,
                            self.y_min_text, self.y_max_text, self.choice_cat, self.choice_cmap,
                            self.vmin_slider, self.txt_vmin, self.vmax_slider, self.txt_vmax,
-                           self.reset_button, self.btn_roi_vlim]:
+                           self.reset_button, self.btn_roi_vlim, self.spin_bin_x,
+                           self.spin_bin_y, self.spin_bin_all, self.btn_box_binning,
+                           self.choice_fit_overlay]:
                 widget.Disable()
             return
 
         for widget in [self.rb_cm1, self.rb_mev, self.x_min_text, self.x_max_text,
                        self.y_min_text, self.y_max_text, self.choice_cat, self.choice_cmap,
                        self.vmin_slider, self.txt_vmin, self.vmax_slider, self.txt_vmax,
-                       self.reset_button, self.btn_roi_vlim]:
+                       self.reset_button, self.btn_roi_vlim, self.spin_bin_x,
+                       self.spin_bin_y, self.spin_bin_all, self.btn_box_binning,
+                       self.choice_fit_overlay]:
             widget.Enable()
 
-        config = self.target_view.get_plot_config()
+        plot_config = self.target_view.get_plot_config()
+        self._set_unit_controls(plot_config.get('unit', self.target_view.get_spectral_unit()))
         
         # Sync Limits
-        xlim = config.get('xlim', (0, 1))
-        ylim = config.get('ylim', (0, 1))
-        
-        current_unit = self.get_x_unit()
-        if current_unit == 'meV':
-             xlim = (xlim[0] * EV_PER_CM1 * 1000, xlim[1] * EV_PER_CM1 * 1000)
-        
+        xlim = plot_config.get('xlim', (0, 1))
+        ylim = plot_config.get('ylim', (0, 1))
+
         self.set_x_range(xlim[0], xlim[1])
         self.set_y_range(ylim[0], ylim[1])
         
         # Sync Contrast
-        vmin_p = config.get('vmin_p', 0)
-        vmax_p = config.get('vmax_p', 100)
+        vmin_p = plot_config.get('vmin_p', 0)
+        vmax_p = plot_config.get('vmax_p', 100)
         self.set_vlim_range(vmin_p, vmax_p)
         
         # Sync Absolute Contrast Values
@@ -1132,8 +1547,43 @@ class PlotConfigPanel(wx.Panel):
         self.update_absolute_vlim_display(v_abs[0], v_abs[1])
         
         # Sync Colormap
-        cmap = config.get('cmap', 'OrRd')
+        cmap = plot_config.get('cmap', 'OrRd')
         self.set_colormap(cmap)
+
+        self._set_binning_controls(
+            plot_config.get('slice_x_binning', 1),
+            plot_config.get('slice_y_binning', 1),
+            plot_config.get('slice_binning_mode', 'cross'),
+        )
+        self._set_fit_overlay_control(plot_config.get('fit_overlay_mode', 'off'))
+
+    def _cmap_choices_for_category(self):
+        cat = self.choice_cat.GetStringSelection()
+        if cat == 'Custom...':
+            return list(config.get('custom_colormaps', {}).keys()) + ['Edit Custom...']
+        if cat == 'CMCrameri':
+            return list(self.cmaps_cmc)
+        return list(self.cmaps_std)
+
+    def _restore_full_cmap_choices(self, keep_value=True):
+        value = self.choice_cmap.GetValue()
+        insertion_point = self.choice_cmap.GetInsertionPoint()
+        self._filtering = True
+        choices = self._cmap_choices_for_category()
+        self.choice_cmap.Set(choices)
+        if keep_value and value:
+            self.choice_cmap.SetValue(value)
+            try:
+                self.choice_cmap.SetInsertionPoint(insertion_point)
+            except Exception:
+                pass
+        elif choices:
+            self.choice_cmap.SetSelection(0)
+        self._filtering = False
+
+    def on_cmap_dropdown(self, event):
+        self._restore_full_cmap_choices(keep_value=True)
+        event.Skip()
 
     def on_cat_change(self, event):
         cat = self.choice_cat.GetStringSelection()
@@ -1142,8 +1592,8 @@ class PlotConfigPanel(wx.Panel):
         # If Custom, we want to disable search/typing so user can see and modify directly
         if cat == 'Custom...':
             # Note: We can't easily change style, but we can clear and disable text part
-            cmaps = list(config.get('custom_colormaps', {}).keys())
-            self.choice_cmap.Set(cmaps + ['Edit Custom...'])
+            cmaps = self._cmap_choices_for_category()
+            self.choice_cmap.Set(cmaps)
             if cmaps:
                 self.choice_cmap.SetSelection(0)
             # Try to disable typing
@@ -1152,18 +1602,20 @@ class PlotConfigPanel(wx.Panel):
             except Exception:
                 pass
         elif cat == 'CMCrameri':
-            self.choice_cmap.Set(self.cmaps_cmc)
-            if self.cmaps_cmc:
+            cmaps = self._cmap_choices_for_category()
+            self.choice_cmap.Set(cmaps)
+            if cmaps:
                 self.choice_cmap.SetSelection(0)
             try:
                 self.choice_cmap.GetTextCtrl().SetEditable(True)
             except Exception:
                 pass
         else: # Standard
-            self.choice_cmap.Set(self.cmaps_std)
-            if 'OrRd' in self.cmaps_std:
+            cmaps = self._cmap_choices_for_category()
+            self.choice_cmap.Set(cmaps)
+            if 'OrRd' in cmaps:
                 self.choice_cmap.SetStringSelection('OrRd')
-            elif self.cmaps_std:
+            elif cmaps:
                 self.choice_cmap.SetSelection(0)
             try:
                 self.choice_cmap.GetTextCtrl().SetEditable(True)
@@ -1185,14 +1637,10 @@ class PlotConfigPanel(wx.Panel):
             
         txt = self.choice_cmap.GetValue().lower()
         if not txt:
+            self._restore_full_cmap_choices(keep_value=False)
             return
             
-        if cat == 'Standard':
-            base_list = self.cmaps_std
-        elif cat == 'CMCrameri':
-            base_list = self.cmaps_cmc
-        else: # Should not happen given the return above
-            base_list = list(config.get('custom_colormaps', {}).keys()) + ['Edit Custom...']
+        base_list = self._cmap_choices_for_category()
             
         filtered = [m for m in base_list if txt in m.lower()]
         
@@ -1210,20 +1658,20 @@ class PlotConfigPanel(wx.Panel):
 
     def on_unit_change(self, event):
         rb = event.GetEventObject()
-        new_unit = rb.GetLabel()
+        new_unit = normalize_spectral_unit(rb.GetLabel())
         if new_unit == self.x_unit:
             return
-        self.x_unit = new_unit
-        config.set('unit', new_unit)
+        old_xlim = None
+        if self.target_view:
+            old_xlim, _ = self.target_view.get_plot_limits()
+        self._set_unit_controls(new_unit)
         
         if self.target_view:
-            xlim_cm1, _ = self.target_view.get_plot_limits()
-            if xlim_cm1 and xlim_cm1[0] is not None:
-                if new_unit == 'meV':
-                    xlim_display = (xlim_cm1[0] * EV_PER_CM1 * 1000, xlim_cm1[1] * EV_PER_CM1 * 1000)
-                else: # cm-1
-                    xlim_display = xlim_cm1
-                self.set_x_range(xlim_display[0], xlim_display[1])
+            self.target_view.set_spectral_unit(new_unit)
+            plot_config = self.target_view.get_plot_config()
+            xlim = plot_config.get('xlim', old_xlim or (0, 1))
+            if xlim and xlim[0] is not None:
+                self.set_x_range(xlim[0], xlim[1])
 
     def on_x_range_enter(self, event):
         if self.target_view:
@@ -1242,6 +1690,100 @@ class PlotConfigPanel(wx.Panel):
                 self.target_view.set_y_range(ymin, ymax)
             except ValueError:
                 wx.MessageBox("Invalid Y range. Please enter numeric values.", "Error", wx.OK | wx.ICON_ERROR)
+
+    def _coerce_binning_value(self, ctrl: wx.SpinCtrl) -> Optional[int]:
+        try:
+            return max(1, int(ctrl.GetValue()))
+        except (TypeError, ValueError):
+            return None
+
+    def _set_binning_controls(self, x_bin: int, y_bin: int, mode: str) -> None:
+        self._syncing_binning_controls = True
+        try:
+            try:
+                x_bin = max(1, int(x_bin))
+            except (TypeError, ValueError):
+                x_bin = 1
+            try:
+                y_bin = max(1, int(y_bin))
+            except (TypeError, ValueError):
+                y_bin = 1
+            mode = "box" if mode == "box" else "cross"
+            self.spin_bin_x.SetValue(x_bin)
+            self.spin_bin_y.SetValue(y_bin)
+            self.spin_bin_all.SetValue(x_bin if x_bin == y_bin else max(x_bin, y_bin))
+            self.btn_box_binning.SetValue(mode == "box")
+            self.btn_box_binning.SetLabel("Box" if mode == "box" else "Cross")
+        finally:
+            self._syncing_binning_controls = False
+
+    def on_binning_change(self, event):
+        if self._syncing_binning_controls or not self.target_view:
+            if event:
+                event.Skip()
+            return
+        x_bin = self._coerce_binning_value(self.spin_bin_x)
+        y_bin = self._coerce_binning_value(self.spin_bin_y)
+        if x_bin is None or y_bin is None:
+            if event:
+                event.Skip()
+            return
+        if x_bin == y_bin:
+            self._syncing_binning_controls = True
+            try:
+                self.spin_bin_all.SetValue(x_bin)
+            finally:
+                self._syncing_binning_controls = False
+        self.target_view.set_slice_binning(
+            x_bin=x_bin,
+            y_bin=y_bin,
+            mode="box" if self.btn_box_binning.GetValue() else "cross",
+        )
+        if event:
+            event.Skip()
+
+    def on_all_binning_change(self, event):
+        if self._syncing_binning_controls or not self.target_view:
+            if event:
+                event.Skip()
+            return
+        value = self._coerce_binning_value(self.spin_bin_all)
+        if value is None:
+            if event:
+                event.Skip()
+            return
+        self._syncing_binning_controls = True
+        try:
+            self.spin_bin_x.SetValue(value)
+            self.spin_bin_y.SetValue(value)
+        finally:
+            self._syncing_binning_controls = False
+        self.target_view.set_slice_binning(
+            x_bin=value,
+            y_bin=value,
+            mode="box" if self.btn_box_binning.GetValue() else "cross",
+        )
+        if event:
+            event.Skip()
+
+    def on_binning_mode_change(self, event):
+        if not self.target_view:
+            return
+        mode = "box" if self.btn_box_binning.GetValue() else "cross"
+        self.btn_box_binning.SetLabel("Box" if mode == "box" else "Cross")
+        self.target_view.set_slice_binning(mode=mode)
+
+    def _set_fit_overlay_control(self, mode: str) -> None:
+        mode = normalize_fit_overlay_mode(mode)
+        labels = {"off": "Off", "global": "Global", "row": "Row", "both": "Both"}
+        if not self.choice_fit_overlay.SetStringSelection(labels.get(mode, "Off")):
+            self.choice_fit_overlay.SetSelection(0)
+
+    def on_fit_overlay_change(self, event):
+        if not self.target_view:
+            return
+        mode = normalize_fit_overlay_mode(self.choice_fit_overlay.GetStringSelection())
+        self.target_view.set_fit_overlay_mode(mode)
 
     def on_vlim_slide(self, event):
         vmin_p = self.vmin_slider.GetValue()
@@ -1315,10 +1857,11 @@ class PlotConfigPanel(wx.Panel):
         cmap = self.choice_cmap.GetValue()
         if not cmap: return
         
-        previous_cmap = config.get('colormap', 'OrRd')
+        previous_cmap = self.target_view.get_colormap() if self.target_view else config.get('default_colormap', config.get('colormap', 'OrRd'))
 
         if cmap == 'Edit Custom...':
             dlg = CustomColorbarsDialog(self)
+            current_view_cmap = self.target_view.get_colormap() if self.target_view else previous_cmap
             
             # Try to pre-select previous if it's custom
             base_previous = previous_cmap[:-2] if previous_cmap.endswith('_r') else previous_cmap
@@ -1327,6 +1870,7 @@ class PlotConfigPanel(wx.Panel):
                 dlg.load_nodes(base_previous)
                 
             if dlg.ShowModal() == wx.ID_OK:
+                changed_names = dlg.get_changed_names()
                 config.set('custom_colormaps', dlg.get_results())
                 self._register_custom_cmaps()
                 
@@ -1336,8 +1880,12 @@ class PlotConfigPanel(wx.Panel):
                 self.choice_cmap.Set(custom_cmaps + ['Edit Custom...'])
                 
                 if new_cmap in custom_cmaps:
-                    self.choice_cmap.SetValue(new_cmap)
-                    cmap = new_cmap
+                    if previous_cmap.endswith('_r') and previous_cmap[:-2] == new_cmap:
+                        self.choice_cmap.SetValue(previous_cmap)
+                        cmap = previous_cmap
+                    else:
+                        self.choice_cmap.SetValue(new_cmap)
+                        cmap = new_cmap
                 elif custom_cmaps:
                     self.choice_cmap.SetSelection(0)
                     cmap = self.choice_cmap.GetValue()
@@ -1347,6 +1895,9 @@ class PlotConfigPanel(wx.Panel):
                     self.on_cat_change(None)
                     return
                 self._filtering = False
+                current_base = current_view_cmap[:-2] if current_view_cmap.endswith('_r') else current_view_cmap
+                if self.target_view and current_base in changed_names:
+                    self.target_view.refresh_current_colormap()
             else:
                 # Cancelled, revert
                 custom_cmaps = list(config.get('custom_colormaps', {}).keys())
@@ -1378,7 +1929,6 @@ class PlotConfigPanel(wx.Panel):
             except Exception:
                 return
 
-        config.set('colormap', cmap)
         if self.target_view and cmap != 'Edit Custom...':
             self.target_view.set_colormap(cmap)
     
@@ -1402,21 +1952,22 @@ class PlotConfigPanel(wx.Panel):
 
     def set_colormap(self, cmap_name):
         # Switch category if needed
+        self._filtering = True
         custom_maps = config.get('custom_colormaps', {})
-        if cmap_name in custom_maps or (cmap_name.endswith('_r') and cmap_name[:-2] in custom_maps):
-            if self.choice_cat.GetStringSelection() != 'Custom...':
+        try:
+            if cmap_name in custom_maps or (cmap_name.endswith('_r') and cmap_name[:-2] in custom_maps):
                 self.choice_cat.SetStringSelection('Custom...')
                 self.choice_cmap.Set(list(custom_maps.keys()) + ['Edit Custom...'])
-        elif cmap_name.startswith('cmc.') and self.cmaps_cmc:
-            if self.choice_cat.GetStringSelection() != 'CMCrameri':
+            elif cmap_name.startswith('cmc.') and self.cmaps_cmc:
                 self.choice_cat.SetStringSelection('CMCrameri')
                 self.choice_cmap.Set(self.cmaps_cmc)
-        else:
-            if self.choice_cat.GetStringSelection() != 'Standard':
+            else:
                 self.choice_cat.SetStringSelection('Standard')
                 self.choice_cmap.Set(self.cmaps_std)
-        
-        self.choice_cmap.SetValue(cmap_name)
+            
+            self.choice_cmap.SetValue(cmap_name)
+        finally:
+            self._filtering = False
 
     def get_x_unit(self):
         return self.x_unit

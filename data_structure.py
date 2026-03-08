@@ -183,7 +183,7 @@ def load_table(path: str) -> Tuple[Union[Tuple[np.ndarray, np.ndarray],
     ext = os.path.splitext(path)[1].lower()
 
     if ext in {".txt", ".dat"}:
-        df = pd.read_csv(path, delim_whitespace=True, comment="#", header=None)
+        df = pd.read_csv(path, sep=r"\s+", comment="#", header=None)
     elif ext == ".csv":
         df = pd.read_csv(path, comment="#")
     elif ext == ".tsv":
@@ -290,6 +290,88 @@ def shift_to_eV(shift_cm: np.ndarray) -> np.ndarray:
     return shift_cm * EV_PER_CM1
 
 
+SUPPORTED_SPECTRAL_UNITS = ("meV", "cm-1")
+
+
+def normalize_spectral_unit(unit: Optional[str], default: str = "meV") -> str:
+    """Return a supported public spectral unit name."""
+    value = str(unit or default or "meV").strip().lower()
+    if value in {"mev", "milliev", "millielectronvolt", "millielectronvolts"}:
+        return "meV"
+    if value in {"cm-1", "cm^-1", "cm⁻¹", "cm1", "wavenumber", "wavenumbers"}:
+        return "cm-1"
+    if "mev" in value:
+        return "meV"
+    if "cm-1" in value or "cm^-1" in value or "cm⁻¹" in value or "cm1" in value or ("cm" in value and "-1" in value):
+        return "cm-1"
+    return normalize_spectral_unit(default, "meV") if value else "meV"
+
+
+def cm1_to_mev(value):
+    """Convert Raman shift from cm^-1 to meV."""
+    return np.asarray(value, dtype=float) * EV_PER_CM1 * 1000.0
+
+
+def mev_to_cm1(value):
+    """Convert Raman shift from meV to cm^-1."""
+    return np.asarray(value, dtype=float) / (EV_PER_CM1 * 1000.0)
+
+
+def cm1_to_unit(value, unit: str):
+    unit = normalize_spectral_unit(unit)
+    if unit == "meV":
+        return cm1_to_mev(value)
+    return np.asarray(value, dtype=float)
+
+
+def unit_to_cm1(value, unit: str):
+    unit = normalize_spectral_unit(unit)
+    if unit == "meV":
+        return mev_to_cm1(value)
+    return np.asarray(value, dtype=float)
+
+
+def spectral_xlim_from_cm1(xlim: Optional[Tuple[float, float]], unit: str) -> Optional[Tuple[float, float]]:
+    if xlim is None:
+        return None
+    converted = cm1_to_unit(np.asarray(xlim, dtype=float), unit)
+    return (float(converted[0]), float(converted[1]))
+
+
+def spectral_xlim_to_cm1(xlim: Optional[Tuple[float, float]], unit: str) -> Optional[Tuple[float, float]]:
+    if xlim is None:
+        return None
+    converted = unit_to_cm1(np.asarray(xlim, dtype=float), unit)
+    return (float(converted[0]), float(converted[1]))
+
+
+def alternate_spectral_unit(unit: str) -> str:
+    return "cm-1" if normalize_spectral_unit(unit) == "meV" else "meV"
+
+
+def spectral_axis_label(unit: str, *, latex: bool = True) -> str:
+    unit = normalize_spectral_unit(unit)
+    if unit == "meV":
+        return "Raman shift (meV)"
+    return "Raman shift (cm$^{-1}$)" if latex else "Raman shift (cm-1)"
+
+
+def spectral_axis_for_run(run, unit: str) -> Optional[np.ndarray]:
+    unit = normalize_spectral_unit(unit)
+    if run is None:
+        return None
+    if unit == "meV":
+        if getattr(run, "energy_eV", None) is not None:
+            return np.asarray(run.energy_eV, dtype=float) * 1000.0
+        if getattr(run, "shift_cm1", None) is not None:
+            return cm1_to_mev(run.shift_cm1)
+    if getattr(run, "shift_cm1", None) is not None:
+        return np.asarray(run.shift_cm1, dtype=float)
+    if getattr(run, "energy_eV", None) is not None:
+        return mev_to_cm1(np.asarray(run.energy_eV, dtype=float) * 1000.0)
+    return None
+
+
 def infer_intensity_unit(y: np.ndarray) -> str:
     """
     Decide whether an array of intensities is effectively integer-like
@@ -321,6 +403,7 @@ class RunType(str, Enum):
     RUN_1D = "1d run"
     RUN_2D = "2d run"
     DERIVED = "derived run"
+    FIT_PARAMS = "fit parameters"
     OTHER = "other"
 
 @dataclass
@@ -370,6 +453,40 @@ class RunViewConfig:
                    derived_n_points=derived_n_points,
                    derived_autorange=derived_autorange,
                    derived_range=derived_range)
+
+@dataclass
+class GraphViewConfig:
+    """Persisted axis and color settings for one visible graph panel."""
+    xlim: Optional[Tuple[float, float]] = None
+    ylim: Optional[Tuple[float, float]] = None
+    vmin: Optional[float] = None
+    vmax: Optional[float] = None
+    cmap: Optional[str] = None
+    clim: Optional[Tuple[float, float]] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GraphViewConfig":
+        if data is None:
+            return cls()
+
+        def _tuple_or_none(value):
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                try:
+                    return (float(value[0]), float(value[1]))
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        return cls(
+            xlim=_tuple_or_none(data.get("xlim")),
+            ylim=_tuple_or_none(data.get("ylim")),
+            vmin=None if data.get("vmin") is None else float(data.get("vmin")),
+            vmax=None if data.get("vmax") is None else float(data.get("vmax")),
+            cmap=data.get("cmap"),
+            clim=_tuple_or_none(data.get("clim")),
+        )
 
 @dataclass
 class Run:
@@ -533,15 +650,38 @@ class Run:
         Export the Run data to CSV files.
         For 2D runs: exports two files (cm-1 and meV).
         For 1D runs: exports one file with the best available X-axis.
+        Runs carrying map-fit parameter text also export a companion .dat file.
 
         If `base_filepath` is provided, it is used. Otherwise, a filename is
         generated from metadata and saved in `output_dir` (if provided) or
         the run's source directory.
         """
+        if self.run_type == RunType.FIT_PARAMS and self.metadata.get("fit_parameters_text"):
+            self._export_fit_parameters_text(base_filepath, output_dir)
+            return
+
         if self.is_2d:
             self._export_csv_2d(base_filepath, output_dir)
         else:
             self.export_csv_1d(base_filepath, output_dir)
+
+        if self.metadata.get("fit_parameters_text"):
+            self._export_fit_parameters_text(base_filepath, output_dir)
+
+    def _export_fit_parameters_text(self, base_filepath: Optional[str] = None, output_dir: Optional[str] = None) -> str:
+        base_filepath = self._resolve_export_path(base_filepath, output_dir)
+        base, _ext = os.path.splitext(base_filepath)
+        path = f"{base}_fit_params.dat"
+        text = str(self.metadata.get("fit_parameters_text", ""))
+        source_ids = self.metadata.get("source_run_ids") or self.metadata.get("fit_params_source_run_ids")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# Venkata map fitting parameters\n")
+            f.write(f"# Run: {self.nickname} ({self.id})\n")
+            if source_ids:
+                f.write(f"# Source run ids: {', '.join(str(v) for v in source_ids)}\n")
+            f.write(text.rstrip())
+            f.write("\n")
+        return path
 
     def _export_csv_2d(self, base_filepath: Optional[str] = None, output_dir: Optional[str] = None):
         """
@@ -705,7 +845,8 @@ class Run:
     def from_formula(cls, formula: str, params: Dict[str, float] = None, 
                      n_points: int = 100, x_range: Tuple[float, float] = (0, 100),
                      autorange: bool = False,
-                     nickname: str = "Formula Run") -> "Run":
+                     nickname: str = "Formula Run",
+                     x_unit: str = "x") -> "Run":
         """
         Create a Derived Run defined by a formula.
         """
@@ -717,7 +858,8 @@ class Run:
             "formula_params": params or {},
             "default_n_points": n_points,
             "default_autorange": autorange,
-            "default_range": x_range
+            "default_range": x_range,
+            "raw_x_unit": x_unit,
         }
         
         return cls(
@@ -758,18 +900,26 @@ class Run:
         wl_nm = None
         angle_values = None
         
+        x_label_lower = str(x_label).lower()
+
         # Simple heuristic mapping
-        if "cm" in x_label and "-1" in x_label:
+        if "mev" in x_label_lower:
+            energy_eV = x / 1000.0
+            shift_cm1 = energy_eV / EV_PER_CM1
+        elif "cm" in x_label_lower and ("-1" in x_label_lower or "^-1" in x_label_lower):
             shift_cm1 = x
-        elif "eV" in x_label:
+            energy_eV = shift_to_eV(shift_cm1)
+        elif "ev" in x_label_lower or "energy" in x_label_lower:
             energy_eV = x
-        elif "nm" in x_label:
+            shift_cm1 = energy_eV / EV_PER_CM1
+        elif "nm" in x_label_lower:
             wl_nm = x
-        elif "Angle" in x_label or "deg" in x_label:
+        elif "angle" in x_label_lower or "deg" in x_label_lower:
             angle_values = x
         else:
             # Default fallback for generic data
             shift_cm1 = x
+            energy_eV = shift_to_eV(shift_cm1)
             
         return cls(
             id=new_run_id(prefix="derived"),
@@ -789,7 +939,12 @@ class Run:
         )
 
     @classmethod
-    def from_file(cls, path: str) -> "Run":
+    def from_file(
+        cls,
+        path: str,
+        default_unknown_1d_spectral_unit: str = "meV",
+        default_unknown_2d_spectral_unit: str = "meV",
+    ) -> "Run":
         """
         Build a Run from a data file using load_table and parse_filename.
 
@@ -798,7 +953,8 @@ class Run:
             * (x, y)  -> treat as 1D spectrum.
             * (x, y, Z) -> treat as 2D map (e.g. angular_matrix_meV.csv).
         - For 2D case:
-            * x is assumed to be in meV (column labels).
+            * x is interpreted from filename/header when possible.
+            * otherwise x defaults to ``default_unknown_2d_spectral_unit``.
             * y is assumed to be angle in degrees.
             * Converts meV -> eV -> cm^-1 for the x-axis.
         - For 1D case:
@@ -808,6 +964,8 @@ class Run:
         arrays, header_labels = load_table(path)
         info = parse_filename(path)
         metadata = dict(info)
+        default_unknown_1d_spectral_unit = normalize_spectral_unit(default_unknown_1d_spectral_unit)
+        default_unknown_2d_spectral_unit = normalize_spectral_unit(default_unknown_2d_spectral_unit)
 
         try:
             mtime = os.path.getmtime(path)
@@ -871,10 +1029,16 @@ class Run:
                 if any(k in x_label for k in ["angle", "deg", "theta"]):
                     angle_values = x
                     default_x = None 
+                elif "mev" in x_label:
+                    energy_eV = x / 1000.0
+                    shift_cm1 = energy_eV / EV_PER_CM1
+                    metadata["raw_x_unit"] = "meV"
+                    default_x = None
                 elif any(k in x_label for k in ["ev", "energy"]):
                     energy_eV = x
                     # attempt auto-conversion
                     shift_cm1 = energy_eV / EV_PER_CM1
+                    metadata["raw_x_unit"] = "eV"
                     default_x = None
                 elif any(k in x_label for k in ["nm", "wave"]):
                     wl_nm = x
@@ -882,11 +1046,17 @@ class Run:
                 elif any(k in x_label for k in ["cm-1", "raman", "shift", "wavenumber"]):
                     shift_cm1 = x
                     energy_eV = shift_to_eV(shift_cm1)
+                    metadata["raw_x_unit"] = "cm-1"
                     default_x = None
             
             if default_x is not None:
-                shift_cm1 = default_x
-                energy_eV = shift_to_eV(shift_cm1)
+                if default_unknown_1d_spectral_unit == "meV":
+                    energy_eV = default_x / 1000.0
+                    shift_cm1 = energy_eV / EV_PER_CM1
+                else:
+                    shift_cm1 = default_x
+                    energy_eV = shift_to_eV(shift_cm1)
+                metadata["raw_x_unit"] = default_unknown_1d_spectral_unit
 
             return cls(
                 id=new_run_id(),
@@ -926,10 +1096,13 @@ class Run:
                 shift_cm1 = energies_eV / EV_PER_CM1
                 metadata.setdefault("raw_x_unit", "meV")
             else:
-                # Default fallback (legacy behavior assumed meV)
-                energies_eV = x_raw / 1000.0
-                shift_cm1 = energies_eV / EV_PER_CM1
-                metadata.setdefault("raw_x_unit", "meV")
+                if default_unknown_2d_spectral_unit == "meV":
+                    energies_eV = x_raw / 1000.0
+                    shift_cm1 = energies_eV / EV_PER_CM1
+                else:
+                    shift_cm1 = x_raw
+                    energies_eV = shift_to_eV(shift_cm1)
+                metadata.setdefault("raw_x_unit", default_unknown_2d_spectral_unit)
 
             metadata.setdefault("raw_dim", "2d")
             metadata.setdefault("raw_y_unit", "deg")
@@ -973,7 +1146,14 @@ class ViewState:
     run_configs: Dict[str, RunViewConfig] = field(default_factory=dict)
 
     # Display options
-    x_axis: str = "shift_cm1"   # "shift_cm1" or "energy_eV"
+    x_axis: str = "shift_cm1"   # Legacy: "shift_cm1" or "energy_eV"
+    spectral_unit: str = "meV"
+    angle_slice_type: str = "polar"
+    slice_x_binning: int = 1
+    slice_y_binning: int = 1
+    slice_binning_mode: str = "cross"
+    fit_overlay_mode: str = "off"
+    show_secondary_unit_axis: bool = True
     normalize: bool = False
     show_legend: bool = False
     
@@ -983,10 +1163,31 @@ class ViewState:
     vmin: float = 0.0
     vmax: float = 100.0
     cmap: str = "OrRd"
+    graph_configs: Dict[str, GraphViewConfig] = field(default_factory=dict)
 
     # Curve-fit placeholders (to be filled by analysis / GUI)
     active_fit_id: Optional[str] = None
     fit_params: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.spectral_unit = normalize_spectral_unit(self.spectral_unit)
+        if self.angle_slice_type not in {"polar", "cartesian"}:
+            self.angle_slice_type = "polar"
+        self.slice_x_binning = self._coerce_binning(self.slice_x_binning)
+        self.slice_y_binning = self._coerce_binning(self.slice_y_binning)
+        self.slice_binning_mode = str(self.slice_binning_mode).lower()
+        if self.slice_binning_mode not in {"cross", "box"}:
+            self.slice_binning_mode = "cross"
+        self.fit_overlay_mode = str(self.fit_overlay_mode).lower()
+        if self.fit_overlay_mode not in {"off", "global", "row", "both"}:
+            self.fit_overlay_mode = "off"
+
+    @staticmethod
+    def _coerce_binning(value: Any) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 1
 
     @property
     def n_runs(self) -> int:
@@ -997,17 +1198,84 @@ class ViewState:
             self.run_configs[run_id] = RunViewConfig()
         return self.run_configs[run_id]
 
+    def get_graph_config(self, graph_id: str) -> GraphViewConfig:
+        """
+        Return per-panel plot settings for keys such as ``1A`` or ``2C``.
+
+        The older view-level ``xlim``/``ylim``/``vmin``/``vmax``/``cmap`` fields
+        remain in place for backward compatibility. Newer saves mirror the
+        primary map into those fields so older code can still make sense of it.
+        """
+        if graph_id not in self.graph_configs:
+            self.graph_configs[graph_id] = GraphViewConfig()
+        return self.graph_configs[graph_id]
+
+    def seed_legacy_graph_configs(self) -> None:
+        """Populate graph configs from legacy view-level settings when needed."""
+        if self.graph_configs:
+            return
+
+        legacy_vmin = self.vmin
+        legacy_vmax = self.vmax
+        legacy_cmap = self.cmap
+
+        for slot in ("1", "2"):
+            map_cfg = self.get_graph_config(f"{slot}A")
+            map_cfg.xlim = tuple(self.xlim) if self.xlim else None
+            map_cfg.ylim = tuple(self.ylim) if self.ylim else None
+            map_cfg.vmin = legacy_vmin
+            map_cfg.vmax = legacy_vmax
+            map_cfg.cmap = legacy_cmap
+
+            # Plot B uses angle on its x-axis; Plot C uses shift on its x-axis.
+            b_cfg = self.get_graph_config(f"{slot}B")
+            b_cfg.xlim = tuple(self.ylim) if self.ylim else None
+
+            c_cfg = self.get_graph_config(f"{slot}C")
+            c_cfg.xlim = tuple(self.xlim) if self.xlim else None
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ViewState":
         run_configs_raw = data.get("run_configs", {})
         run_configs = {k: RunViewConfig.from_dict(v) for k, v in run_configs_raw.items()}
+        graph_configs_raw = data.get("graph_configs", {})
+        graph_configs = {k: GraphViewConfig.from_dict(v) for k, v in graph_configs_raw.items()}
         
         # Remove these from dict before unpacking to avoid double init
         base_data = dict(data)
-        if "run_configs" in base_data:
-            del base_data["run_configs"]
-            
-        return cls(run_configs=run_configs, **base_data)
+        for key in ("run_configs", "graph_configs"):
+            if key in base_data:
+                del base_data[key]
+
+        allowed = set(cls.__dataclass_fields__.keys())
+        base_data = {k: v for k, v in base_data.items() if k in allowed}
+        if "spectral_unit" in base_data:
+            base_data["spectral_unit"] = normalize_spectral_unit(base_data.get("spectral_unit"))
+        elif base_data.get("x_axis") == "energy_eV":
+            base_data["spectral_unit"] = "meV"
+        else:
+            base_data["spectral_unit"] = "meV"
+        if base_data.get("angle_slice_type") not in {"polar", "cartesian"}:
+            base_data["angle_slice_type"] = "polar"
+        base_data["slice_x_binning"] = cls._coerce_binning(base_data.get("slice_x_binning", 1))
+        base_data["slice_y_binning"] = cls._coerce_binning(base_data.get("slice_y_binning", 1))
+        base_data["slice_binning_mode"] = str(base_data.get("slice_binning_mode", "cross")).lower()
+        if base_data.get("slice_binning_mode") not in {"cross", "box"}:
+            base_data["slice_binning_mode"] = "cross"
+        base_data["fit_overlay_mode"] = str(base_data.get("fit_overlay_mode", "off")).lower()
+        if base_data.get("fit_overlay_mode") not in {"off", "global", "row", "both"}:
+            base_data["fit_overlay_mode"] = "off"
+        base_data["show_secondary_unit_axis"] = bool(base_data.get("show_secondary_unit_axis", True))
+        for key in ("xlim", "ylim"):
+            value = base_data.get(key)
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                try:
+                    base_data[key] = (float(value[0]), float(value[1]))
+                except (TypeError, ValueError):
+                    base_data[key] = None
+        view = cls(run_configs=run_configs, graph_configs=graph_configs, **base_data)
+        view.seed_legacy_graph_configs()
+        return view
 
 @dataclass
 class ExperimentSet:
@@ -1126,6 +1394,268 @@ class ExperimentSet:
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_json_dict(), f, indent=2, ensure_ascii=False)
+
+    def export_igor(self, path: str) -> str:
+        """
+        Export numeric runs to an Igor Text (.itx) file without external deps.
+
+        The file recreates dataset folders shaped like the reference PXP data
+        folder ``root:CsPdS_bi_xx``:
+
+        - ``root:<run_name>:wave0...waveN`` are per-x vertical slices.
+        - ``root:<run_name>:<run_name>_xaxis:wave0...waveN`` are scalar x
+          coordinate waves matching those slices.
+        - ``wave2D`` is an x-by-angle matrix.
+        - ``wave2D_interp`` is a uniformly scaled ImageTool companion wave
+          interpolated from the nonuniform x-axis, matching the reference PXP
+          profile/mask state.
+        - ``wave1Dx`` is the Raman-shift x axis in cm-1.
+        - ``wave1Dx_meV`` is the same axis in meV.
+        - ``wavey`` mirrors the last angle column of ``wave2D``, matching the
+          reference PXP folders.
+
+        Native .pxp files are packed binary Igor experiments. If a .pxp path is
+        passed, this method writes a sibling .itx file instead of creating a
+        mislabeled text file that Igor Pro cannot open.
+        """
+        root, ext = os.path.splitext(path)
+        if ext.lower() in {".pxp", ".pxt"}:
+            path = root + ".itx"
+        elif not ext:
+            path = path + ".itx"
+
+        def sanitize_wave_name(name: str, used: set[str]) -> str:
+            name = re.sub(r"\W+", "_", str(name or "wave")).strip("_")
+            if not name:
+                name = "wave"
+            if name[0].isdigit():
+                name = f"w_{name}"
+            name = name[:31]
+
+            base = name
+            suffix = 1
+            while name in used:
+                extra = f"_{suffix}"
+                name = f"{base[:31 - len(extra)]}{extra}"
+                suffix += 1
+            used.add(name)
+            return name
+
+        def sanitize_local_name(name: str, fallback: str, used: set[str]) -> str:
+            return sanitize_wave_name(name or fallback, used)
+
+        def format_value(value: float) -> str:
+            value = float(value)
+            if not np.isfinite(value):
+                return "NaN"
+            return f"{value:.12g}"
+
+        def write_wave(f, wave_name: str, data: np.ndarray, wave_type: str = "double") -> None:
+            if wave_type == "byte":
+                arr = np.asarray(data, dtype=np.uint8)
+                wave_flag = "/B/U"
+            elif wave_type == "single":
+                arr = np.asarray(data, dtype=np.float32)
+                wave_flag = ""
+            else:
+                arr = np.asarray(data, dtype=float)
+                wave_flag = "/D"
+
+            if arr.ndim == 0:
+                arr = arr.reshape(1)
+            elif arr.ndim > 2:
+                arr = arr.reshape(arr.shape[0], -1)
+
+            def _format_array_value(value) -> str:
+                if wave_type == "byte":
+                    return str(int(value))
+                return format_value(float(value))
+
+            if arr.ndim == 1:
+                f.write(f"WAVES{wave_flag}/N=({arr.shape[0]}) {wave_name}\n")
+                f.write("BEGIN\n")
+                for value in arr:
+                    f.write(f"{_format_array_value(value)}\n")
+                f.write("END\n")
+                return
+
+            f.write(f"WAVES{wave_flag}/N=({arr.shape[0]},{arr.shape[1]}) {wave_name}\n")
+            f.write("BEGIN\n")
+            for row in arr:
+                f.write("\t".join(_format_array_value(v) for v in row))
+                f.write("\n")
+            f.write("END\n")
+
+        def write_x_scale(f, wave_name: str, start: float, delta: float) -> None:
+            if np.isfinite(start) and np.isfinite(delta) and delta != 0:
+                f.write(f"X SetScale/P x, {format_value(start)}, {format_value(delta)}, {wave_name}\n")
+
+        def make_interpolated_image(
+            x_values: np.ndarray,
+            image_xy: np.ndarray,
+        ) -> Tuple[np.ndarray, Optional[float], Optional[float]]:
+            """
+            Build the uniformly scaled ImageTool image stored in the reference PXP.
+
+            The raw wave2D keeps the nonuniform x grid through the scalar xaxis
+            folder. ImageTool's saved profile/mask state is tied to a uniformly
+            scaled companion wave, so we export both.
+            """
+            x = np.asarray(x_values, dtype=float)
+            image = np.asarray(image_xy, dtype=float)
+            if x.ndim != 1 or image.ndim != 2 or image.shape[0] != x.size or x.size < 2:
+                return image, None, None
+
+            finite_x = np.isfinite(x)
+            if finite_x.sum() < 2:
+                return image, None, None
+
+            x = x[finite_x]
+            image = image[finite_x, :]
+            order = np.argsort(x)
+            x = x[order]
+            image = image[order, :]
+
+            unique_x, inverse = np.unique(x, return_inverse=True)
+            if unique_x.size < 2:
+                return image, None, None
+            if unique_x.size != x.size:
+                merged = np.empty((unique_x.size, image.shape[1]), dtype=float)
+                for idx in range(unique_x.size):
+                    merged[idx, :] = np.nanmean(image[inverse == idx, :], axis=0)
+                image = merged
+                x = unique_x
+
+            x_start = float(np.ceil(np.nanmin(x)))
+            x_stop = float(np.floor(np.nanmax(x)))
+            if not np.isfinite(x_start) or not np.isfinite(x_stop) or x_stop <= x_start:
+                x_start = float(x[0])
+                x_stop = float(x[-1])
+            if x_stop <= x_start:
+                return image, None, None
+
+            interp_count = max(1000, int(x_values.size))
+            x_interp = np.linspace(x_start, x_stop, interp_count)
+            image_interp = np.empty((interp_count, image.shape[1]), dtype=float)
+            for col in range(image.shape[1]):
+                y = image[:, col]
+                finite = np.isfinite(y)
+                if finite.sum() >= 2:
+                    image_interp[:, col] = np.interp(x_interp, x[finite], y[finite])
+                elif finite.sum() == 1:
+                    image_interp[:, col] = float(y[finite][0])
+                else:
+                    image_interp[:, col] = np.nan
+
+            delta = float((x_stop - x_start) / (interp_count - 1))
+            return image_interp, x_start, delta
+
+        def folder_path(folder_name: str) -> str:
+            return f"root:{folder_name}"
+
+        def write_set_folder(f, folder_name: str) -> None:
+            f.write("X SetDataFolder root:\n")
+            f.write(f"X NewDataFolder/O {folder_path(folder_name)}\n")
+            f.write(f"X SetDataFolder {folder_path(folder_name)}\n")
+
+        used_names: set[str] = set()
+        used_folders: set[str] = set()
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("IGOR\n")
+            f.write("X SetDataFolder root:\n")
+
+            for run_id, run in self.runs.items():
+                if run.is_2d:
+                    folder_name = sanitize_local_name(run.nickname, run_id, used_folders)
+                    write_set_folder(f, folder_name)
+
+                    local_used: set[str] = set()
+                    intensity = np.asarray(run.intensity_2d, dtype=float)
+                    x_axis = np.asarray(run.shift_cm1, dtype=float) if run.shift_cm1 is not None else np.arange(intensity.shape[1], dtype=float)
+                    if run.angle_values is not None:
+                        y_axis = np.asarray(run.angle_values, dtype=float)
+                    else:
+                        y_axis = np.arange(intensity.shape[0], dtype=float)
+
+                    if intensity.shape != (y_axis.size, x_axis.size):
+                        if intensity.shape == (x_axis.size, y_axis.size):
+                            intensity_yx = intensity.T
+                        else:
+                            raise ValueError(
+                                f"Run '{run.nickname}' has incompatible 2D shape {intensity.shape} "
+                                f"for axes ({y_axis.size}, {x_axis.size})."
+                            )
+                    else:
+                        intensity_yx = intensity
+
+                    # Reference PXP stores wave2D as (x, y), while Venkata stores
+                    # intensity_2d as (y, x).
+                    intensity_xy = np.asarray(intensity_yx.T, dtype=float)
+
+                    for idx in range(intensity_xy.shape[0]):
+                        write_wave(f, f"wave{idx}", intensity_xy[idx, :])
+
+                    wave2d_name = sanitize_wave_name("wave2D", local_used)
+                    write_wave(f, wave2d_name, intensity_xy, wave_type="single")
+                    wave2d_interp, interp_start, interp_delta = make_interpolated_image(x_axis, intensity_xy)
+                    wave2d_interp_name = sanitize_wave_name("wave2D_interp", local_used)
+                    write_wave(f, wave2d_interp_name, wave2d_interp, wave_type="single")
+                    if interp_start is not None and interp_delta is not None:
+                        write_x_scale(f, wave2d_interp_name, interp_start, interp_delta)
+
+                    write_wave(f, sanitize_wave_name("wave1Dx", local_used), x_axis, wave_type="single")
+                    if run.energy_eV is not None and len(run.energy_eV) == x_axis.size:
+                        x_mev = np.asarray(run.energy_eV, dtype=float) * 1000.0
+                    else:
+                        x_mev = x_axis * EV_PER_CM1 * 1000.0
+                    write_wave(f, sanitize_wave_name("wave1Dx_meV", local_used), x_mev, wave_type="single")
+                    # In the reference PXP folders, wavey exactly matches the
+                    # last angle column of wave2D. ImageTool uses these helper
+                    # waves for profile state, so using the first column makes
+                    # the displayed image look right while the slice/profile
+                    # values start from the wrong trace.
+                    write_wave(f, sanitize_wave_name("wavey", local_used), intensity_xy[:, -1], wave_type="single")
+                    roi_name = sanitize_wave_name("M_ROIMask", local_used)
+                    write_wave(f, roi_name, np.ones(wave2d_interp.shape, dtype=np.uint8), wave_type="byte")
+                    if interp_start is not None and interp_delta is not None:
+                        write_x_scale(f, roi_name, interp_start, interp_delta)
+                    write_wave(f, sanitize_wave_name("proc_ROIx", local_used), np.array([], dtype=float), wave_type="single")
+                    write_wave(f, sanitize_wave_name("proc_ROIy", local_used), np.array([], dtype=float), wave_type="single")
+                    write_wave(f, sanitize_wave_name("sel_ROIx", local_used), np.array([], dtype=float), wave_type="single")
+                    write_wave(f, sanitize_wave_name("sel_ROIy", local_used), np.array([], dtype=float), wave_type="single")
+
+                    x_folder = sanitize_wave_name(f"{folder_name}_xaxis", set())
+                    f.write(f"X NewDataFolder/O {folder_path(folder_name)}:{x_folder}\n")
+                    f.write(f"X SetDataFolder {folder_path(folder_name)}:{x_folder}\n")
+                    for idx, x_val in enumerate(x_axis):
+                        write_wave(f, f"wave{idx}", np.array([x_val], dtype=float))
+                    f.write(f"X SetDataFolder {folder_path(folder_name)}\n")
+
+                elif run.intensity is not None:
+                    folder_name = sanitize_local_name(run.nickname, run_id, used_folders)
+                    write_set_folder(f, folder_name)
+
+                    local_used: set[str] = set()
+                    wave_name = sanitize_wave_name("trace", local_used)
+                    write_wave(f, wave_name, run.intensity)
+
+                    if run.shift_cm1 is not None:
+                        x_name = sanitize_wave_name("x_cm1", local_used)
+                        write_wave(f, x_name, run.shift_cm1)
+                    elif run.angle_values is not None:
+                        x_name = sanitize_wave_name("x_deg", local_used)
+                        write_wave(f, x_name, run.angle_values)
+                    elif run.wl_nm is not None:
+                        x_name = sanitize_wave_name("x_nm", local_used)
+                        write_wave(f, x_name, run.wl_nm)
+                    elif run.energy_eV is not None:
+                        x_name = sanitize_wave_name("x_eV", local_used)
+                        write_wave(f, x_name, run.energy_eV)
+
+            f.write("X SetDataFolder root:\n\n")
+
+        return path
 
     def export_hdf5(self, path: str) -> None:
         """

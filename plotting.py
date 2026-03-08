@@ -100,7 +100,8 @@ class RamanPlotter2d(BasePlotter):
         xlabel: str = "Raman shift (cm$^{-1}$)",
         ylabel: str = "Angle (deg)",
         cmap: str = "OrRd",
-        x_unit_conversion: Optional[Tuple[Callable, Callable]] = None
+        x_unit_conversion: Optional[Tuple[Callable, Callable]] = None,
+        secondary_x_label: str = "Energy shift (meV)",
     ):
         self.clear()
         
@@ -155,7 +156,7 @@ class RamanPlotter2d(BasePlotter):
         if x_unit_conversion:
             self._x_unit_conversion = x_unit_conversion
             self.secax = self.ax.secondary_xaxis("top", functions=x_unit_conversion)
-            self.secax.set_xlabel("Energy shift (meV)") # assumption, can be parameterized
+            self.secax.set_xlabel(secondary_x_label)
 
         # Reset artists
         self._vline = None
@@ -471,6 +472,7 @@ class SlicePlotter(BasePlotter):
         xlabel: str = "Raman shift (cm$^{-1}$)",
         ylabel: str = "Intensity (a.u.)",
         x_unit_conversion: Optional[Tuple[Callable, Callable]] = None,
+        secondary_x_label: str = "Energy shift (meV)",
         style: Optional[Any] = None
     ):
         self.clear()
@@ -493,7 +495,7 @@ class SlicePlotter(BasePlotter):
 
         if x_unit_conversion:
             self._secax = self.ax.secondary_xaxis("top", functions=x_unit_conversion)
-            self._secax.set_xlabel("Energy shift (meV)")
+            self._secax.set_xlabel(secondary_x_label)
 
         self.draw()
 
@@ -515,5 +517,4 @@ class SlicePlotter(BasePlotter):
         else:
             self._vline.set_visible(False)
         self.draw()
-
 

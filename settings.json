@@ -1,36 +1,60 @@
 {
-    "colormap": "cmc.lajolla_custom",
-    "unit": "cm-1",
+    "default_spectral_unit": "meV",
+    "default_colormap": "magma_r_custom2",
+    "default_vmin_percent": 0.0,
+    "default_vmax_percent": 100.0,
+    "default_angle_slice_type": "polar",
+    "default_slice_x_binning": 1,
+    "default_slice_y_binning": 1,
+    "default_slice_binning_mode": "cross",
+    "show_secondary_unit_axis": true,
+    "highlight_requires_modifier": true,
+    "default_unknown_1d_spectral_unit": "meV",
+    "default_unknown_2d_spectral_unit": "meV",
+    "colormap": "magma_r_custom2",
+    "unit": "meV",
     "dark_value": 600.0,
-    "cosmic_threshold": 100.0,
+    "cosmic_threshold": 300.0,
     "cosmic_ratio": 2.0,
     "window_size": [
-        1400,
-        800
+        1920,
+        1050
     ],
-    "last_directory": "/Users/joonyounglee/Library/CloudStorage/Dropbox/QMASS-Data/Raman Spectroscopy/260216_CsPtS",
+    "last_directory": "/Users/joonyounglee/Library/CloudStorage/Dropbox-QMASS/QMASS/Paper/2026_vdWkagome2_RamanARPES/Joonyounglee/Raman Slices/0522",
     "custom_colormaps": {
-        "MyCustomMap": [
+        "magma_r_custom1": [
             [
                 0.0,
+                "#FBFBFB"
+            ],
+            [
+                0.3,
+                "#ECAB88"
+            ],
+            [
+                0.8,
+                "#9136B5"
+            ],
+            [
+                0.9,
                 "#000000"
             ],
             [
                 1.0,
-                "#FFFFFF"
+                "#5B58FF"
             ]
         ],
-        "magma_r_custom": [
+        "magma_r_custom2": [
             [
                 0.0,
                 "#fcfdbf"
             ],
             [
-                0.7,
+                0.3,
                 "#FB8761"
             ],
             [
-                0.8,
+                0.6,
                 "#B5367A"
             ],
             [
@@ -42,26 +66,98 @@
                 "#000004"
             ]
         ],
-        "cmc.lajolla_custom": [
+        "magma_r_custom_rps": [
             [
                 0.0,
-                "#FFFECB"
+                "#FCFDBF"
             ],
             [
-                0.5,
-                "#EDAE54"
+                0.05,
+                "#FB8761"
+            ],
+            [
+                0.4,
+                "#B5367A"
             ],
             [
                 0.6,
-                "#D9604E"
+                "#4F127B"
             ],
             [
-                0.8,
-                "#67342A"
+                1.0,
+                "#000004"
+            ]
+        ],
+        "magma_r_custom_rps2": [
+            [
+                0.0,
+                "#FCFDBF"
+            ],
+            [
+                0.0641025641025641,
+                "#F7A926"
+            ],
+            [
+                0.10256410256410256,
+                "#FA8861"
+            ],
+            [
+                0.6009615384615384,
+                "#B5367A"
+            ],
+            [
+                0.7996794871794872,
+                "#4F127B"
+            ],
+            [
+                1.0,
+                "#000004"
+            ]
+        ],
+        "bone_r": [
+            [
+                0.0,
+                "#FFFFFF"
             ],
             [
                 0.9,
-                "#191900"
+                "#313171"
+            ]
+        ],
+        "bone_rr": [
+            [
+                0.0,
+                "#FFFFFF"
+            ],
+            [
+                0.3,
+                "#A6C6C6"
+            ],
+            [
+                0.8,
+                "#515171"
+            ],
+            [
+                1.0,
+                "#000000"
+            ]
+        ],
+        "magma_r_custom": [
+            [
+                0.0,
+                "#fcfdbf"
+            ],
+            [
+                0.25,
+                "#fb8761"
+            ],
+            [
+                0.75,
+                "#4f127b"
+            ],
+            [
+                1.0,
+                "#000004"
             ]
         ]
     }

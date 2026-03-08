@@ -9,6 +9,7 @@ from matplotlib.backends.backend_wxagg import NavigationToolbar2WxAgg as Navigat
 from matplotlib.figure import Figure
 import analysis
 from data_structure import Run, RunType, new_run_id
+from typing import List, Optional, Dict, Any, Tuple
 
 class ParamsGrid(wx.grid.Grid):
     def __init__(self, parent):
@@ -128,30 +129,102 @@ class ValidationFrame(wx.Frame):
             
         self.canvas.draw()
 
+
+class ExportOptionsDialog(wx.Dialog):
+    def __init__(self, parent, peak_names):
+        super().__init__(parent, title="Export Options", size=(400, 500))
+        self.peak_names = peak_names
+        self.init_ui()
+        
+    def init_ui(self):
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        sizer.Add(wx.StaticText(self, label="Select data to export to experiment:"), 0, wx.ALL, 10)
+        
+        self.cb_full_rec = wx.CheckBox(self, label="Full Reconstruction (Total)")
+        self.cb_full_rec.SetValue(True)
+        sizer.Add(self.cb_full_rec, 0, wx.LEFT|wx.RIGHT|wx.BOTTOM, 10)
+        
+        self.cb_params = wx.CheckBox(self, label="Fit Parameters (as a special run)")
+        self.cb_params.SetValue(True)
+        sizer.Add(self.cb_params, 0, wx.LEFT|wx.RIGHT|wx.BOTTOM, 10)
+
+        self.cb_polar_areas = wx.CheckBox(self, label="Peak-wise Polar Peak Area Map (Angle vs Peak)")
+        self.cb_polar_areas.SetValue(True)
+        sizer.Add(self.cb_polar_areas, 0, wx.LEFT|wx.RIGHT|wx.BOTTOM, 10)
+
+        sizer.Add(wx.StaticLine(self), 0, wx.EXPAND|wx.ALL, 5)
+        sizer.Add(wx.StaticText(self, label="Individual Peak Reconstructions:"), 0, wx.ALL, 10)
+        
+        self.peak_cbs = []
+        for name in self.peak_names:
+            cb = wx.CheckBox(self, label=f"Peak: {name}")
+            cb.SetValue(False)
+            self.peak_cbs.append(cb)
+            sizer.Add(cb, 0, wx.LEFT|wx.RIGHT|wx.BOTTOM, 10)
+            
+        btn_sizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
+        sizer.Add(btn_sizer, 0, wx.ALL | wx.ALIGN_RIGHT, 10)
+        
+        self.SetSizer(sizer)
+
+    def get_options(self):
+        return {
+            "full_rec": self.cb_full_rec.GetValue(),
+            "params": self.cb_params.GetValue(),
+            "polar_areas": self.cb_polar_areas.GetValue(),
+            "peaks": [cb.GetValue() for cb in self.peak_cbs]
+        }
+
 class MapFittingDialog(wx.Dialog):
-    def __init__(self, parent, run1: Run, run2: Run):
-        super().__init__(parent, title=f"Joint 2D Fitting: {run1.nickname} & {run2.nickname}", size=(1400, 900),
+    def __init__(
+        self,
+        parent,
+        run1: Run,
+        run2: Optional[Run] = None,
+        params_run: Optional[Run] = None,
+        single_config: str = "parallel",
+    ):
+        super().__init__(parent, title=f"Joint 2D Fitting", size=(1400, 900),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX)
         
         self.engine = analysis.MapFittingEngine()
-        self.run1 = run1
-        self.run2 = run2
         
-        # Determine which is XX and which is YX based on nickname or pol metadata
-        # Default: run1 is XX, run2 is YX unless detected otherwise
-        r1_pol = str(run1.metadata.get("pol", "")).lower()
-        r2_pol = str(run2.metadata.get("pol", "")).lower()
-        
-        swap = False
-        if ("yx" in r1_pol or "xy" in r1_pol or "cross" in r1_pol) and not ("xx" in r2_pol or "para" in r2_pol):
-            swap = True
-        
-        if swap:
-            self.run1, self.run2 = run2, run1
+        self.single_config = "cross" if str(single_config).lower().startswith("cross") else "parallel"
+
+        if run2 is None:
+            self.run1, self.run2 = run1, None
+            self.engine.datasets[0]["config"] = self.single_config
+            self.engine.datasets[0]["label"] = "Parallel (XX)" if self.single_config == "parallel" else "Cross (YX)"
+        else:
+            # Determine which is XX and which is YX based on pol metadata
+            r1_pol = str(run1.metadata.get("pol", "")).lower()
+            r2_pol = str(run2.metadata.get("pol", "")).lower()
             
-        self.engine.set_data(0, self.run1.shift_cm1, self.run1.angle_values, self.run1.intensity_2d, self.run1.nickname)
-        self.engine.set_data(1, self.run2.shift_cm1, self.run2.angle_values, self.run2.intensity_2d, self.run2.nickname)
+            swap = False
+            if ("yx" in r1_pol or "xy" in r1_pol or "cross" in r1_pol) and not ("xx" in r2_pol or "para" in r2_pol):
+                swap = True
+            
+            if swap:
+                self.run1, self.run2 = run2, run1
+            else:
+                self.run1, self.run2 = run1, run2
+            
+        if self.run1.is_2d:
+            self.engine.set_data(0, self.run1.shift_cm1, self.run1.angle_values, self.run1.intensity_2d, self.run1.nickname)
+            self.engine.datasets[0]["config"] = self.single_config if self.run2 is None else "parallel"
+            self.engine.datasets[0]["label"] = "Parallel (XX)" if self.engine.datasets[0]["config"] == "parallel" else "Cross (YX)"
+        if self.run2 is not None and self.run2.is_2d:
+            self.engine.set_data(1, self.run2.shift_cm1, self.run2.angle_values, self.run2.intensity_2d, self.run2.nickname)
         
+        if params_run:
+            self.engine.from_dict(params_run.metadata.get("fit_state", {}))
+        
+        if self.run2 is None:
+            self.SetTitle(f"2D Fitting: {self.run1.nickname} ({self.engine.datasets[0]['label']})")
+        else:
+            self.SetTitle(f"Joint 2D Fitting: {self.run1.nickname} & {self.run2.nickname}")
+
         self.last_sel = 0
         self.slice_angle_idx = 0
         self.slice_shift_idx = len(self.engine.datasets[0]["x"]) // 2 if self.engine.datasets[0]["x"] is not None else 0
@@ -161,6 +234,35 @@ class MapFittingDialog(wx.Dialog):
         self.init_ui()
         self.refresh_ui()
         self.update_plots()
+
+    def _source_runs(self) -> List[Run]:
+        return [r for r in (self.run1, self.run2) if r is not None]
+
+    def _source_run_ids(self) -> List[str]:
+        return [r.id for r in self._source_runs()]
+
+    def make_fit_params_run(self) -> Run:
+        names = "_".join(r.nickname for r in self._source_runs())
+        text = self.engine.export_parameters_text()
+        return Run(
+            id=new_run_id(prefix="params"),
+            source_path="",
+            metadata={
+                "nickname": f"FitParams_{names}",
+                "fit_state": self.engine.to_dict(),
+                "fit_parameters_text": text,
+                "source_run_ids": self._source_run_ids(),
+            },
+            run_type=RunType.FIT_PARAMS
+        )
+
+    def persist_fit_metadata_to_sources(self) -> None:
+        text = self.engine.export_parameters_text()
+        state = self.engine.to_dict()
+        for run in self._source_runs():
+            run.metadata["fit_state"] = state
+            run.metadata["fit_parameters_text"] = text
+            run.metadata["fit_params_source_run_ids"] = self._source_run_ids()
 
     def init_ui(self):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -217,7 +319,8 @@ class MapFittingDialog(wx.Dialog):
         # Actions
         act_box = wx.FlexGridSizer(3, 2, 5, 5)
         for lbl, cb in [("Preview", self.on_preview), ("FIT Global", self.on_fit), 
-                        ("Validate (RowFit)", self.on_validate), ("Export Text", self.on_export_text)]:
+                        ("Validate (RowFit)", self.on_validate), ("Export Text", self.on_export_text),
+                        ("Import Text", self.on_import_text)]:
             btn = wx.Button(left_panel, label=lbl)
             btn.Bind(wx.EVT_BUTTON, cb)
             act_box.Add(btn, 1, wx.EXPAND)
@@ -255,7 +358,7 @@ class MapFittingDialog(wx.Dialog):
         # Dialog buttons
         btn_sizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
         # Add "Export to Experiment" button
-        self.btn_export_exp = wx.Button(self, label="Export Result Runs to Experiment")
+        self.btn_export_exp = wx.Button(self, label="Export to Experiment...")
         self.btn_export_exp.Bind(wx.EVT_BUTTON, self.on_export_to_experiment)
         
         h_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -350,6 +453,7 @@ class MapFittingDialog(wx.Dialog):
         success, msg = self.engine.run_optimization()
         dlg.Destroy()
         if success: 
+            self.persist_fit_metadata_to_sources()
             self.load_grid()
             self.update_plots()
             wx.MessageBox("Global Fit Complete", "Success")
@@ -373,6 +477,21 @@ class MapFittingDialog(wx.Dialog):
         dlg = wx.lib.dialogs.ScrolledMessageDialog(self, text, "Exported Parameters")
         dlg.ShowModal()
         dlg.Destroy()
+
+    def on_import_text(self, e):
+        with wx.FileDialog(self, "Import Fitting Parameters", wildcard="TXT files (*.txt)|*.txt",
+                          style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as file_dlg:
+            if file_dlg.ShowModal() == wx.ID_CANCEL: return
+            path = file_dlg.GetPath()
+            try:
+                with open(path, "r") as f:
+                    text = f.read()
+                self.engine.import_parameters_text(text)
+                self.refresh_ui()
+                self.update_plots()
+                wx.MessageBox("Parameters imported successfully.", "Success")
+            except Exception as ex:
+                wx.MessageBox(f"Import failed: {ex}", "Error", wx.ICON_ERROR)
 
     def on_click(self, e):
         if self.toolbar.mode != '': return
@@ -460,20 +579,96 @@ class MapFittingDialog(wx.Dialog):
     def on_export_to_experiment(self, e):
         """Build Run objects from reconstructions and store them."""
         self.save_grid(self.peak_list.GetSelection())
+        self.persist_fit_metadata_to_sources()
         
-        recons = self.engine.get_peak_reconstructions()
-        if not recons:
-            wx.MessageBox("No reconstruction data available. Run fitting first.", "Info")
-            return
-            
+        peak_names = [p["name"] for p in self.engine.peaks]
+        with ExportOptionsDialog(self, peak_names) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            options = dlg.get_options()
+
         self.result_runs = []
         
+        # 1. Full Reconstruction
+        if options["full_rec"]:
+            for i in range(2):
+                orig_run = self.run1 if i == 0 else self.run2
+                if orig_run is None or not orig_run.is_2d: continue
+                total_rec = self.engine.reconstruct(i)
+                
+                new_nickname = f"{orig_run.nickname}_TotalFit"
+                new_metadata = orig_run.metadata.copy()
+                new_metadata["nickname"] = new_nickname
+                new_metadata["is_reconstruction"] = True
+                new_metadata["fit_component"] = "Total"
+                new_metadata["source_run_id"] = orig_run.id
+                
+                new_run = Run(
+                    id=new_run_id(prefix="fit"),
+                    source_path=orig_run.source_path,
+                    source_mtime=orig_run.source_mtime,
+                    wl_nm=None,
+                    shift_cm1=orig_run.shift_cm1,
+                    energy_eV=orig_run.energy_eV,
+                    intensity=None,
+                    intensity_2d=total_rec,
+                    angle_values=orig_run.angle_values,
+                    intensity_unit=orig_run.intensity_unit,
+                    angle_unit=orig_run.angle_unit,
+                    metadata=new_metadata,
+                    run_type=RunType.RUN_2D,
+                    raw_table=None
+                )
+                self.result_runs.append(new_run)
+
+        # 2. Fit Parameters
+        if options["params"]:
+            self.result_runs.append(self.make_fit_params_run())
+
+        # 3. Polar Areas
+        if options["polar_areas"]:
+            for i in range(2):
+                orig_run = self.run1 if i == 0 else self.run2
+                if orig_run is None or not orig_run.is_2d: continue
+                areas = self.engine.get_peak_polar_areas(i)
+                if areas is None: continue
+                
+                new_nickname = f"{orig_run.nickname}_PolarAreas"
+                new_run = Run(
+                    id=new_run_id(prefix="polar"),
+                    source_path="",
+                    shift_cm1=np.arange(areas.shape[1]), # Peak index
+                    angle_values=orig_run.angle_values,
+                    intensity_2d=areas,
+                    metadata={
+                        "nickname": new_nickname,
+                        "source_run_id": orig_run.id,
+                        "peak_names": peak_names
+                    },
+                    run_type=RunType.RUN_2D
+                )
+                self.result_runs.append(new_run)
+
+        # 4. Individual Peak Reconstructions
+        recons = self.engine.get_peak_reconstructions()
         for rec in recons:
             ds_idx = rec["dataset_idx"]
             orig_run = self.run1 if ds_idx == 0 else self.run2
+            if not (orig_run and orig_run.is_2d): continue
             name = rec["name"]
-            matrix = rec["matrix"]
             
+            # Check if this peak was selected
+            if name == "Background":
+                continue
+                
+            try:
+                peak_idx = peak_names.index(name)
+                if not options["peaks"][peak_idx]:
+                    continue
+            except ValueError:
+                continue
+                
+            matrix = rec["matrix"]
             new_nickname = f"{orig_run.nickname}_{name}_fit"
             
             new_metadata = orig_run.metadata.copy()
@@ -500,36 +695,11 @@ class MapFittingDialog(wx.Dialog):
             )
             self.result_runs.append(new_run)
             
-        # Also add the TOTAL reconstruction for each dataset
-        for i in range(2):
-            orig_run = self.run1 if i == 0 else self.run2
-            total_rec = self.engine.reconstruct(i)
-            
-            new_nickname = f"{orig_run.nickname}_TotalFit"
-            new_metadata = orig_run.metadata.copy()
-            new_metadata["nickname"] = new_nickname
-            new_metadata["is_reconstruction"] = True
-            new_metadata["fit_component"] = "Total"
-            new_metadata["source_run_id"] = orig_run.id
-            
-            new_run = Run(
-                id=new_run_id(prefix="fit"),
-                source_path=orig_run.source_path,
-                source_mtime=orig_run.source_mtime,
-                wl_nm=None,
-                shift_cm1=orig_run.shift_cm1,
-                energy_eV=orig_run.energy_eV,
-                intensity=None,
-                intensity_2d=total_rec,
-                angle_values=orig_run.angle_values,
-                intensity_unit=orig_run.intensity_unit,
-                angle_unit=orig_run.angle_unit,
-                metadata=new_metadata,
-                run_type=RunType.RUN_2D,
-                raw_table=None
-            )
-            self.result_runs.append(new_run)
-            
-        wx.MessageBox(f"Created {len(self.result_runs)} reconstruction runs.", "Export Successful")
-        # In a real dialog, we might want to close here or just stay open.
-        # If we are in a Modal dialog, the caller will check self.result_runs.
+        # Count how many for each run
+        r1_count = len([r for r in self.result_runs if r.metadata.get("source_run_id") == self.run1.id])
+        lines = [f"Created {len(self.result_runs)} runs total.", f"- {self.run1.nickname}: {r1_count} runs"]
+        if self.run2 is not None:
+            r2_count = len([r for r in self.result_runs if r.metadata.get("source_run_id") == self.run2.id])
+            lines.append(f"- {self.run2.nickname}: {r2_count} runs")
+        msg = "\n".join(lines)
+        wx.MessageBox(msg, "Export Successful")

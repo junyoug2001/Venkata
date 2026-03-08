@@ -5,3 +5,18 @@ Results/
 *.csv
 *.dat
 __pycache__/
+*.ipynb
+X.zip
+261108_CsPdS_AirExposed/
+
+260523 Venkata.md
+CPS_bulk_xx_2dmap_5cm-1_to_50meV.pdf
+.gitignore
+CPS_bulk_yx_2dmap_5cm-1_to_50meV.pdf
+CsPdS_Airexposed_Analysis.zip
+CsPdS_airexposed_graphsPDF.zip
+261108_CsPdS_AirExposed/RawData/CsPdS_fewlayer_RR.pdf
+temp_pyigor_15556.h5
+261108_CsPdS_AirExposed.zip
+260523_RamanData.itx
+data.pxp

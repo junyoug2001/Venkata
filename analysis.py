@@ -114,17 +114,21 @@ class MergeDiscoverResult:
 
     title: str = "Preview (raw, wavelength axis)"
     candidate_laser_nm: Optional[float] = None
+    
+    # Store raw data for cosmic ray detection etc.
+    raw_files: List[str] = field(default_factory=list, repr=False)
+    raw_xxxx: List[Optional[str]] = field(default_factory=list, repr=False) # xxxx from original files
+    raw_yyyy: List[Optional[str]] = field(default_factory=list, repr=False) # yyyy from original files
+    raw_angle_values: Optional[np.ndarray] = field(default=None, repr=False)  # shape (n_raw,)
+    raw_intensity_matrix: Optional[np.ndarray] = field(default=None, repr=False)  # shape (n_raw, nx)
+    raw_rows_by_xxxx: Optional[Dict[str, List[int]]] = field(default=None, repr=False) # Map xxxx to list of raw row indices
 
-    # --- New fields for raw/primitive data access (for GUI plotting) ---
-    raw_files: List[str] = field(default_factory=list)
-    raw_xxxx: List[Optional[str]] = field(default_factory=list)
-    raw_yyyy: List[Optional[str]] = field(default_factory=list)
-    raw_angle_values: Optional[np.ndarray] = None  # shape (n_raw,)
-    raw_intensity_matrix: Optional[np.ndarray] = None  # shape (n_raw, nx)
-    raw_rows_by_xxxx: Optional[Dict[str, List[int]]] = None
-    primitive_xxxx: List[str] = field(default_factory=list)
-    primitive_matrix: Optional[np.ndarray] = None  # shape (n_xxxx, nx)
-    cosmic_matrix: Optional[np.ndarray] = None
+    primitive_xxxx: List[str] = field(default_factory=list) # xxxx values after grouping, e.g., ["0001", "0002"] or ["RR", "RL"]
+    primitive_matrix: Optional[np.ndarray] = field(default=None)  # shape (n_xxxx, nx)
+
+    cosmic_matrix: Optional[np.ndarray] = field(default=None) # Mask applied to original raw_intensity_matrix
+    
+    is_polarization_merge: bool = False # New flag to indicate a polarization merge
 
 
 @dataclass
@@ -212,296 +216,660 @@ class NullPrompt(UserPrompt):
 
 # ============================================================================
 # Filename detection helpers
+POLARIZATION_TYPES = ["RR", "LL", "RL", "LR"]
+POLARIZATION_TYPES_RE = "|".join(POLARIZATION_TYPES)
+
+# Regex for different filename patterns
+
+POLARIZATION_IDX_RE = re.compile(
+
+    r"^(?P<prefix>.*?)_(?P<pol_type>RR|RL|LR|LL)(?P<middle>.*)_(?P<yyyy>\d{4})(?P<ext>\.[^.]+)$"
+
+)
+
+NORMAL_IDX_TWO_RE = re.compile(r"^(?P<prefix>.+)_(?P<xxxx>\d{4})_(?P<yyyy>\d{4})(?P<ext>\.[^.]+)$")
+
+NORMAL_IDX_ONE_RE = re.compile(r"^(?P<prefix>.+)_(?P<xxxx>\d{4})(?P<ext>\.[^.]+)$")
+
 # ============================================================================
 
 
-# Requirement: detect suffix "_xxxx_yyyy" where xxxx and yyyy are 4 digits.
-IDX_RE = re.compile(r"^(?P<prefix>.*)_(?P<xxxx>\d{4})_(?P<yyyy>\d{4})(?P<ext>\.[^.]+)$")
 
 
-def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], List[str]]:
-    """Detect similar files in the same directory.
 
-    Similarity criterion (current):
-    - Same directory
-    - File name matches <prefix>_xxxx_yyyy<ext>
-    - Same prefix and ext as the seed file
+def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], List[str], bool]:
 
-    Returns
-    - files: sorted list by (xxxx, yyyy)
-    - pattern_hint: '<prefix>_xxxx_yyyy<ext>' for GUI display
-    - unique_xxxx: sorted unique xxxx
-    - unique_yyyy: sorted unique yyyy
-
-    If seed file does not match the pattern, returns [seed_file] and pattern_hint=basename.
-    """
+    """Detect similar files in the same directory."""
 
     seed_file = os.path.abspath(seed_file)
+
     d = os.path.dirname(seed_file)
+
     base = os.path.basename(seed_file)
 
-    m = IDX_RE.match(base)
-    if not m:
-        return [seed_file], base, [], []
-
-    prefix = m.group("prefix")
-    ext = m.group("ext")
-    pattern_hint = f"{prefix}_xxxx_yyyy{ext}"
-
-    cands: List[Tuple[str, str, str]] = []
-    for fn in os.listdir(d):
-        mm = IDX_RE.match(fn)
-        if not mm:
-            continue
-        if mm.group("prefix") != prefix or mm.group("ext") != ext:
-            continue
-        cands.append((os.path.join(d, fn), mm.group("xxxx"), mm.group("yyyy")))
-
-    cands.sort(key=lambda t: (t[1], t[2]))
-    files = [p for (p, _, _) in cands]
-    unique_xxxx = sorted({x for (_, x, _) in cands})
-    unique_yyyy = sorted({y for (_, _, y) in cands})
-
-    if not files:
-        # Edge-case: nothing matched even though seed matched.
-        files = [seed_file]
-
-    return files, pattern_hint, unique_xxxx, unique_yyyy
 
 
-# ============================================================================
-# I/O helpers
-# ============================================================================
+    # Determine the pattern from the seed file
+
+    seed_xxxx, seed_yyyy, is_pol = _parse_xxxx_yyyy_from_path(base)
+
+    
+
+    if seed_xxxx is None: # Not a parsable file
+
+        return [seed_file], base, [], [], False
+
+
+
+    cands = []
+
+    
+
+    # Find a common prefix/pattern based on the seed file type
+
+    if is_pol:
+
+        m_seed = POLARIZATION_IDX_RE.match(base)
+
+        if not m_seed: return [seed_file], base, [], [], False
+
+        
+
+        seed_prefix = m_seed.group("prefix")
+
+        seed_middle = m_seed.group("middle")
+
+        seed_ext = m_seed.group("ext")
+
+        pattern_hint = f"{seed_prefix}_{{pol_type}}{seed_middle}_{{yyyy}}{seed_ext}"
+
+        
+
+        for fn in os.listdir(d):
+
+            m = POLARIZATION_IDX_RE.match(fn)
+
+            if m and m.group("prefix") == seed_prefix and m.group("middle") == seed_middle and m.group("ext") == seed_ext:
+
+                cands.append((os.path.join(d, fn), m.group("pol_type"), m.group("yyyy")))
+
+        
+
+        cands.sort(key=lambda t: (t[2], t[1]))
+
+        files = [p for p, _, _ in cands]
+
+        unique_xxxx = sorted(list({c[1] for c in cands}))
+
+        unique_yyyy = sorted(list({c[2] for c in cands}))
+
+        return files, pattern_hint, unique_xxxx, unique_yyyy, True
+
+
+
+    else: # Normal numeric merge
+
+        m_seed = NORMAL_IDX_TWO_RE.match(base) or NORMAL_IDX_ONE_RE.match(base)
+
+        if not m_seed: return [seed_file], base, [], [], False
+
+
+
+        seed_prefix = m_seed.group("prefix")
+
+        seed_ext = m_seed.group("ext")
+
+        
+
+        # Check both one and two-index files
+
+        for fn in os.listdir(d):
+
+            m2 = NORMAL_IDX_TWO_RE.match(fn)
+
+            if m2 and m2.group("prefix") == seed_prefix and m2.group("ext") == seed_ext:
+
+                cands.append((os.path.join(d, fn), m2.group("xxxx"), m2.group("yyyy")))
+
+                continue
+
+
+
+            m1 = NORMAL_IDX_ONE_RE.match(fn)
+
+            if m1 and m1.group("prefix") == seed_prefix and m1.group("ext") == seed_ext:
+
+                 cands.append((os.path.join(d, fn), m1.group("xxxx"), None))
+
+        
+
+        if m_seed.groupdict().get("yyyy"):
+
+             pattern_hint = f"{seed_prefix}_xxxx_yyyy{seed_ext}"
+
+        else:
+
+             pattern_hint = f"{seed_prefix}_xxxx{seed_ext}"
+
+
+
+        cands.sort(key=lambda t: (t[1], t[2] or ""))
+
+        files = [p for p, _, _ in cands]
+
+        unique_xxxx = sorted(list({c[1] for c in cands}))
+
+        unique_yyyy = sorted(list({c[2] for c in cands if c[2] is not None}))
+
+        return files, pattern_hint, unique_xxxx, unique_yyyy, False
+
+        
+
+    return [seed_file], base, [], [], False
+
 
 
 def load_1d_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
+
     """Load a 1D spectrum file as (x, y).
 
+
+
     Current prototype assumes a CSV-like file with at least 2 columns.
+
     Delimiter is inferred by numpy.genfromtxt for common cases.
 
     NOTE: This is intentionally conservative and will be improved later to
+
     follow the project's Run loader conventions (data_structure.py).
+
     """
 
     arr = np.genfromtxt(path, delimiter=None, dtype=float)
+
     if arr.ndim == 1:
+
         raise ValueError(f"File {path} does not look like a 2-column table.")
+
     if arr.shape[1] < 2:
+
         raise ValueError(f"File {path} has <2 columns.")
 
+
+
     x = np.asarray(arr[:, 0], float)
+
     y = np.asarray(arr[:, 1], float)
+
     m = np.isfinite(x) & np.isfinite(y)
+
     x = x[m]
+
     y = y[m]
+
     if x.size < 2:
+
         raise ValueError(f"File {path} has too few finite points.")
+
     return x, y
 
 
 
+
+
+
+
 # Helper: parse angle from filename using step_deg and xxxx, else fallback to default
-def _angle_deg_from_filename(path: str, xxxx: Optional[str], default: float) -> float:
+
+def _angle_deg_from_filename(path: str, xxxx: Optional[str], default: float) -> Union[float, str]:
+
     base = os.path.basename(path)
-    mm = IDX_RE.match(base)
+
+    if xxxx in POLARIZATION_TYPES:
+
+        return xxxx
+
     if xxxx is not None:
+
         try:
+
             xxxx_int = int(xxxx)
+
         except Exception:
+
             xxxx_int = None
+
     else:
+
         xxxx_int = None
+
     mstep = re.search(r"(-?\d+(?:\.\d+)?)deg", base)
+
     if mstep and xxxx_int is not None:
+
         try:
+
             step_deg = abs(float(mstep.group(1)))
+
             return float(step_deg * (xxxx_int - 1))
+
         except Exception:
+
             return float(default)
+
     return float(default)
 
 
+
+
+
 def build_raw_matrix_wavelength_axis(
+
     files: Sequence[str],
+
     *,
+
     assume_xgrid_consistent: bool = True,
+
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
     """Build (wavelength_nm, raw_angle_values, raw_intensity_matrix) for all raw files.
+
     - angle derived from filename step_deg and xxxx (see _angle_deg_from_filename).
+
     - Returns (wavelength_nm, raw_angle_values, raw_intensity_matrix) where:
+
         wavelength_nm: (nx,)
+
         raw_angle_values: (n_raw,)
+
         raw_intensity_matrix: (n_raw, nx)
+
     """
+
     xs: Optional[np.ndarray] = None
+
     rows: List[np.ndarray] = []
+
     angles: List[float] = []
+
     for idx, p in enumerate(files):
+
         x, y = load_1d_xy(p)
+
         if xs is None:
+
             xs = x
+
         if assume_xgrid_consistent:
+
             n = min(xs.size, x.size, y.size)
+
             if n < xs.size:
+
                 xs = xs[:n]
+
                 # Trim all existing rows to the new minimum size
+
                 rows = [r[:n] for r in rows]
+
             rows.append(np.asarray(y[:n], float))
+
         else:
+
             n = min(xs.size, x.size, y.size)
+
             if n < xs.size:
+
                 xs = xs[:n]
+
                 rows = [r[:n] for r in rows]
+
             rows.append(np.asarray(y[:n], float))
-        xxxx, yyyy = _parse_xxxx_yyyy_from_path(p)
+
+        xxxx, yyyy, _ = _parse_xxxx_yyyy_from_path(p)
+
         ang = _angle_deg_from_filename(p, xxxx, default=idx)
+
         angles.append(ang)
+
     if xs is None or not rows:
+
         raise ValueError("No valid files were loaded.")
+
     wavelength_nm = np.asarray(xs, float)
+
     angle_values = np.asarray(angles, float)
+
     intensity_matrix = np.vstack(rows)
+
     return wavelength_nm, angle_values, intensity_matrix
 
 
+
+
+
 # Helper: build primitive matrix averaged over yyyy for each xxxx
+
 def build_primitive_matrix_by_xxxx(
+
     files: Sequence[str],
+
     wavelength_nm: np.ndarray,
+
     raw_angle_values: np.ndarray,
+
     raw_intensity_matrix: np.ndarray,
+
     dark_value: float = 0.0,
+
 ) -> Tuple[List[str], np.ndarray, np.ndarray, Dict[str, List[int]]]:
+
     """
+
     - Parse xxxx, yyyy for each row.
+
     - Build raw_rows_by_xxxx mapping.
+
     - Sort primitive_xxxx numerically where possible.
+
     - For each xxxx group, compute mean over rows to create primitive row.
+
     - angle for primitive row: mean of raw_angle_values for that group.
+
     - Returns (primitive_xxxx, primitive_angle_values, primitive_matrix, raw_rows_by_xxxx)
+
     """
+
     n_raw = len(files)
+
     raw_xxxx: List[Optional[str]] = []
+
     raw_yyyy: List[Optional[str]] = []
+
     for p in files:
-        x, y = _parse_xxxx_yyyy_from_path(p)
+
+        x, y, _ = _parse_xxxx_yyyy_from_path(p)
+
         raw_xxxx.append(x)
+
         raw_yyyy.append(y)
+
     # Group rows by xxxx
+
     raw_rows_by_xxxx: Dict[str, List[int]] = {}
+
     for r, x in enumerate(raw_xxxx):
+
         key = x if x is not None else f"row{r:04d}"
+
         raw_rows_by_xxxx.setdefault(key, []).append(r)
+
     # Sort primitive_xxxx numerically if possible
+
     def sort_key(xx):
+
         try:
+
             return int(xx)
+
         except Exception:
+
             return xx
+
     primitive_xxxx = sorted(raw_rows_by_xxxx.keys(), key=sort_key)
+
     primitive_angle_values: List[float] = []
+
     primitive_matrix_rows: List[np.ndarray] = []
+
     for xx in primitive_xxxx:
+
         rows = raw_rows_by_xxxx[xx]
+
         block = raw_intensity_matrix[rows, :]
+
         mean_row = np.mean(block, axis=0)
+
         primitive_matrix_rows.append(mean_row)
+
         mean_angle = float(np.mean(raw_angle_values[rows]))
+
         primitive_angle_values.append(mean_angle)
+
     primitive_matrix = np.vstack(primitive_matrix_rows)
+
     
+
     if dark_value != 0.0:
+
         primitive_matrix -= dark_value
+
         primitive_matrix[primitive_matrix < 0] = 0
+
         
+
     primitive_angle_values_arr = np.asarray(primitive_angle_values, float)
+
     return primitive_xxxx, primitive_angle_values_arr, primitive_matrix, raw_rows_by_xxxx
 
 
+
+
+
 # ============================================================================
+
 # Physics conversions
+
 # ============================================================================
+
+
+
 
 
 def raman_shift_cm1_from_wavelength_nm(
+
     wavelength_nm: np.ndarray,
+
     laser_nm: float,
+
 ) -> np.ndarray:
+
     """Compute Raman shift (cm^-1) from wavelength axis and laser wavelength.
+
+
 
     Convention: shift = (1/laser - 1/lambda) * 1e7 with nm -> cm^-1.
 
+
+
     Assumes wavelength_nm and laser_nm are in nanometers.
+
     """
 
+
+
     wl = np.asarray(wavelength_nm, float)
+
     laser_nm = float(laser_nm)
+
     if laser_nm <= 0:
+
         raise ValueError("laser_nm must be > 0")
+
     if np.any(wl <= 0):
+
         raise ValueError("wavelength_nm must be > 0")
 
+
+
     # 1/nm -> 1/cm factor is 1e7
+
     shift = (1.0 / laser_nm - 1.0 / wl) * 1.0e7
+
     return shift
 
 
+
+
+
 def ev_from_cm1(shift_cm1: np.ndarray) -> np.ndarray:
+
     """Convert Raman shift in cm^-1 to energy in eV."""
 
+
+
     # 1 eV ≈ 8065.544005 cm^-1
+
     return np.asarray(shift_cm1, float) / 8065.544005
 
+
+
 def cm1_from_ev(ev: np.ndarray) -> np.ndarray:
+
     """Convert Raman shift in cm^-1 to energy in eV."""
 
+
+
     # 1 eV ≈ 8065.544005 cm^-1
+
     return np.asarray(ev, float) * 8065.544005
 
 
+
+
+
 # ============================================================================
+
 # Cosmic-ray correction (placeholder)
+
 # ============================================================================
+
+
+
 
 
 def cosmic_detect_evidence(intensity_matrix: np.ndarray) -> Dict[str, object]:
+
     """Return numeric evidence for cosmic-ray detection.
 
+
+
     Placeholder implementation:
+
     - reports max value and max-to-median ratio
+
     - reports whether max exceeds a heuristic threshold (500)
 
+
+
     This will be replaced by the project's real cosmic detection logic.
+
     """
 
+
+
     I = np.asarray(intensity_matrix, float)
+
     mx = float(np.nanmax(I))
+
     med = float(np.nanmedian(I))
+
     ratio = float(mx / med) if med != 0 else float("inf")
+
     threshold = 500.0
+
     exceeds = bool(mx > threshold)
+
     return {
+
         "max": mx,
+
         "median": med,
+
         "max_over_median": ratio,
+
         "threshold": threshold,
+
         "exceeds_threshold": exceeds,
+
         "note": "placeholder evidence; replace with robust cosmic logic",
+
     }
 
 
+
+
+
 # ============================================================================
+
 # Cosmic-ray GUI-Oriented Helpers
+
 # ============================================================================
 
 
-def _parse_xxxx_yyyy_from_path(path: str) -> Tuple[Optional[str], Optional[str]]:
+
+
+
+_PARSE_CACHE: Dict[str, Tuple[Optional[str], Optional[str], bool]] = {}
+
+
+
+def _parse_xxxx_yyyy_from_path(path: str) -> Tuple[Optional[str], Optional[str], bool]:
+
     base = os.path.basename(path)
-    m = IDX_RE.match(base)
-    if not m:
-        return None, None
-    return m.group("xxxx"), m.group("yyyy")
+
+    if base in _PARSE_CACHE:
+
+        return _PARSE_CACHE[base]
+
+
+
+    m_pol = POLARIZATION_IDX_RE.match(base)
+
+    if m_pol:
+
+        xxxx = m_pol.group("pol_type")
+
+        yyyy = m_pol.group("yyyy")
+
+        _PARSE_CACHE[base] = (xxxx, yyyy, True)
+
+        return xxxx, yyyy, True
+
+    
+
+    m_normal = NORMAL_IDX_TWO_RE.match(base)
+
+    if m_normal:
+
+        xxxx = m_normal.group("xxxx")
+
+        yyyy = m_normal.group("yyyy")
+
+        _PARSE_CACHE[base] = (xxxx, yyyy, False)
+
+        return xxxx, yyyy, False
+
+
+
+    m_normal = NORMAL_IDX_ONE_RE.match(base)
+
+    if m_normal:
+
+        xxxx = m_normal.group("xxxx")
+
+        yyyy = None
+
+        _PARSE_CACHE[base] = (xxxx, yyyy, False)
+
+        return xxxx, yyyy, False
+
+    
+
+    _PARSE_CACHE[base] = (None, None, False)
+
+    return None, None, False
 
 
 def _estimate_fwhm_nm(x_nm: np.ndarray, y: np.ndarray, i0: int) -> float:
@@ -623,7 +991,7 @@ def detect_cosmic_peaks_comparative(
         if cand_cols.size == 0:
             continue
 
-        row_xxxx, row_yyyy = _parse_xxxx_yyyy_from_path(files[r])
+        row_xxxx, row_yyyy, _ = _parse_xxxx_yyyy_from_path(files[r])
 
         for c in cand_cols:
             peak_intensity = y[c]
@@ -763,11 +1131,11 @@ def _apply_cosmic_removal_logic(
     ny, nx = I.shape
 
     # 4) Build row_meta and rows_by_xxxx from selected files
-    row_meta: List[Tuple[Optional[str], Optional[str]]] = [
+    row_meta: List[Tuple[Optional[str], Optional[str], bool]] = [
         _parse_xxxx_yyyy_from_path(p) for p in files
     ]
     rows_by_xxxx: Dict[str, List[int]] = {}
-    for r, (xxxx, yyyy) in enumerate(row_meta):
+    for r, (xxxx, yyyy, _) in enumerate(row_meta):
         if xxxx is None:
             continue
         rows_by_xxxx.setdefault(xxxx, []).append(r)
@@ -810,7 +1178,7 @@ def _apply_cosmic_removal_logic(
             for rr in rows_by_xxxx[xxxx]:
                 if rr == r:
                     continue
-                _, y2 = row_meta[rr]
+                _, y2, _ = row_meta[rr]
                 if yyyy is None or y2 != yyyy:
                     donors.append(rr)
 
@@ -1053,32 +1421,66 @@ class MapFittingEngine:
                 peak["ang_params"] [name] [0] = popt[idx]; idx += 1
 
     def run_optimization(self):
-        if self.datasets[0]["z"] is None or self.datasets[1]["z"] is None:
+        active = [
+            (idx, ds)
+            for idx, ds in enumerate(self.datasets)
+            if ds["z"] is not None and ds["x"] is not None and ds["ang"] is not None
+        ]
+        if not active:
             return False, "Data missing"
-        
-        d1 = self.datasets[0]
-        XX1, YY1 = np.meshgrid(d1["x"], d1["ang"])
-        mask1 = np.tile(self.get_mask(0), (len(d1["ang"]), 1)).ravel()
-        x1_fit = XX1.ravel()[mask1]
-        th1_fit = YY1.ravel()[mask1]
-        z1_fit = d1["z"].ravel()[mask1]
-        
-        d2 = self.datasets[1]
-        XX2, YY2 = np.meshgrid(d2["x"], d2["ang"])
-        mask2 = np.tile(self.get_mask(1), (len(d2["ang"]), 1)).ravel()
-        x2_fit = XX2.ravel()[mask2]
-        th2_fit = YY2.ravel()[mask2]
-        z2_fit = d2["z"].ravel()[mask2]
-        
-        if len(z1_fit) == 0 or len(z2_fit) == 0:
-            return False, "No data points in range for one or both datasets."
 
-        z_combined = np.concatenate([z1_fit, z2_fit])
         p0, lower, upper = self.flatten_params(0), self.flatten_params(1), self.flatten_params(2)
-        
+
         try:
-            popt, _ = curve_fit(self._joint_model_func, (x1_fit, th1_fit, x2_fit, th2_fit), z_combined, 
-                                p0=p0, bounds=(lower, upper), maxfev=5000)
+            if len(active) == 1:
+                ds_idx, ds = active[0]
+                XX, YY = np.meshgrid(ds["x"], ds["ang"])
+                mask = np.tile(self.get_mask(ds_idx), (len(ds["ang"]), 1)).ravel()
+                x_fit = XX.ravel()[mask]
+                th_fit = YY.ravel()[mask]
+                z_fit = ds["z"].ravel()[mask]
+                if len(z_fit) == 0:
+                    return False, "No data points in range."
+
+                def single_model(xy_tuple, *params):
+                    x_vals, th_vals = xy_tuple
+                    return self._calc_single_config(x_vals, th_vals, ds["config"], params)
+
+                popt, _ = curve_fit(
+                    single_model,
+                    (x_fit, th_fit),
+                    z_fit,
+                    p0=p0,
+                    bounds=(lower, upper),
+                    maxfev=5000,
+                )
+            else:
+                d1 = self.datasets[0]
+                XX1, YY1 = np.meshgrid(d1["x"], d1["ang"])
+                mask1 = np.tile(self.get_mask(0), (len(d1["ang"]), 1)).ravel()
+                x1_fit = XX1.ravel()[mask1]
+                th1_fit = YY1.ravel()[mask1]
+                z1_fit = d1["z"].ravel()[mask1]
+
+                d2 = self.datasets[1]
+                XX2, YY2 = np.meshgrid(d2["x"], d2["ang"])
+                mask2 = np.tile(self.get_mask(1), (len(d2["ang"]), 1)).ravel()
+                x2_fit = XX2.ravel()[mask2]
+                th2_fit = YY2.ravel()[mask2]
+                z2_fit = d2["z"].ravel()[mask2]
+
+                if len(z1_fit) == 0 or len(z2_fit) == 0:
+                    return False, "No data points in range for one or both datasets."
+
+                z_combined = np.concatenate([z1_fit, z2_fit])
+                popt, _ = curve_fit(
+                    self._joint_model_func,
+                    (x1_fit, th1_fit, x2_fit, th2_fit),
+                    z_combined,
+                    p0=p0,
+                    bounds=(lower, upper),
+                    maxfev=5000,
+                )
             self.update_params_from_fit(popt)
             return True, "Success"
         except Exception as e:
@@ -1086,11 +1488,14 @@ class MapFittingEngine:
 
     def validate_row_by_row(self):
         """Perform row-by-row fitting and return results."""
-        if self.datasets[0]["z"] is None: return False, "No Data", None
+        if not any(ds["z"] is not None for ds in self.datasets):
+            return False, "No Data", None
         
         validation_results = []
         
         for ds_idx, ds in enumerate(self.datasets):
+            if ds["z"] is None or ds["x"] is None or ds["ang"] is None:
+                continue
             rows_params = []
             rec_matrix = []
             
@@ -1173,12 +1578,13 @@ class MapFittingEngine:
 
     def get_peak_reconstructions(self):
         """Generate matrices for individual peaks and background."""
-        if self.datasets[0]["z"] is None: return []
-
         results = []
         flat_params = self.flatten_params(which_val=0) 
 
         for ds_idx, ds in enumerate(self.datasets):
+            if ds["z"] is None or ds["x"] is None or ds["ang"] is None:
+                continue
+                
             XX, YY = np.meshgrid(ds["x"], ds["ang"])
             x_flat = XX.ravel()
             theta_flat = YY.ravel()
@@ -1218,6 +1624,49 @@ class MapFittingEngine:
         
         return results
 
+    def to_dict(self):
+        """Return engine state as a dictionary."""
+        return {
+            "peaks": self.peaks,
+            "bg_params": self.bg_params,
+            "x_min_limit": float(self.x_min_limit) if np.isfinite(self.x_min_limit) else -1e9,
+            "x_max_limit": float(self.x_max_limit) if np.isfinite(self.x_max_limit) else 1e9
+        }
+
+    def from_dict(self, data):
+        """Load engine state from a dictionary."""
+        self.peaks = data.get("peaks", [])
+        self.bg_params = data.get("bg_params", self.bg_params)
+        self.x_min_limit = data.get("x_min_limit", -np.inf)
+        self.x_max_limit = data.get("x_max_limit", np.inf)
+
+    def get_peak_polar_areas(self, dataset_index):
+        """Return a 2D map of peak areas (angle vs peak)."""
+        ds = self.datasets[dataset_index]
+        if ds["ang"] is None or ds["z"] is None:
+            return None
+        
+        n_peaks = len(self.peaks)
+        if n_peaks == 0: return np.zeros((len(ds["ang"]), 0))
+        
+        n_angles = len(ds["ang"])
+        areas = np.zeros((n_angles, n_peaks))
+        
+        flat_params = self.flatten_params(which_val=0)
+        idx = 2
+        for p_idx, peak in enumerate(self.peaks):
+            gamma = flat_params[idx+1]
+            idx += 2
+            rule_def = RULE_METADATA[peak["rule"]]
+            n_ang = len(rule_def["params"])
+            ang_p = flat_params[idx : idx+n_ang]
+            idx += n_ang
+            
+            I_val = rule_def["func"](ds["ang"], ds["config"], *ang_p)
+            areas[:, p_idx] = I_val / (np.abs(gamma) + 1e-9)
+            
+        return areas
+
     def export_parameters_text(self):
         """Return a string summary of parameters."""
         lines = []
@@ -1237,6 +1686,44 @@ class MapFittingEngine:
             lines.append("")
         return "\n".join(lines)
 
+    def import_parameters_text(self, text):
+        """Parse a string summary of parameters and update engine state."""
+        self.peaks = []
+        
+        current_peak = None
+        
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            
+            if line.startswith("[Background]"):
+                current_peak = "BG"
+                continue
+            
+            m_peak = re.match(r"\[Peak \d+: (.*)\]", line)
+            if m_peak:
+                name = m_peak.group(1)
+                current_peak = {"name": name, "spec_params": {}, "ang_params": {}}
+                self.peaks.append(current_peak)
+                continue
+            
+            if current_peak == "BG":
+                m_val = re.match(r"(Offset|Slope): ([\d.-e]+) \[([\d.-e]+), ([\d.-e]+)\]", line)
+                if m_val:
+                    key = m_val.group(1).lower()
+                    self.bg_params[key] = [float(m_val.group(2)), float(m_val.group(3)), float(m_val.group(4))]
+            elif isinstance(current_peak, dict):
+                if line.startswith("Rule: "):
+                    current_peak["rule"] = line[len("Rule: "):]
+                else:
+                    m_val = re.match(r"(.*): ([\d.-e]+) \[([\d.-e]+), ([\d.-e]+)\]", line)
+                    if m_val:
+                        key = m_val.group(1)
+                        vals = [float(m_val.group(2)), float(m_val.group(3)), float(m_val.group(4))]
+                        if key == "Center (x0)": current_peak["spec_params"]["x0"] = vals
+                        elif key == "Width (Gamma)": current_peak["spec_params"]["gamma"] = vals
+                        else: current_peak["ang_params"][key] = vals
+
 
 # ============================================================================
 # Stage-1 and Stage-2 API
@@ -1244,7 +1731,7 @@ class MapFittingEngine:
 
 
 def discover_merge(options: MergeDiscoverOptions) -> MergeDiscoverResult:
-    files, pattern_hint, unique_xxxx, unique_yyyy = detect_similar_files(options.seed_file)
+    files, pattern_hint, unique_xxxx, unique_yyyy, is_polarization_merge = detect_similar_files(options.seed_file)
     wavelength_nm, raw_angle_values, raw_intensity_matrix = build_raw_matrix_wavelength_axis(
         files, assume_xgrid_consistent=options.assume_xgrid_consistent
     )
@@ -1252,7 +1739,7 @@ def discover_merge(options: MergeDiscoverOptions) -> MergeDiscoverResult:
     raw_xxxx = []
     raw_yyyy = []
     for p in files:
-        x, y = _parse_xxxx_yyyy_from_path(p)
+        x, y, _ = _parse_xxxx_yyyy_from_path(p)
         raw_xxxx.append(x)
         raw_yyyy.append(y)
     # Build primitive matrix (averaged over yyyy for each xxxx)
@@ -1328,6 +1815,7 @@ def discover_merge(options: MergeDiscoverOptions) -> MergeDiscoverResult:
         primitive_xxxx=primitive_xxxx,
         primitive_matrix=primitive_matrix,
         cosmic_matrix=None,
+        is_polarization_merge=is_polarization_merge,
     )
 
 
@@ -1645,7 +2133,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # --- Export to CSV ---
     base = os.path.basename(seed)
-    m = IDX_RE.match(base)
+    m = POLARIZATION_IDX_RE.match(base)
+    if not m:
+        m = NORMAL_IDX_RE.match(base)
     if m:
         prefix = m.group("prefix")
     else:

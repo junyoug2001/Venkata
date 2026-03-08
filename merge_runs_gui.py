@@ -19,11 +19,15 @@ from data_structure import (
     ExperimentSet,
     Run,
     ViewState,
-    EV_PER_CM1,
+    alternate_spectral_unit,
+    cm1_to_unit,
     new_experiment_id,
     new_view_id,
     infer_intensity_unit,
+    normalize_spectral_unit,
     parse_filename,
+    spectral_axis_label,
+    unit_to_cm1,
 )
 from plotting import RamanPlotter2d, SlicePlotter
 from config_manager import config
@@ -196,7 +200,9 @@ class MergeRunsDialog(wx.Dialog):
 
         self.rad_raman_unit_cm1 = wx.RadioButton(ctrl_panel, label="cm-1", style=wx.RB_GROUP)
         self.rad_raman_unit_mev = wx.RadioButton(ctrl_panel, label="meV")
-        self.rad_raman_unit_cm1.SetValue(True)
+        default_unit = normalize_spectral_unit(config.get("default_spectral_unit", config.get("unit", "meV")))
+        self.rad_raman_unit_mev.SetValue(default_unit == "meV")
+        self.rad_raman_unit_cm1.SetValue(default_unit == "cm-1")
         self.rad_raman_unit_cm1.Enable(False)
         self.rad_raman_unit_mev.Enable(False)
 
@@ -605,7 +611,8 @@ class MergeRunsDialog(wx.Dialog):
 
         self._laser_vline = None
 
-        self._x = np.asarray(self._prev.raman_shift_cm1, dtype=float)
+        self._display_unit = normalize_spectral_unit("meV" if self.rad_raman_unit_mev.GetValue() else "cm-1")
+        self._x = cm1_to_unit(np.asarray(self._prev.raman_shift_cm1, dtype=float), self._display_unit)
         self._y = np.asarray(self._prev.angle_values, dtype=float)
         self._I = np.asarray(self._prev.intensity_matrix, dtype=float)
 
@@ -616,16 +623,18 @@ class MergeRunsDialog(wx.Dialog):
         # Setup secondary axis helpers if energy_ev is available
         x_unit_conv = None
         if self._prev.energy_ev is not None and np.all(np.isfinite(self._prev.energy_ev)):
-            def cm1_to_ev(x_cm1): return np.asarray(x_cm1, dtype=float) * EV_PER_CM1
-            def ev_to_cm1(x_ev): return np.asarray(x_ev, dtype=float) / EV_PER_CM1
-            x_unit_conv = (cm1_to_ev, ev_to_cm1)
+            if self._display_unit == "meV":
+                x_unit_conv = (lambda x: unit_to_cm1(x, "meV"), lambda x: cm1_to_unit(x, "meV"))
+            else:
+                x_unit_conv = (lambda x: cm1_to_unit(x, "meV"), lambda x: unit_to_cm1(x, "meV"))
 
         self.plotterA.render(
             self._x, self._y, self._I,
             title=self._prev.title,
-            xlabel="Raman shift (cm$^{-1}$)",
+            xlabel=spectral_axis_label(self._display_unit),
             ylabel="Angle (deg)",
-            x_unit_conversion=x_unit_conv
+            x_unit_conversion=x_unit_conv,
+            secondary_x_label=spectral_axis_label(alternate_spectral_unit(self._display_unit)),
         )
 
         if self._original_preview_xlim is None:
@@ -634,7 +643,7 @@ class MergeRunsDialog(wx.Dialog):
 
         self._apply_contrast_from_sliders()
 
-        # Laser overlay (0 cm-1)
+        # Laser overlay (0 in either Raman-shift unit)
         self._laser_vline = self.plotterA.ax.axvline(
             0.0, color="green", alpha=0.6, linewidth=1.2
         )
@@ -686,7 +695,7 @@ class MergeRunsDialog(wx.Dialog):
         slice_xlabel = "Wavelength (nm)"
         if self._in_preview_mode:
             slice_title = "Spectral slice (selected angle row)"
-            slice_xlabel = "Raman shift (cm$^{-1}$)"
+            slice_xlabel = spectral_axis_label(getattr(self, "_display_unit", "meV"))
         else:
             slice_title = f"Spectral slice ({x_sel:.3f} nm, {y_sel:.1f} deg)"
 
@@ -696,6 +705,12 @@ class MergeRunsDialog(wx.Dialog):
             xlabel=slice_xlabel,
             ylabel="Intensity"
         )
+        if self.plotterA and self.plotterA.ax and self.plotterC and self.plotterC.ax:
+            self._syncing_limits = True
+            try:
+                self.plotterC.ax.set_xlim(self.plotterA.ax.get_xlim())
+            finally:
+                self._syncing_limits = False
         self.plotterC.set_highlight(x_sel)
 
     # -----------------------------
@@ -738,7 +753,7 @@ class MergeRunsDialog(wx.Dialog):
     def _update_manual_laser_line(self) -> None:
         if self._in_preview_mode:
             return
-        if self._mesh is None and self.plotterA.mesh is None:
+        if self.plotterA is None or self.plotterA.mesh is None:
             return
             
         s = self.txt_manual_nm.GetValue().strip()

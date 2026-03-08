@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import analysis
+import polar_area_fitting
 from merge_runs_gui import MergeRunsDialog
 from two_d_map_fitting_gui import MapFittingDialog
 from normalization_gui import NormalizeDialog
@@ -58,7 +59,7 @@ from data_structure import (
     ExperimentSet,
     Run,
     ViewState,
-    EV_PER_CM1,
+    normalize_spectral_unit,
     new_experiment_id,
     new_view_id,
     new_run_id,
@@ -67,9 +68,89 @@ from data_structure import (
 from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
 
 from wx_left_panel import FilesPanel, RunsPanel, ExperimentPanel, LogPanel
-from wx_left_lower_panel import PreviewPanel, CurveFitPanel, PlotConfigPanel, AppearancesPanel
+from wx_left_lower_panel import PreviewPanel, CurveFitPanel, PlotConfigPanel, AppearancesPanel, PreferencesPanel
 from wx_right_panel import RamanToolbar, ViewPanel
 from config_manager import config
+
+
+class PolarAreaFittingDialog(wx.Dialog):
+    def __init__(
+        self,
+        parent,
+        runs: List[Run],
+        default_targets: List[float],
+        default_colors: List[str],
+        default_output: str,
+    ):
+        super().__init__(parent, title="Generate Polar Area Fittings", size=(520, 520))
+        self.default_colors = default_colors
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        run_label = ", ".join(run.nickname for run in runs)
+        sizer.Add(wx.StaticText(self, label=f"Runs: {run_label}"), 0, wx.ALL | wx.EXPAND, 10)
+
+        grid = wx.FlexGridSizer(0, 2, 6, 8)
+        grid.AddGrowableCol(1, 1)
+
+        target_text = ", ".join(f"{v:.6g}" for v in default_targets)
+        self.txt_targets = wx.TextCtrl(self, value=target_text)
+        grid.Add(wx.StaticText(self, label="Target peaks (cm-1):"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.txt_targets, 1, wx.EXPAND)
+
+        self.file_output = wx.FilePickerCtrl(
+            self,
+            path=default_output,
+            message="Save polar fit PDF",
+            wildcard="PDF files (*.pdf)|*.pdf",
+            style=wx.FLP_SAVE | wx.FLP_OVERWRITE_PROMPT | wx.FLP_USE_TEXTCTRL,
+        )
+        grid.Add(wx.StaticText(self, label="Output PDF:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.file_output, 1, wx.EXPAND)
+
+        self.txt_peak_window = wx.TextCtrl(self, value="8")
+        grid.Add(wx.StaticText(self, label="Peak window:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.txt_peak_window, 0, wx.EXPAND)
+
+        self.txt_center_window = wx.TextCtrl(self, value="2")
+        grid.Add(wx.StaticText(self, label="Center tolerance:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.txt_center_window, 0, wx.EXPAND)
+
+        self.chk_normalize = wx.CheckBox(self, label="Normalize each polar plot")
+        self.chk_normalize.SetValue(True)
+        grid.AddSpacer(1)
+        grid.Add(self.chk_normalize, 0, wx.EXPAND)
+
+        sizer.Add(grid, 0, wx.ALL | wx.EXPAND, 10)
+
+        sizer.Add(wx.StaticText(self, label="Plot colors:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        self.color_pickers = []
+        color_grid = wx.FlexGridSizer(0, 4, 5, 8)
+        for idx in range(6):
+            color_grid.Add(wx.StaticText(self, label=f"{idx + 1}"), 0, wx.ALIGN_CENTER_VERTICAL)
+            picker = wx.ColourPickerCtrl(self)
+            color = default_colors[idx] if idx < len(default_colors) else "#000000"
+            picker.SetColour(wx.Colour(color))
+            self.color_pickers.append(picker)
+            color_grid.Add(picker, 0, wx.EXPAND)
+        sizer.Add(color_grid, 0, wx.ALL | wx.EXPAND, 10)
+
+        sizer.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.ALIGN_RIGHT, 10)
+        self.SetSizer(sizer)
+
+    def get_values(self) -> Dict[str, Any]:
+        target_raw = self.txt_targets.GetValue().replace(",", " ").split()
+        targets = [float(v) for v in target_raw]
+        colors = []
+        for picker in self.color_pickers[:len(targets)]:
+            colors.append(picker.GetColour().GetAsString(wx.C2S_HTML_SYNTAX))
+        return {
+            "targets": targets,
+            "output": self.file_output.GetPath(),
+            "peak_window": float(self.txt_peak_window.GetValue()),
+            "center_window": float(self.txt_center_window.GetValue()),
+            "normalize": self.chk_normalize.GetValue(),
+            "colors": colors,
+        }
 
 
 # -----------------------------
@@ -118,6 +199,7 @@ class MainFrame(wx.Frame):
 
     def on_close(self, event):
         """Save settings and close the app."""
+        self._persist_view_panel_states()
         size = self.GetSize()
         config.set("window_size", [size.width, size.height])
         config.save()
@@ -132,6 +214,7 @@ class MainFrame(wx.Frame):
         file_menu = wx.Menu()
         item_open = file_menu.Append(wx.ID_OPEN, "Open Experiment...\tCtrl-O")
         item_save = file_menu.Append(wx.ID_SAVE, "Save Experiment...\tCtrl-S")
+        item_export_igor = file_menu.Append(wx.ID_ANY, "Export to Igor Pro...")
         file_menu.AppendSeparator()
         item_import = file_menu.Append(wx.ID_ANY, "Import Run...\tCtrl-I")
         item_new_formula = file_menu.Append(wx.ID_ANY, "New Formula Run...")
@@ -142,6 +225,7 @@ class MainFrame(wx.Frame):
         
         self.Bind(wx.EVT_MENU, self.on_open_experiment, item_open)
         self.Bind(wx.EVT_MENU, self.on_save_experiment, item_save)
+        self.Bind(wx.EVT_MENU, self.on_export_igor, item_export_igor)
         self.Bind(wx.EVT_MENU, self.on_import_run_dialog, item_import)
         self.Bind(wx.EVT_MENU, self.on_new_formula_run, item_new_formula)
         self.Bind(wx.EVT_MENU, self.on_merge_run_dialog, item_merge)
@@ -160,9 +244,11 @@ class MainFrame(wx.Frame):
 
         # Tools menu
         tools_menu = wx.Menu()
-        item_2d_fit = tools_menu.Append(wx.ID_ANY, "2D Map Fitting...")
+        item_2d_fit = tools_menu.Append(wx.ID_ANY, "Make 2D Fit...")
+        item_polar_fit = tools_menu.Append(wx.ID_ANY, "Generate Polar Area Fittings...")
         item_normalize = tools_menu.Append(wx.ID_ANY, "Normalize...")
         self.Bind(wx.EVT_MENU, self.on_2d_map_fitting, item_2d_fit)
+        self.Bind(wx.EVT_MENU, self.on_generate_polar_area_fittings, item_polar_fit)
         self.Bind(wx.EVT_MENU, self.on_normalize, item_normalize)
         menubar.Append(tools_menu, "&Tools")
 
@@ -215,7 +301,12 @@ class MainFrame(wx.Frame):
             abs_p = os.path.abspath(p)
             d = os.path.dirname(abs_p)
             base = os.path.basename(abs_p)
-            m = analysis.IDX_RE.match(base)
+            m = analysis.POLARIZATION_IDX_RE.match(base)
+            if not m:
+                m = analysis.NORMAL_IDX_TWO_RE.match(base)
+            if not m:
+                m = analysis.NORMAL_IDX_ONE_RE.match(base)
+
             if m:
                 # Experiment pattern: group by (dir, prefix, ext)
                 key = (d, m.group("prefix"), m.group("ext"))
@@ -314,31 +405,177 @@ class MainFrame(wx.Frame):
 
     def on_2d_map_fitting(self, event):
         """
-        Open the 2D map fitting tool. Requires exactly two 2D runs to be selected.
+        Open the 2D map fitting tool. 
+        Supports selecting one or two 2D runs, OR one FIT_PARAMS run.
         """
         run_ids = self.runs_panel._get_selected_run_ids()
-        if len(run_ids) != 2:
-            wx.MessageBox("Please select exactly two 2D runs in the Experiment tab.", "Selection Error", wx.OK | wx.ICON_ERROR)
-            return
-            
-        run1 = self.experiment.get_run(run_ids[0])
-        run2 = self.experiment.get_run(run_ids[1])
         
-        if not (run1.is_2d and run2.is_2d):
-            wx.MessageBox("Both selected runs must be 2D runs.", "Selection Error", wx.OK | wx.ICON_ERROR)
+        run1, run2 = None, None
+        params_run = None
+        single_config = "parallel"
+        
+        if len(run_ids) == 1:
+            selected_run = self.experiment.get_run(run_ids[0])
+            if selected_run is None:
+                return
+            if selected_run.run_type == RunType.FIT_PARAMS:
+                params_run = selected_run
+                source_ids = selected_run.metadata.get("source_run_ids", [])
+                
+                if len(source_ids) == 2:
+                    run1 = self.experiment.get_run(source_ids[0])
+                    run2 = self.experiment.get_run(source_ids[1])
+                    
+                    if not (run1 and run2):
+                        wx.MessageBox("One or more source runs for this FIT_PARAMS run could not be found.", "Error", wx.OK | wx.ICON_ERROR)
+                        return
+                elif len(source_ids) == 1:
+                    run1 = self.experiment.get_run(source_ids[0])
+                    if run1 is None:
+                        wx.MessageBox("The source run for this FIT_PARAMS run could not be found.", "Error", wx.OK | wx.ICON_ERROR)
+                        return
+                    single_config = polar_area_fitting.infer_config(run1)
+                else:
+                    wx.MessageBox("Selected run is not a valid FIT_PARAMS run.", "Error", wx.OK | wx.ICON_ERROR)
+                    return
+            else:
+                if not selected_run.is_2d:
+                    wx.MessageBox("Selected run must be a 2D run or a Fit Parameters run.", "Selection Error", wx.OK | wx.ICON_ERROR)
+                    return
+                choices = ["Parallel (XX)", "Cross (YX)"]
+                guessed = polar_area_fitting.infer_config(selected_run)
+                with wx.SingleChoiceDialog(
+                    self,
+                    "How should this single selected run be interpreted?",
+                    "2D Fit Polarization",
+                    choices,
+                ) as dlg:
+                    dlg.SetSelection(0 if guessed == "parallel" else 1)
+                    if dlg.ShowModal() != wx.ID_OK:
+                        return
+                    single_config = "parallel" if dlg.GetSelection() == 0 else "cross"
+                run1 = selected_run
+        elif len(run_ids) == 2:
+            run1 = self.experiment.get_run(run_ids[0])
+            run2 = self.experiment.get_run(run_ids[1])
+            
+            if not (run1 and run2 and run1.is_2d and run2.is_2d):
+                wx.MessageBox("Both selected runs must be 2D runs.", "Selection Error", wx.OK | wx.ICON_ERROR)
+                return
+        else:
+            wx.MessageBox("Please select one or two 2D runs, or one Fit Parameters run.", "Selection Error", wx.OK | wx.ICON_ERROR)
             return
             
-        dlg = MapFittingDialog(self, run1, run2)
-        dlg.ShowModal()
+        dlg = MapFittingDialog(self, run1, run2, params_run=params_run, single_config=single_config)
+        modal_result = dlg.ShowModal()
+        if modal_result == wx.ID_OK:
+            dlg.persist_fit_metadata_to_sources()
+            if not any(r.run_type == RunType.FIT_PARAMS for r in dlg.result_runs):
+                dlg.result_runs.append(dlg.make_fit_params_run())
             
         # Add any result runs to experiment
         if dlg.result_runs:
             for r in dlg.result_runs:
                 self.experiment.add_run(r)
-            self.log_panel.append_log(f"Added {len(dlg.result_runs)} reconstruction runs to experiment.")
+            self.log_panel.append_log(f"Added {len(dlg.result_runs)} results to experiment.")
             self._refresh_left_panels()
             
         dlg.Destroy()
+
+    def _selected_runs_for_polar_area_fit(self) -> Tuple[List[Run], Optional[Dict[str, Any]]]:
+        run_ids = self.runs_panel._get_selected_run_ids()
+        if not run_ids:
+            raise ValueError("Please select one fitted 2D run, two fitted 2D runs, or one Fit Parameters run.")
+
+        selected = [self.experiment.get_run(rid) for rid in run_ids]
+        selected = [run for run in selected if run is not None]
+        if len(selected) == 1 and selected[0].run_type == RunType.FIT_PARAMS:
+            params_run = selected[0]
+            runs = polar_area_fitting.runs_from_fit_selection(self.experiment, params_run)
+            if not runs:
+                raise ValueError("The selected Fit Parameters run does not point to any available 2D source runs.")
+            return runs, params_run.metadata.get("fit_state")
+
+        if len(selected) > 2:
+            raise ValueError("Please select at most two 2D runs.")
+        if not all(run.is_2d for run in selected):
+            raise ValueError("Selected runs must be 2D runs, unless selecting one Fit Parameters run.")
+
+        fit_state, _params_run = polar_area_fitting.fit_state_for_runs(self.experiment, selected)
+        return selected, fit_state
+
+    def on_generate_polar_area_fittings(self, event):
+        """Generate vector PDF polar plots from row-by-row Lorentzian areas."""
+        try:
+            runs, fit_state = self._selected_runs_for_polar_area_fit()
+        except Exception as exc:
+            wx.MessageBox(str(exc), "Polar Area Fittings", wx.OK | wx.ICON_ERROR)
+            return
+
+        default_targets = []
+        if fit_state:
+            for peak in fit_state.get("peaks", []):
+                try:
+                    default_targets.append(float(peak.get("spec_params", {}).get("x0", [])[0]))
+                except Exception:
+                    pass
+        if not default_targets and runs and runs[0].shift_cm1 is not None:
+            default_targets = [float(np.nanmedian(runs[0].shift_cm1))]
+
+        cmap_name = polar_area_fitting.view_cmap_for_runs(self.experiment, runs) or config.get("default_colormap", config.get("colormap", "OrRd"))
+        default_colors = polar_area_fitting.colors_from_cmap(cmap_name, max(len(default_targets), 6))
+        last_dir = config.get("last_directory", "") or os.getcwd()
+        safe_name = "_".join(run.nickname for run in runs)
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in safe_name)
+        default_output = os.path.join(last_dir, f"{safe_name}_polar_area_fits.pdf")
+
+        with PolarAreaFittingDialog(self, runs, default_targets, default_colors, default_output) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            try:
+                opts = dlg.get_values()
+            except Exception as exc:
+                wx.MessageBox(f"Invalid options: {exc}", "Polar Area Fittings", wx.OK | wx.ICON_ERROR)
+                return
+
+        if not opts["output"]:
+            wx.MessageBox("Choose an output PDF path.", "Polar Area Fittings", wx.OK | wx.ICON_ERROR)
+            return
+
+        progress = wx.ProgressDialog(
+            "Polar Area Fittings",
+            "Running row-by-row fits and exporting PDF...",
+            parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_ELAPSED_TIME,
+        )
+        progress.Pulse()
+        try:
+            out_path, row_fits, tensor_fits = polar_area_fitting.generate_polar_area_pdf(
+                self.experiment,
+                runs,
+                opts["targets"],
+                opts["output"],
+                fit_state=fit_state,
+                colors=opts["colors"],
+                peak_window=opts["peak_window"],
+                center_window=opts["center_window"],
+                normalize=opts["normalize"],
+            )
+        except Exception as exc:
+            progress.Destroy()
+            wx.MessageBox(f"Failed to generate polar area fittings: {exc}", "Polar Area Fittings", wx.OK | wx.ICON_ERROR)
+            return
+        progress.Destroy()
+
+        for run in runs:
+            run.metadata["last_polar_area_fit_pdf"] = out_path
+            run.metadata["last_polar_area_fit_targets"] = opts["targets"]
+
+        self.log_panel.append_log(
+            f"Generated polar area fitting PDF for {len(runs)} run(s), "
+            f"{len(row_fits)} row-fit series, {len(tensor_fits)} tensor fit(s): {out_path}"
+        )
+        wx.MessageBox(f"Saved:\n{out_path}", "Polar Area Fittings", wx.OK | wx.ICON_INFORMATION)
 
     def on_normalize(self, event):
         """
@@ -424,11 +661,16 @@ class MainFrame(wx.Frame):
             on_edit_formula=self.on_edit_formula,
             on_edit_derived_props=self.on_edit_derived_props
         )
+        self.preferences_panel = PreferencesPanel(
+            top_notebook,
+            on_use_current_view=self.on_use_current_view_as_defaults,
+        )
         self.log_panel = LogPanel(top_notebook)
 
         top_notebook.AddPage(self.files_panel, "Files")
         top_notebook.AddPage(self.runs_panel, "Experiment")
         top_notebook.AddPage(self.experiment_panel, "Metadata")
+        top_notebook.AddPage(self.preferences_panel, "Preferences")
         top_notebook.AddPage(self.log_panel, "Log")
 
         # --- bottom notebook (Preview / Curve Fit) ---
@@ -487,6 +729,24 @@ class MainFrame(wx.Frame):
         if panel:
             self.plot_config_panel.set_target_view(panel)
 
+    def on_use_current_view_as_defaults(self):
+        panel = self.get_current_view_panel()
+        view_id = self._get_current_view_id()
+        view_state = self.experiment.get_view(view_id) if view_id else None
+        if not panel or not view_state:
+            return
+        panel.save_current_plot_config()
+        map_cfg = view_state.graph_configs.get("1A")
+        config.set("default_spectral_unit", normalize_spectral_unit(view_state.spectral_unit))
+        config.set("default_colormap", panel.get_colormap())
+        config.set("default_vmin_percent", float(map_cfg.vmin if map_cfg and map_cfg.vmin is not None else view_state.vmin))
+        config.set("default_vmax_percent", float(map_cfg.vmax if map_cfg and map_cfg.vmax is not None else view_state.vmax))
+        config.set("default_angle_slice_type", view_state.angle_slice_type)
+        config.set("default_slice_x_binning", view_state.slice_x_binning)
+        config.set("default_slice_y_binning", view_state.slice_y_binning)
+        config.set("default_slice_binning_mode", view_state.slice_binning_mode)
+        config.set("show_secondary_unit_axis", view_state.show_secondary_unit_axis)
+
     def _set_initial_split_ratio(self):
         """
         Set initial left:right split to approximately 1/3 : 2/3,
@@ -517,7 +777,11 @@ class MainFrame(wx.Frame):
             if not path:
                 continue
             try:
-                run = Run.from_file(path)
+                run = Run.from_file(
+                    path,
+                    default_unknown_1d_spectral_unit=config.get("default_unknown_1d_spectral_unit", "meV"),
+                    default_unknown_2d_spectral_unit=config.get("default_unknown_2d_spectral_unit", "meV"),
+                )
             except Exception as e:
                 self.log_panel.append_log(f"Failed to load {path}: {e}")
                 continue
@@ -574,7 +838,8 @@ class MainFrame(wx.Frame):
             params={"amp": 100.0, "freq": 1.0},
             n_points=200,
             x_range=(0, 500),
-            nickname="New Formula Run"
+            nickname="New Formula Run",
+            x_unit=normalize_spectral_unit(config.get("default_spectral_unit", "meV")),
         )
         self.experiment.add_run(new_run)
         self.log_panel.append_log(f"Created new formula run: {new_run.id}")
@@ -681,7 +946,30 @@ class MainFrame(wx.Frame):
         view_id = new_view_id()
         title = f"View {idx}"
 
-        view_state = ViewState(id=view_id, title=title, run_ids=run_ids or [])
+        default_unit = normalize_spectral_unit(config.get("default_spectral_unit", config.get("unit", "meV")))
+        default_cmap = config.get("default_colormap", config.get("colormap", "OrRd"))
+        default_vmin = float(config.get("default_vmin_percent", 0.0))
+        default_vmax = float(config.get("default_vmax_percent", 100.0))
+        view_state = ViewState(
+            id=view_id,
+            title=title,
+            run_ids=run_ids or [],
+            spectral_unit=default_unit,
+            x_axis="energy_eV" if default_unit == "meV" else "shift_cm1",
+            angle_slice_type=config.get("default_angle_slice_type", "polar"),
+            slice_x_binning=config.get("default_slice_x_binning", 1),
+            slice_y_binning=config.get("default_slice_y_binning", 1),
+            slice_binning_mode=str(config.get("default_slice_binning_mode", "cross")).lower(),
+            show_secondary_unit_axis=bool(config.get("show_secondary_unit_axis", True)),
+            vmin=default_vmin,
+            vmax=default_vmax,
+            cmap=default_cmap,
+        )
+        for key in ("1A", "2A"):
+            graph_cfg = view_state.get_graph_config(key)
+            graph_cfg.vmin = default_vmin
+            graph_cfg.vmax = default_vmax
+            graph_cfg.cmap = default_cmap
         self.experiment.add_view(view_state)
 
         panel = ViewPanel(
@@ -698,6 +986,9 @@ class MainFrame(wx.Frame):
 
         # Initialize plot for this view
         panel.set_view_model(self.experiment, view_state)
+        self.view_notebook.SetSelection(page_index)
+        self.plot_config_panel.set_target_view(panel)
+        self.appearances_panel.update_view(view_state, self.experiment)
 
         # Update the Experiment tab's views list and metadata tree
         self.runs_panel.refresh_from_experiment(self.experiment)
@@ -744,7 +1035,7 @@ class MainFrame(wx.Frame):
         if overlay_target_run:
             self._refresh_all_view_panels()
 
-    def on_curve_fit_request(self, source_run: Run, plot_type: str, x_data: np.ndarray, y_data: np.ndarray):
+    def on_curve_fit_request(self, source_run: Run, plot_type: str, x_data: np.ndarray, y_data: np.ndarray, x_label: Optional[str] = None):
         """
         Handle request to fit a curve to the given data.
         Switches to CurveFitPanel and loads data.
@@ -761,7 +1052,7 @@ class MainFrame(wx.Frame):
                 break
         
         # 3. Load Data
-        self.curvefit_panel.set_data(source_run, plot_type, x_data, y_data)
+        self.curvefit_panel.set_data(source_run, plot_type, x_data, y_data, x_label=x_label)
         self.log_panel.append_log(f"Started curve fit for {source_run.nickname} ({plot_type})")
 
     
@@ -1090,6 +1381,7 @@ class MainFrame(wx.Frame):
         """
         Save the current ExperimentSet to an HDF5 file.
         """
+        self._persist_view_panel_states()
         wildcard = "HDF5 files (*.h5;*.hdf5)|*.h5;*.hdf5|All files (*.*)|*.*"
         with wx.FileDialog(
             self, message="Save Experiment",
@@ -1103,6 +1395,24 @@ class MainFrame(wx.Frame):
                     self.log_panel.append_log(f"Experiment saved to {path}")
                 except Exception as e:
                     wx.MessageBox(f"Failed to save experiment: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_export_igor(self, event=None) -> None:
+        """
+        Export the current ExperimentSet to an Igor Pro file.
+        """
+        wildcard = "Igor Text image package (*.itx)|*.itx|All files (*.*)|*.*"
+        with wx.FileDialog(
+            self, message="Export to Igor Pro",
+            wildcard=wildcard,
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT
+        ) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                path = dlg.GetPath()
+                try:
+                    written_path = self.experiment.export_igor(path)
+                    self.log_panel.append_log(f"Igor image package exported to {written_path}")
+                except Exception as e:
+                    wx.MessageBox(f"Failed to export to Igor Pro: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
     def on_open_experiment(self, event=None) -> None:
         """
@@ -1156,6 +1466,11 @@ class MainFrame(wx.Frame):
     def _refresh_all_view_panels(self) -> None:
         for view_id in list(self.experiment.views.keys()):
             self._update_view_plot(view_id)
+
+    def _persist_view_panel_states(self) -> None:
+        for panel in list(self._view_id_to_panel.values()):
+            if hasattr(panel, "save_current_plot_config"):
+                panel.save_current_plot_config()
 
 
     # -------- callbacks from panels --------
@@ -1235,8 +1550,14 @@ class RamanApp(wx.App):
 if __name__ == "__main__":
     import sys
 
+    if len(sys.argv) > 1 and sys.argv[1] in {"export-plot", "--export-plot"}:
+        from plot_export_cli import main as export_plot_main
+        raise SystemExit(export_plot_main(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "agent":
+        from agent_cli import main as agent_main
+        raise SystemExit(agent_main(sys.argv[2:]))
+
     filenames = sys.argv[1:]
     app = RamanApp(filenames)
     app.MainLoop()
-
-
