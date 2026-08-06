@@ -19,6 +19,7 @@ from data_structure import (
     Run,
     ViewState,
     EV_PER_CM1,
+    is_hidden_run,
     new_experiment_id,
     new_view_id,
     RunType
@@ -29,52 +30,52 @@ from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
 class DerivedRunFormulaDialog(wx.Dialog):
     def __init__(self, parent, formula: str, params: Dict[str, float]):
         super().__init__(parent, title="Edit Derived Run Formula", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        
+
         self.formula = formula
         self.params = params.copy()
-        
+
         sizer = wx.BoxSizer(wx.VERTICAL)
-        
+
         # Formula
         sizer.Add(wx.StaticText(self, label="Formula (use 'x' as variable, 'np' for numpy):"), 0, wx.ALL, 5)
         self.txt_formula = wx.TextCtrl(self, value=self.formula, size=(400, -1))
         sizer.Add(self.txt_formula, 0, wx.EXPAND | wx.ALL, 5)
-        
+
         # Parameters
         sizer.Add(wx.StaticText(self, label="Parameters:"), 0, wx.ALL, 5)
         self.param_grid = wx.FlexGridSizer(cols=2, hgap=5, vgap=5)
         self.param_ctrls = {}
-        
+
         self._build_param_grid()
         sizer.Add(self.param_grid, 1, wx.EXPAND | wx.ALL, 5)
-        
+
         # Add/Remove Param Buttons
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         btn_add = wx.Button(self, label="Add Param")
         btn_add.Bind(wx.EVT_BUTTON, self.on_add_param)
         btn_sizer.Add(btn_add, 0, wx.RIGHT, 5)
         sizer.Add(btn_sizer, 0, wx.ALL, 5)
-        
+
         # Dialog Buttons
         btns = self.CreateButtonSizer(wx.OK | wx.CANCEL)
         sizer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
-        
+
         self.SetSizer(sizer)
         self.Fit()
-        
+
     def _build_param_grid(self):
         self.param_grid.Clear(True)
         self.param_ctrls.clear()
-        
+
         for name, val in self.params.items():
             lbl = wx.StaticText(self, label=f"{name}:")
             txt = wx.TextCtrl(self, value=str(val))
             self.param_grid.Add(lbl, 0, wx.ALIGN_CENTER_VERTICAL)
             self.param_grid.Add(txt, 1, wx.EXPAND)
             self.param_ctrls[name] = txt
-            
+
         self.Layout()
-        
+
     def on_add_param(self, event):
         dlg = wx.TextEntryDialog(self, "Enter parameter name:", "New Parameter")
         if dlg.ShowModal() == wx.ID_OK:
@@ -83,7 +84,7 @@ class DerivedRunFormulaDialog(wx.Dialog):
                 self.params[name] = 1.0
                 self._build_param_grid()
         dlg.Destroy()
-        
+
     def get_values(self):
         # Update params from text ctrls
         for name, txt in self.param_ctrls.items():
@@ -97,25 +98,25 @@ class DerivedRunFormulaDialog(wx.Dialog):
 class DerivedRunPropsDialog(wx.Dialog):
     def __init__(self, parent, n_points: int, autorange: bool, x_range: Tuple[float, float]):
         super().__init__(parent, title="Edit Derived Run Properties", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        
+
         self.n_points = n_points
         self.autorange = autorange
         self.x_range = x_range
-        
+
         sizer = wx.BoxSizer(wx.VERTICAL)
         gs = wx.FlexGridSizer(3, 2, 5, 5)
-        
+
         # N Points
         gs.Add(wx.StaticText(self, label="N Points:"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.txt_n = wx.TextCtrl(self, value=str(n_points))
         gs.Add(self.txt_n, 1, wx.EXPAND)
-        
+
         # Auto Range
         gs.Add(wx.StaticText(self, label="Auto Range:"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.chk_auto = wx.CheckBox(self, label="Use Plot Limits")
         self.chk_auto.SetValue(autorange)
         gs.Add(self.chk_auto, 1, wx.EXPAND)
-        
+
         # Range
         gs.Add(wx.StaticText(self, label="Default Range:"), 0, wx.ALIGN_CENTER_VERTICAL)
         range_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -124,24 +125,24 @@ class DerivedRunPropsDialog(wx.Dialog):
         range_sizer.Add(self.txt_min, 1, wx.RIGHT, 5)
         range_sizer.Add(self.txt_max, 1)
         gs.Add(range_sizer, 1, wx.EXPAND)
-        
+
         sizer.Add(gs, 1, wx.EXPAND | wx.ALL, 10)
-        
+
         # Enable/Disable range inputs based on auto
         self.chk_auto.Bind(wx.EVT_CHECKBOX, self.update_range_state)
         self.update_range_state()
-        
+
         btns = self.CreateButtonSizer(wx.OK | wx.CANCEL)
         sizer.Add(btns, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
-        
+
         self.SetSizer(sizer)
         self.Fit()
-        
+
     def update_range_state(self, evt=None):
         is_auto = self.chk_auto.GetValue()
         self.txt_min.Enable(not is_auto)
         self.txt_max.Enable(not is_auto)
-        
+
     def get_values(self):
         try:
             n = int(self.txt_n.GetValue())
@@ -192,7 +193,7 @@ class FilesPanel(wx.Panel):
         if os.path.isdir(path):
             self.dir_ctrl.SetPath(os.path.abspath(path))
 
-    def on_item_activated(self, event): 
+    def on_item_activated(self, event):
         """Handle activation in the directory tree."""
         item = event.GetItem()
         if not item.IsOk():
@@ -312,7 +313,7 @@ class RunsPanel(wx.Panel):
         top_sizer.Add(label_runs, 0, wx.ALL, 4)
 
         self.run_list = wx.ListCtrl(
-            top_panel, 
+            top_panel,
             style=wx.LC_REPORT | wx.LC_VRULES | wx.LC_HRULES
         )
         self.run_list.InsertColumn(0, "Run Name", width=100)
@@ -357,7 +358,7 @@ class RunsPanel(wx.Panel):
         else:
             self._sort_col = col
             self._sort_ascending = True
-        
+
         self._sort_list()
 
     def _sort_list(self):
@@ -403,7 +404,7 @@ class RunsPanel(wx.Panel):
         if key in [wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER]:
             self._on_context_rename_run(event)
             return
-        
+
         # Delete or Cmd+Backspace -> Remove
         if key == wx.WXK_DELETE or (key == wx.WXK_BACK and event.CmdDown()):
             self._on_context_remove_run(event)
@@ -416,19 +417,44 @@ class RunsPanel(wx.Panel):
     def refresh_from_experiment(self, exp: ExperimentSet) -> None:
         """Rebuild the runs and views lists from the given ExperimentSet."""
         self._experiment = exp
+        selected_run_ids = set(self._get_selected_run_ids())
+        top_run_id = None
+        try:
+            top_idx = self.run_list.GetTopItem()
+            if 0 <= top_idx < len(self._run_ids):
+                top_run_id = self._run_ids[top_idx]
+        except Exception:
+            top_run_id = None
+        selected_view_id, _selected_view_runs = self._get_selected_view_info()
+        try:
+            top_view_idx = self.views_list.GetScrollPos(wx.VERTICAL)
+        except Exception:
+            top_view_idx = None
+
         # Runs
         self.run_list.DeleteAllItems()
         self._run_ids.clear()
 
         for run_id, run in exp.runs.items():
+            if is_hidden_run(run):
+                continue
             nickname = exp.get_run_nickname(run_id)
             base = os.path.basename(run.source_path)
-            
+
             idx = self.run_list.InsertItem(self.run_list.GetItemCount(), nickname)
             self.run_list.SetItem(idx, 1, run_id)
             self.run_list.SetItem(idx, 2, base)
-            
+
             self._run_ids.append(run_id)
+
+        for idx, run_id in enumerate(self._run_ids):
+            if run_id in selected_run_ids:
+                self.run_list.Select(idx, True)
+        if top_run_id in self._run_ids:
+            try:
+                self.run_list.EnsureVisible(self._run_ids.index(top_run_id))
+            except Exception:
+                pass
 
         # Views
         self.views_list.Clear()
@@ -443,14 +469,27 @@ class RunsPanel(wx.Panel):
                 title = getattr(view, "title", view_id)
                 if view.run_ids:
                     nicknames = [
-                        exp.get_run_nickname(rid) for rid in view.run_ids
+                        exp.get_run_nickname(rid)
+                        for rid in view.run_ids
+                        if (run := exp.get_run(rid)) is not None and not is_hidden_run(run)
                     ]
-                    runs_str = ", ".join(nicknames)
+                    runs_str = ", ".join(nicknames) if nicknames else "(no visible runs)"
                 else:
                     runs_str = "(no runs)"
                 self.views_list.Append(f"{title}: {runs_str}")
         else:
             self.views_list.Append("(no views)")
+
+        if selected_view_id in self._view_ids:
+            try:
+                self.views_list.SetSelection(self._view_ids.index(selected_view_id))
+            except Exception:
+                pass
+        if top_view_idx is not None:
+            try:
+                self.views_list.SetScrollPos(wx.VERTICAL, top_view_idx)
+            except Exception:
+                pass
 
     # --- internal helpers ---
 
@@ -483,7 +522,7 @@ class RunsPanel(wx.Panel):
         item_rename = menu.Append(wx.ID_ANY, "Rename run")
         item_update = menu.Append(wx.ID_ANY, "Update from file")
         item_export = menu.Append(wx.ID_ANY, "Export Run...")
-        
+
         # Check if derived run is selected
         run_ids = self._get_selected_run_ids()
         if len(run_ids) == 1 and self._experiment:
@@ -532,9 +571,9 @@ class RunsPanel(wx.Panel):
     def _on_context_remove_run(self, event):
         if self._on_remove_run is None:
             return
-        
+
         run_ids = self._get_selected_run_ids()
-        
+
         if run_ids:
             # Confirm removal
             msg = f"Are you sure you want to remove {len(run_ids)} run(s)?\nThis will remove them from all views."
@@ -557,7 +596,7 @@ class RunsPanel(wx.Panel):
     def _on_context_update_from_file(self, event):
         if self._on_update_from_file is None:
             return
-        
+
         run_ids = self._get_selected_run_ids()
         if run_ids:
             self._on_update_from_file(run_ids)
@@ -602,7 +641,7 @@ class RunsPanel(wx.Panel):
 
         # Get item rectangle for column 0 (Run Name)
         rect = self.run_list.GetItemRect(index, wx.LIST_RECT_LABEL)
-        
+
         # Adjust position slightly for better visual alignment
         x = rect.x
         y = rect.y
@@ -746,18 +785,20 @@ class ExperimentPanel(wx.Panel):
         self._on_edit_formula = on_edit_formula
         self._on_edit_derived_props = on_edit_derived_props
         self._experiment: Optional[ExperimentSet] = None
-        
+
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.tree = wx.TreeCtrl(self, style=wx.TR_HAS_BUTTONS | wx.TR_DEFAULT_STYLE)
         sizer.Add(self.tree, 1, wx.EXPAND | wx.ALL, 4)
 
         self.SetSizer(sizer)
-        
+
         self.tree.Bind(wx.EVT_TREE_ITEM_RIGHT_CLICK, self.on_tree_right_click)
 
     def refresh_from_experiment(self, exp: ExperimentSet) -> None:
         """Rebuild the tree from the given ExperimentSet."""
+        top_path = self._visible_item_path()
+        selected_path = self._selected_item_path()
         self._experiment = exp
         self.tree.DeleteAllItems()
 
@@ -773,8 +814,9 @@ class ExperimentPanel(wx.Panel):
 
         # Runs subtree: RunNN as node label, with id / file / metadata as children
         runs_node = self.tree.AppendItem(root, "Runs")
-        if exp.runs:
-            for run_id, run in exp.runs.items():
+        visible_runs = [(run_id, run) for run_id, run in exp.runs.items() if not is_hidden_run(run)]
+        if visible_runs:
+            for run_id, run in visible_runs:
                 nickname = exp.get_run_nickname(run_id)
                 run_item = self.tree.AppendItem(runs_node, nickname)
                 self.tree.SetItemData(run_item, run_id) # Store run_id for context menu
@@ -814,27 +856,104 @@ class ExperimentPanel(wx.Panel):
             self.tree.AppendItem(views_node, "(no views)")
 
         self.tree.ExpandAll()
+        self._restore_tree_position(top_path, selected_path)
+
+    def _item_key(self, item) -> str:
+        if not item or not item.IsOk():
+            return ""
+        data = self.tree.GetItemData(item)
+        if data:
+            return f"run:{data}"
+        return self.tree.GetItemText(item)
+
+    def _item_path(self, item) -> Tuple[str, ...]:
+        if not item or not item.IsOk():
+            return ()
+        parts = []
+        current = item
+        while current and current.IsOk():
+            parts.append(self._item_key(current))
+            current = self.tree.GetItemParent(current)
+        return tuple(reversed(parts))
+
+    def _selected_item_path(self) -> Tuple[str, ...]:
+        item = self.tree.GetSelection()
+        return self._item_path(item)
+
+    def _visible_item_path(self) -> Tuple[str, ...]:
+        try:
+            item = self.tree.GetFirstVisibleItem()
+        except Exception:
+            item = None
+        return self._item_path(item)
+
+    def _find_item_by_path(self, path: Tuple[str, ...]):
+        if not path:
+            return wx.TreeItemId()
+        root = self.tree.GetRootItem()
+        if not root.IsOk() or self._item_key(root) != path[0]:
+            return wx.TreeItemId()
+        current = root
+        for key in path[1:]:
+            child, cookie = self.tree.GetFirstChild(current)
+            found = wx.TreeItemId()
+            while child.IsOk():
+                if self._item_key(child) == key:
+                    found = child
+                    break
+                child, cookie = self.tree.GetNextChild(current, cookie)
+            if not found.IsOk():
+                return wx.TreeItemId()
+            current = found
+        return current
+
+    def _scroll_item_into_top_position(self, item) -> None:
+        if not item or not item.IsOk():
+            return
+        try:
+            if hasattr(self.tree, "ScrollTo"):
+                self.tree.ScrollTo(item)
+                return
+        except Exception:
+            pass
+        try:
+            self.tree.EnsureVisible(item)
+        except Exception:
+            pass
+
+    def _restore_tree_position(self, top_path: Tuple[str, ...], selected_path: Tuple[str, ...]) -> None:
+        top_item = self._find_item_by_path(top_path)
+        selected_item = self._find_item_by_path(selected_path)
+
+        if selected_item.IsOk():
+            try:
+                self.tree.SelectItem(selected_item)
+            except Exception:
+                pass
+
+        if top_item.IsOk():
+            wx.CallAfter(self._scroll_item_into_top_position, top_item)
 
     def on_tree_right_click(self, event):
         item = event.GetItem()
         if not item.IsOk():
             return
-            
+
         run_id = self.tree.GetItemData(item)
         if not run_id or not self._experiment:
             return
-            
+
         run = self._experiment.get_run(run_id)
         if not run or run.run_type != RunType.DERIVED:
             return
-            
+
         menu = wx.Menu()
         item_formula = menu.Append(wx.ID_ANY, "Edit Formula...")
         item_props = menu.Append(wx.ID_ANY, "Edit Derived Props...")
-        
+
         self.Bind(wx.EVT_MENU, lambda e: self._on_menu_edit_formula(run_id), item_formula)
         self.Bind(wx.EVT_MENU, lambda e: self._on_menu_edit_props(run_id), item_props)
-        
+
         self.PopupMenu(menu)
         menu.Destroy()
 
@@ -842,7 +961,7 @@ class ExperimentPanel(wx.Panel):
         run = self._experiment.get_run(run_id)
         current_formula = run.metadata.get("formula", "")
         current_params = run.metadata.get("formula_params", {})
-        
+
         dlg = DerivedRunFormulaDialog(self, current_formula, current_params)
         if dlg.ShowModal() == wx.ID_OK:
             new_formula, new_params = dlg.get_values()
@@ -856,7 +975,7 @@ class ExperimentPanel(wx.Panel):
         current_n = run.metadata.get("default_n_points", 100)
         current_auto = run.metadata.get("default_autorange", False)
         current_range = run.metadata.get("default_range", (0, 100))
-        
+
         dlg = DerivedRunPropsDialog(self, current_n, current_auto, current_range)
         if dlg.ShowModal() == wx.ID_OK:
             new_n, new_auto, new_range = dlg.get_values()
@@ -881,4 +1000,3 @@ class LogPanel(wx.Panel):
 
     def append_log(self, msg: str) -> None:
         self.text.AppendText(msg + "\n")
-

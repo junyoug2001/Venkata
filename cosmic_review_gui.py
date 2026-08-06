@@ -38,13 +38,15 @@ class CosmicReviewDialog(wx.Dialog):
         *,
         cosmic_result: "analysis.MergeCosmicResult",
         contrast_percent: Tuple[float, float],
+        on_detection_settings_change=None,
     ):
         super().__init__(parent, title="Cosmic Review", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
 
+        self._on_detection_settings_change = on_detection_settings_change
         self._x_centers = np.asarray(cosmic_result.wavelength_nm, dtype=float)
         self._y_centers = np.asarray(cosmic_result.angle_values, dtype=float)
         self._I = np.asarray(cosmic_result.intensity_matrix, dtype=float) - cosmic_result.dark_value
-        
+
         # Check for shape mismatch
         ny, nx = self._I.shape
         ly = len(self._y_centers)
@@ -60,7 +62,7 @@ class CosmicReviewDialog(wx.Dialog):
         self._raw_rows_by_xxxx = dict(cosmic_result.raw_rows_by_xxxx) if cosmic_result.raw_rows_by_xxxx else {}
         self._primitive_xxxx = list(cosmic_result.primitive_xxxx) if cosmic_result.primitive_xxxx else None
         self._unique_xxxx = list(cosmic_result.unique_xxxx) if cosmic_result.unique_xxxx else None
-        
+
         peaks = list(getattr(cosmic_result, "peaks", []))
         evidence = getattr(cosmic_result, "evidence", {}) or {}
         candidates: List[Dict[str, Any]] = []
@@ -93,7 +95,7 @@ class CosmicReviewDialog(wx.Dialog):
 
         self.plotterA: Optional[RamanPlotter2d] = None
         self.plotterC: Optional[SlicePlotter] = None
-        
+
         self._syncing_limits = False
         self._limit_cb_ids = []
 
@@ -140,19 +142,19 @@ class CosmicReviewDialog(wx.Dialog):
         ctrl_sizer.Add(box_thresh, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
         row_inputs = wx.BoxSizer(wx.HORIZONTAL)
-        
+
         self.txt_threshold = wx.TextCtrl(ctrl_panel, value=f"{cosmic_result.intensity_thresh:.1f}", size=(70, -1))
         self.txt_ratio = wx.TextCtrl(ctrl_panel, value=f"{cosmic_result.comparison_factor:.1f}", size=(70, -1))
         self.btn_detect = wx.Button(ctrl_panel, label="Detect")
-        
+
         row_inputs.Add(wx.StaticText(ctrl_panel, label="Min Height:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
         row_inputs.Add(self.txt_threshold, 1, wx.EXPAND | wx.ALL, 2)
         row_inputs.Add(wx.StaticText(ctrl_panel, label="Ratio:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 2)
         row_inputs.Add(self.txt_ratio, 1, wx.EXPAND | wx.ALL, 2)
         row_inputs.Add(self.btn_detect, 0, wx.ALL, 2)
-        
+
         box_thresh.Add(row_inputs, 0, wx.EXPAND)
-        
+
         self.Bind(wx.EVT_BUTTON, self._on_re_detect, self.btn_detect)
 
         # Candidate list
@@ -169,7 +171,7 @@ class CosmicReviewDialog(wx.Dialog):
         for i, c in enumerate(self._candidates):
             c["original_index"] = i
             c["is_checked"] = bool(c.get("is_confirmed_cosmic", False))
-        
+
         self.Bind(wx.EVT_CHECKBOX, self._on_sort_change, self.chk_sort_prominence)
         self.Bind(wx.EVT_CHECKLISTBOX, self._on_candidate_check_changed, self.chk_list)
 
@@ -215,7 +217,7 @@ class CosmicReviewDialog(wx.Dialog):
         self.SetSize((1150, 740))
         self.Layout()
 
-    def get_remove_mask(self) -> List[bool]:        
+    def get_remove_mask(self) -> List[bool]:
         sorted_by_original_index = sorted(self._candidates, key=lambda c: c['original_index'])
         return [c['is_checked'] for c in sorted_by_original_index]
 
@@ -232,17 +234,19 @@ class CosmicReviewDialog(wx.Dialog):
 
         self._cosmic_result.intensity_thresh = h_val
         self._cosmic_result.comparison_factor = r_val
-        
-        # Save to global config
-        config.set("cosmic_threshold", h_val)
-        config.set("cosmic_ratio", r_val)
-        
+
+        if self._on_detection_settings_change is not None:
+            self._on_detection_settings_change(h_val, r_val)
+        else:
+            config.set("cosmic_threshold", h_val)
+            config.set("cosmic_ratio", r_val)
+
         try:
             new_res = analysis.discover_cosmics(self._cosmic_result)
         except Exception as e:
             wx.MessageBox(f"Detection failed: {e}", "Error", wx.OK | wx.ICON_ERROR)
             return
-            
+
         # Store for return
         self._cosmic_result = new_res
 
@@ -265,12 +269,12 @@ class CosmicReviewDialog(wx.Dialog):
                     "is_checked": bool(p.is_confirmed_cosmic) # Use the logic-based flag
                 }
             )
-        
+
         self._evidence = new_res.evidence
         self._general_evidence = self._evidence
         self.txt_evidence.SetValue(self._format_evidence(self._evidence))
         self._selected_candidate_info = None
-        
+
         self._sort_and_refresh_list()
         self._render_matrix()
         self._update_point_highlights()
@@ -294,7 +298,7 @@ class CosmicReviewDialog(wx.Dialog):
         # Re-apply the checked state
         for i, c in enumerate(self._candidates):
             self.chk_list.Check(i, c['is_checked'])
-    
+
     def _on_sort_change(self, event):
         self._sort_and_refresh_list()
 
@@ -308,7 +312,7 @@ class CosmicReviewDialog(wx.Dialog):
         """Send coordinates of checked candidates to the 2D plotter for visualization."""
         if not self.plotterA:
             return
-            
+
         x_hlts = []
         y_hlts = []
         for c in self._candidates:
@@ -318,7 +322,7 @@ class CosmicReviewDialog(wx.Dialog):
                 if wl is not None and ang is not None:
                     x_hlts.append(wl)
                     y_hlts.append(ang)
-        
+
         # Use Turquoise (#40E0D0) for blue-greenish highlight
         self.plotterA.set_points(x_hlts, y_hlts, color="#40E0D0", size=40)
 
@@ -362,7 +366,7 @@ class CosmicReviewDialog(wx.Dialog):
     def _format_candidate(c: Dict[str, Any]) -> str:
         display_index = c.get('original_index', -1) + 1
         label = f"#{display_index}"
-        
+
         ang = c.get("angle_deg", None)
         wl = c.get("center_wavelength_nm", None)
         inten = c.get("intensity", None)
@@ -385,18 +389,18 @@ class CosmicReviewDialog(wx.Dialog):
 
     def _init_plot_layout(self):
         """Reset figure and recreate plotters. This fixes shrinking due to colorbar."""
-        self.figure.clf() 
-        
+        self.figure.clf()
+
         # Disconnect old sync callbacks
         for reg, cid in self._limit_cb_ids:
-            try: reg.disconnect(cid) 
+            try: reg.disconnect(cid)
             except: pass
         self._limit_cb_ids.clear()
 
         gs = self.figure.add_gridspec(2, 1, height_ratios=[3.0, 1.4], hspace=0.35)
         self.ax_top = self.figure.add_subplot(gs[0, 0])
         self.ax_bot = self.figure.add_subplot(gs[1, 0])
-        
+
         self.plotterA = RamanPlotter2d(self.ax_top)
         self.plotterC = SlicePlotter(self.ax_bot)
 
@@ -408,7 +412,7 @@ class CosmicReviewDialog(wx.Dialog):
                 self.plotterC.ax.set_xlim(ax.get_xlim())
             finally:
                 self._syncing_limits = False
-        
+
         def sync_C_to_A(ax):
             if self._syncing_limits: return
             self._syncing_limits = True
@@ -420,10 +424,13 @@ class CosmicReviewDialog(wx.Dialog):
         self._limit_cb_ids.append((self.ax_top.callbacks, self.ax_top.callbacks.connect("xlim_changed", sync_A_to_C)))
         self._limit_cb_ids.append((self.ax_bot.callbacks, self.ax_bot.callbacks.connect("xlim_changed", sync_C_to_A)))
 
+    def _apply_figure_spacing(self) -> None:
+        self.figure.subplots_adjust(left=0.08, right=0.92, bottom=0.08, top=0.94, hspace=0.38)
+
     def _render_matrix(self) -> None:
         # Reset layout before rendering to fix colorbar shrinking and reset axes
         self._init_plot_layout()
-        
+
         self.plotterA.render(
             self._x_centers, self._y_centers, self._I,
             title="Cosmic review (wavelength axis)",
@@ -432,7 +439,7 @@ class CosmicReviewDialog(wx.Dialog):
         )
         self._update_point_highlights()
         self._apply_contrast_from_sliders()
-        self.figure.tight_layout()
+        self._apply_figure_spacing()
         self.canvas.draw_idle()
 
     def _update_highlight_and_slice(self) -> None:
@@ -452,7 +459,7 @@ class CosmicReviewDialog(wx.Dialog):
             xlabel="Wavelength (nm)",
             ylabel="Intensity"
         )
-        
+
         # Overlay raw data traces
         if self._raw_I is not None and self._raw_rows_by_xxxx:
             xxxx_key = None
@@ -471,15 +478,15 @@ class CosmicReviewDialog(wx.Dialog):
                     raw = raw - self._dark_value
                     raw[raw < 0] = 0
                 n = min(raw.shape[0], self._x_centers.shape[0])
-                
+
                 self.plotterC.add_trace(
-                    self._x_centers[:n], raw[:n], 
+                    self._x_centers[:n], raw[:n],
                     color="black", style=":", alpha=0.6
                 )
 
         # Highlight position
         self.plotterC.set_highlight(x_hl)
-        
+
         # Extra dot for specific candidate (manual artist on ax)
         if self._selected_candidate_info and self._raw_I is not None:
             raw_r = self._selected_candidate_info.get("row_index")
@@ -495,15 +502,15 @@ class CosmicReviewDialog(wx.Dialog):
     def _on_canvas_click(self, event) -> None:
         if event.inaxes is not self.ax_top:
             return
-        
+
         indices = self.plotterA.get_index_at(event.xdata, event.ydata)
         if not indices:
             return
-        
+
         self._sel_col, self._sel_row = indices
         self._selected_candidate_info = None  # Clear selected candidate on manual click
         self.txt_evidence.SetValue(self._format_evidence(self._general_evidence))
-        
+
         self._update_highlight_and_slice()
 
     def _on_candidate_select(self, event) -> None:
@@ -519,14 +526,14 @@ class CosmicReviewDialog(wx.Dialog):
 
         if angle is not None:
             self._sel_row = int(np.argmin(np.abs(self._y_centers - float(angle))))
-        
+
         if wavelength is not None:
             self._sel_col = int(np.argmin(np.abs(self._x_centers - float(wavelength))))
 
         # Show peak-specific evidence
         peak_evidence = c.get("test_results", {})
         self.txt_evidence.SetValue(self._format_evidence(peak_evidence))
-        
+
         self._update_highlight_and_slice()
 
     def _on_contrast_slider(self, event) -> None:
