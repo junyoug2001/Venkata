@@ -1,0 +1,225 @@
+{
+    "default_spectral_unit": "meV",
+    "default_colormap": "magma_r_custom2",
+    "default_vmin_percent": 0.0,
+    "default_vmax_percent": 100.0,
+    "default_angle_slice_type": "polar",
+    "default_slice_x_binning": 1,
+    "default_slice_y_binning": 1,
+    "default_slice_binning_mode": "cross",
+    "show_secondary_unit_axis": true,
+    "highlight_requires_modifier": false,
+    "default_unknown_1d_spectral_unit": "meV",
+    "default_unknown_2d_spectral_unit": "meV",
+    "default_si_bg_profile_path": "",
+    "colormap": "magma_r_custom2",
+    "unit": "meV",
+    "dark_value": 600.0,
+    "cosmic_threshold": 500.0,
+    "cosmic_ratio": 5.0,
+    "window_size": [
+        1920,
+        974
+    ],
+    "last_directory": "",
+    "custom_colormaps": {
+        "magma_r_custom1": [
+            [
+                0.0,
+                "#FBFBFB"
+            ],
+            [
+                0.3,
+                "#ECAB88"
+            ],
+            [
+                0.8,
+                "#9136B5"
+            ],
+            [
+                0.9,
+                "#000000"
+            ],
+            [
+                1.0,
+                "#5B58FF"
+            ]
+        ],
+        "magma_r_custom2": [
+            [
+                0.0,
+                "#fcfdbf"
+            ],
+            [
+                0.3,
+                "#FB8761"
+            ],
+            [
+                0.6,
+                "#B5367A"
+            ],
+            [
+                0.9,
+                "#4F127B"
+            ],
+            [
+                1.0,
+                "#000004"
+            ]
+        ],
+        "magma_r_custom_rps": [
+            [
+                0.0,
+                "#FCFDBF"
+            ],
+            [
+                0.05,
+                "#FB8761"
+            ],
+            [
+                0.4,
+                "#B5367A"
+            ],
+            [
+                0.6,
+                "#4F127B"
+            ],
+            [
+                1.0,
+                "#000004"
+            ]
+        ],
+        "magma_r_custom_rps2": [
+            [
+                0.0,
+                "#FCFDBF"
+            ],
+            [
+                0.04326923076923077,
+                "#FA8861"
+            ],
+            [
+                0.05608974358974359,
+                "#FBC290"
+            ],
+            [
+                0.4358974358974359,
+                "#B5367A"
+            ],
+            [
+                0.842948717948718,
+                "#4F127B"
+            ],
+            [
+                1.0,
+                "#000004"
+            ]
+        ],
+        "bone_rr": [
+            [
+                0.0,
+                "#FFFFFF"
+            ],
+            [
+                0.5336538461538461,
+                "#A6C6C6"
+            ],
+            [
+                1.0,
+                "#000000"
+            ]
+        ],
+        "magma_r_theory": [
+            [
+                0.00641025641025641,
+                "#EEF7FB"
+            ],
+            [
+                0.15064102564102563,
+                "#71CED5"
+            ],
+            [
+                0.6,
+                "#243BCC"
+            ],
+            [
+                0.9,
+                "#3B007F"
+            ],
+            [
+                1.0,
+                "#000004"
+            ]
+        ],
+        "bone_r": [
+            [
+                0.0,
+                "#FFFFFF"
+            ],
+            [
+                0.25,
+                "#B0C7D1"
+            ],
+            [
+                0.5,
+                "#60808F"
+            ],
+            [
+                0.75,
+                "#26404D"
+            ],
+            [
+                1.0,
+                "#000000"
+            ]
+        ],
+        "bone_r_cali": [
+            [
+                0.0,
+                "#FFFFFF"
+            ],
+            [
+                0.2516025641025641,
+                "#B0C7D1"
+            ],
+            [
+                0.6025641025641025,
+                "#60808F"
+            ],
+            [
+                0.8766025641025641,
+                "#26404D"
+            ],
+            [
+                0.9967948717948718,
+                "#000000"
+            ]
+        ],
+        "magma_r_custom_ros3": [
+            [
+                0.0,
+                "#fcfdbf"
+            ],
+            [
+                0.0625,
+                "#E7C273"
+            ],
+            [
+                0.1266025641025641,
+                "#D9846D"
+            ],
+            [
+                0.33653846153846156,
+                "#b5367a"
+            ],
+            [
+                0.5721153846153846,
+                "#4f127b"
+            ],
+            [
+                0.75,
+                "#000004"
+            ]
+        ]
+    }
+}
