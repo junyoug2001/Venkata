@@ -19,10 +19,11 @@ from matplotlib.backends.backend_wxagg import (
 from data_structure import (
     ExperimentSet,
     Run,
+    RunType,
     ViewState,
     alternate_spectral_unit,
     cm1_to_unit,
-    new_experiment_id,
+    new_run_id,
     new_view_id,
     infer_intensity_unit,
     normalize_spectral_unit,
@@ -31,6 +32,8 @@ from data_structure import (
     unit_to_cm1,
 )
 from plotting import RamanPlotter2d, SlicePlotter
+from row_axis import row_axis_from_metadata
+from filename_templates import TemplateValidationError, load_catalog
 from config_manager import config
 
 
@@ -102,14 +105,25 @@ class MergeRunsDialog(wx.Dialog):
 
         # Persist contrast settings
         self._contrast_percent = (0.0, 100.0)
-
+        
         # Synchronization state
         self._syncing_limits = False
         self._limit_cb_ids = []
 
-        # 50% of parent size
+        # Fit the current display instead of forcing a 980×680 dialog that
+        # Windows may silently clip on a low-resolution/high-DPI monitor.
         pw, ph = parent.GetSize()
-        self.SetSize((max(980, int(pw * 0.5)), max(680, int(ph * 0.5))))
+        display_index = wx.Display.GetFromWindow(parent)
+        work_area = wx.Display(display_index if display_index != wx.NOT_FOUND else 0).GetClientArea()
+        # Use display-independent logical-pixel minima.  At 150–200% Windows
+        # scaling, a physically 800 px display can expose only ~400–530 DIP.
+        usable_width = max(460, work_area.width - 32)
+        usable_height = max(360, work_area.height - 48)
+        self.SetMinSize((460, 360))
+        self.SetSize((
+            min(max(980, int(pw * 0.5)), usable_width),
+            min(max(680, int(ph * 0.5)), usable_height),
+        ))
 
         root = wx.BoxSizer(wx.HORIZONTAL)
         self.SetSizer(root)
@@ -138,7 +152,13 @@ class MergeRunsDialog(wx.Dialog):
         # ----------------
         # Right: controls area (1/4)
         # ----------------
-        ctrl_panel = wx.Panel(self)
+        self._ctrl_scroller = wx.ScrolledWindow(self, style=wx.VSCROLL | wx.TAB_TRAVERSAL)
+        self._ctrl_scroller.SetScrollRate(0, 12)
+        ctrl_panel = wx.Panel(self._ctrl_scroller)
+        self._ctrl_scroller.SetSizer(wx.BoxSizer(wx.VERTICAL))
+        self._ctrl_scroller.GetSizer().Add(ctrl_panel, 1, wx.EXPAND)
+        self._ctrl_scroller.SetMinSize((300, 200))
+        ctrl_panel.SetMinSize((300, -1))
         ctrl_sizer = wx.BoxSizer(wx.VERTICAL)
         ctrl_panel.SetSizer(ctrl_sizer)
 
@@ -184,10 +204,34 @@ class MergeRunsDialog(wx.Dialog):
         # Input x-axis unit
         row_input_unit = wx.BoxSizer(wx.HORIZONTAL)
         row_input_unit.Add(wx.StaticText(ctrl_panel, label="Input x unit"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
-        self.choice_input_x_unit = wx.Choice(ctrl_panel, choices=["nm", "cm-1", "meV"])
-        self.choice_input_x_unit.SetStringSelection(self._infer_input_x_unit(self._paths[0] if self._paths else ""))
+        self.choice_input_x_unit = wx.Choice(ctrl_panel, choices=["auto", "nm", "cm-1", "meV"])
+        self.choice_input_x_unit.SetStringSelection("auto")
         row_input_unit.Add(self.choice_input_x_unit, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
         box_opt.Add(row_input_unit, 0, wx.ALL, 2)
+
+        row_template = wx.BoxSizer(wx.HORIZONTAL)
+        row_template.Add(wx.StaticText(ctrl_panel, label="Filename template"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        self.choice_template = wx.Choice(ctrl_panel)
+        row_template.Add(self.choice_template, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        box_opt.Add(row_template, 0, wx.EXPAND | wx.ALL, 2)
+
+        row_profile = wx.BoxSizer(wx.HORIZONTAL)
+        row_profile.Add(wx.StaticText(ctrl_panel, label="Merge axis"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        self.choice_profile = wx.Choice(ctrl_panel)
+        row_profile.Add(self.choice_profile, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        box_opt.Add(row_profile, 0, wx.EXPAND | wx.ALL, 2)
+
+        row_repeat = wx.BoxSizer(wx.HORIZONTAL)
+        row_repeat.Add(wx.StaticText(ctrl_panel, label="Repeats"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        self.choice_repeat = wx.Choice(ctrl_panel, choices=["Average", "Keep separate"])
+        self.choice_repeat.SetSelection(0)
+        row_repeat.Add(self.choice_repeat, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        box_opt.Add(row_repeat, 0, wx.EXPAND | wx.ALL, 2)
+
+        self.lbl_axis_assessment = wx.StaticText(ctrl_panel, label="X axis: awaiting preflight")
+        self.lbl_axis_assessment.Wrap(260)
+        box_opt.Add(self.lbl_axis_assessment, 0, wx.EXPAND | wx.ALL, 2)
+        self._refresh_template_choices()
 
         # Manual laser wavelength
         row_manual = wx.BoxSizer(wx.HORIZONTAL)
@@ -244,9 +288,14 @@ class MergeRunsDialog(wx.Dialog):
         btn_row.Add(self.btn_close, 0, wx.ALL, 4)
         ctrl_sizer.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
-        # Root layout
-        root.Add(plot_panel, 3, wx.EXPAND | wx.ALL, 6)
-        root.Add(ctrl_panel, 1, wx.EXPAND | wx.ALL, 6)
+        # Root layout starts horizontal, then switches to a stacked layout at
+        # narrow widths.  The controls have a real minimum width and can
+        # scroll vertically rather than disappearing behind the plot canvas.
+        self._plot_panel = plot_panel
+        self._controls_panel = ctrl_panel
+        self._compact_layout = None
+        root.Add(plot_panel, 1, wx.EXPAND | wx.ALL, 6)
+        root.Add(self._ctrl_scroller, 0, wx.EXPAND | wx.ALL, 6)
 
         # Bind UI events
         self.Bind(wx.EVT_BUTTON, self._on_preview, self.btn_preview)
@@ -260,16 +309,46 @@ class MergeRunsDialog(wx.Dialog):
         self.Bind(wx.EVT_SLIDER, self._on_contrast_slider, self.slider_vmin)
         self.Bind(wx.EVT_SLIDER, self._on_contrast_slider, self.slider_vmax)
         self.Bind(wx.EVT_TEXT, self._on_dark_value_change, self.txt_dark_value)
+        self.Bind(wx.EVT_CHOICE, self._on_template_or_profile_change, self.choice_template)
+        self.Bind(wx.EVT_CHOICE, self._on_template_or_profile_change, self.choice_profile)
+        self.Bind(wx.EVT_CHOICE, self._on_template_or_profile_change, self.choice_repeat)
+        self.Bind(wx.EVT_CHOICE, self._on_input_unit_change, self.choice_input_x_unit)
+        self.Bind(wx.EVT_SIZE, self._on_dialog_size)
 
         # Run Stage-1 discovery immediately
         self._run_discover()
 
         self.Layout()
+        wx.CallAfter(self._update_responsive_layout)
+
+    def _on_dialog_size(self, event) -> None:
+        wx.CallAfter(self._update_responsive_layout)
+        event.Skip()
+
+    def _update_responsive_layout(self) -> None:
+        """Keep merge controls visible on compact screens and at high DPI."""
+        if not hasattr(self, "_ctrl_scroller") or not hasattr(self, "_plot_panel"):
+            return
+        compact = self.GetClientSize().width < 900
+        if compact == self._compact_layout:
+            self._ctrl_scroller.FitInside()
+            return
+        self._compact_layout = compact
+        root = self.GetSizer()
+        root.Clear(delete_windows=False)
+        if compact:
+            root.Add(self._plot_panel, 1, wx.EXPAND | wx.ALL, 6)
+            root.Add(self._ctrl_scroller, 1, wx.EXPAND | wx.ALL, 6)
+        else:
+            root.Add(self._plot_panel, 1, wx.EXPAND | wx.ALL, 6)
+            root.Add(self._ctrl_scroller, 0, wx.EXPAND | wx.ALL, 6)
+        self._ctrl_scroller.FitInside()
+        self.Layout()
 
     def _init_plot_layout(self):
         """Reset figure and recreate plotters. This fixes shrinking due to colorbar."""
         self.figure.clf()
-
+        
         # Disconnect old sync callbacks
         for reg, cid in self._limit_cb_ids:
             try: reg.disconnect(cid)
@@ -279,7 +358,7 @@ class MergeRunsDialog(wx.Dialog):
         gs = self.figure.add_gridspec(2, 1, height_ratios=[3.0, 1.4], hspace=0.35)
         self.ax_top = self.figure.add_subplot(gs[0, 0])
         self.ax_bot = self.figure.add_subplot(gs[1, 0])
-
+        
         self.plotterA = RamanPlotter2d(self.ax_top)
         self.plotterC = SlicePlotter(self.ax_bot)
 
@@ -291,7 +370,7 @@ class MergeRunsDialog(wx.Dialog):
                 self.plotterC.ax.set_xlim(ax.get_xlim())
             finally:
                 self._syncing_limits = False
-
+        
         def sync_C_to_A(ax):
             if self._syncing_limits: return
             self._syncing_limits = True
@@ -361,13 +440,99 @@ class MergeRunsDialog(wx.Dialog):
     # Stage-1 / Stage-2
     # -----------------------------
 
-    def _infer_input_x_unit(self, path: str) -> str:
-        base = os.path.basename(path or "").lower()
-        if "mev" in base:
-            return "meV"
-        if "cm-1" in base or "cm^-1" in base or "cm1" in base or "wavenumber" in base or "raman_shift" in base:
-            return "cm-1"
-        return "nm"
+    def _refresh_template_choices(self) -> None:
+        """Refresh enabled catalog entries without making the catalog mutable here."""
+        try:
+            catalog = load_catalog()
+            templates = list(catalog.available_templates())
+        except Exception:
+            templates = []
+        self._template_ids = ["auto"] + [template.id for template in templates]
+        self.choice_template.Clear()
+        for template_id, template in zip(self._template_ids, [None] + templates):
+            self.choice_template.Append("Auto (best match)" if template is None else template.label)
+        self.choice_template.SetSelection(0)
+        self._refresh_profile_choices()
+
+    def _selected_template_id(self) -> str:
+        idx = self.choice_template.GetSelection()
+        return self._template_ids[idx] if 0 <= idx < len(self._template_ids) else "auto"
+
+    def _refresh_profile_choices(self) -> None:
+        selected = self._selected_template_id() if hasattr(self, "_template_ids") else "auto"
+        self._profile_ids = ["auto"]
+        labels = ["Auto (template default)"]
+        if selected != "auto":
+            try:
+                catalog = load_catalog()
+                template = next(t for t in catalog.available_templates() if t.id == selected)
+                self._profile_ids.extend(profile.id for profile in template.merge_profiles)
+                labels.extend(profile.label for profile in template.merge_profiles)
+            except Exception:
+                pass
+        self.choice_profile.Clear()
+        self.choice_profile.AppendItems(labels)
+        self.choice_profile.SetSelection(0)
+
+    def _selected_profile_id(self) -> str:
+        idx = self.choice_profile.GetSelection()
+        return self._profile_ids[idx] if 0 <= idx < len(self._profile_ids) else "auto"
+
+    def _selected_repeat_mode(self) -> str:
+        return "separate" if self.choice_repeat.GetSelection() == 1 else "average"
+
+    def _axis_label(self, unit: str) -> str:
+        if unit == "nm":
+            return "Wavelength (nm)"
+        return spectral_axis_label(unit, latex=False) if unit in {"cm-1", "meV"} else "Unconfirmed x axis"
+
+    def _row_axis_for_disc(self, disc: MergeDiscoverResult):
+        return row_axis_from_metadata(
+            {
+                "merge_axis_kind": getattr(disc, "row_axis_kind", "angle"),
+                "merge_axis_unit": getattr(disc, "row_axis_unit", "deg"),
+                "repeat_mode": getattr(disc, "repeat_mode", "average"),
+                "merge_row_labels": list(getattr(disc, "row_labels", []) or []),
+                "polarization_rows": list(getattr(disc, "row_labels", []) or []),
+            },
+            np.asarray(disc.angle_values, dtype=float),
+        )
+
+    def _on_template_or_profile_change(self, event) -> None:
+        if event.GetEventObject() is self.choice_template:
+            self._refresh_profile_choices()
+        self._run_discover()
+
+    def _on_input_unit_change(self, event) -> None:
+        self._run_discover()
+
+    def _resolve_axis_before_render(self, disc: MergeDiscoverResult) -> Optional[MergeDiscoverResult]:
+        assessment = disc.axis_assessment
+        requested = self.choice_input_x_unit.GetStringSelection() or "auto"
+        if assessment is None:
+            return disc
+        if requested != "auto":
+            if requested not in assessment.allowed_units:
+                self._show_message("Selected unit is invalid: " + "; ".join(assessment.warnings))
+                return None
+            return replace(disc, raw_x_unit=requested, title=f"Preview (raw, {requested} axis)")
+        if assessment.confidence == "high" and assessment.recommended_unit:
+            self.choice_input_x_unit.SetStringSelection(assessment.recommended_unit)
+            return replace(disc, raw_x_unit=assessment.recommended_unit, title=f"Preview (raw, {assessment.recommended_unit} axis)")
+
+        choices = list(assessment.allowed_units)
+        message = "\n".join(assessment.warnings) or "The raw x axis has no reliable unit evidence."
+        with wx.SingleChoiceDialog(
+            self,
+            message + "\n\nChoose the input x unit before plotting:",
+            "Confirm input x unit",
+            choices,
+        ) as prompt:
+            if prompt.ShowModal() != wx.ID_OK:
+                return None
+            selected = choices[prompt.GetSelection()]
+        self.choice_input_x_unit.SetStringSelection(selected)
+        return replace(disc, raw_x_unit=selected, title=f"Preview (raw, {selected} axis)")
 
     def _run_discover(self) -> None:
         if not self._paths:
@@ -377,8 +542,17 @@ class MergeRunsDialog(wx.Dialog):
         seed = self._paths[0]
         try:
             self._disc = analysis.discover_merge(
-                MergeDiscoverOptions(seed_file=seed)
+                MergeDiscoverOptions(
+                    seed_file=seed,
+                    template_id=self._selected_template_id(),
+                    profile_id=self._selected_profile_id(),
+                    repeat_mode=self._selected_repeat_mode(),
+                    input_x_unit=self.choice_input_x_unit.GetStringSelection() or "auto",
+                )
             )
+            self._disc = self._resolve_axis_before_render(self._disc)
+            if self._disc is None:
+                return
             self._disc_original = self._disc
             self._disc_active = self._disc_original
             self._disc_cosmic_applied = None
@@ -393,9 +567,20 @@ class MergeRunsDialog(wx.Dialog):
         self.lbl_counts.SetLabel(
             f"xxxx: {len(self._disc.unique_xxxx)}, yyyy: {len(self._disc.unique_yyyy)}"
         )
+        assessment = self._disc.axis_assessment
+        if assessment is not None:
+            warnings = "; ".join(assessment.warnings)
+            suffix = f" — {warnings}" if warnings else ""
+            self.lbl_axis_assessment.SetLabel(
+                f"X axis: {assessment.minimum:.6g}…{assessment.maximum:.6g}; "
+                f"{self._disc.raw_x_unit} ({assessment.confidence}){suffix}"
+            )
         self.txt_files.SetValue("\n".join(self._disc.files))
 
-        if hasattr(self._disc, "candidate_laser_nm") and self._disc.candidate_laser_nm is not None:
+        laser_enabled = self._disc.raw_x_unit == "nm"
+        self.chk_manual_laser.Enable(laser_enabled)
+        self.txt_manual_nm.Enable(laser_enabled and self.chk_manual_laser.GetValue())
+        if laser_enabled and hasattr(self._disc, "candidate_laser_nm") and self._disc.candidate_laser_nm is not None:
             val_str = f"{self._disc.candidate_laser_nm:.4f}"
             self.txt_manual_nm.SetValue(val_str)
 
@@ -422,6 +607,13 @@ class MergeRunsDialog(wx.Dialog):
             return None
 
         manual_nm = None
+        input_unit = self.choice_input_x_unit.GetStringSelection() or "auto"
+        if input_unit == "auto":
+            self._show_message("Confirm the raw input x unit before creating a Raman-shift preview.")
+            return None
+        if self.chk_manual_laser.GetValue() and input_unit != "nm":
+            self._show_message("Laser wavelength is only applicable to wavelength (nm) input.")
+            return None
         if self.chk_manual_laser.GetValue():
             s = self.txt_manual_nm.GetValue().strip()
             if not s:
@@ -436,7 +628,6 @@ class MergeRunsDialog(wx.Dialog):
         raw_files = getattr(disc_for_opts, "raw_files", None)
         files = raw_files if raw_files else disc_for_opts.files
         seed_file = files[0] if files else self._paths[0]
-        input_unit = self.choice_input_x_unit.GetStringSelection() or "nm"
         opts = MergePreviewOptions(
             seed_file=seed_file,
             files=list(files),
@@ -456,7 +647,7 @@ class MergeRunsDialog(wx.Dialog):
         opts = self._build_preview_options()
         if opts is None:
             return
-
+        
         self.txt_dark_value.Enable(False)
 
         try:
@@ -470,20 +661,10 @@ class MergeRunsDialog(wx.Dialog):
         try:
             self._prev = analysis.preview_merge(disc_for_preview, opts, prompt=None)
         except ValueError as e:
-            if str(e) == "wavelength_nm must be > 0":
-                opts.use_raman_x = True
-                try:
-                    self._prev = analysis.preview_merge(disc_for_preview, opts, prompt=None)
-                except Exception as inner_e:
-                    self._prev = None
-                    self.txt_dark_value.Enable(True)
-                    self._show_message(f"Preview failed (after retry): {inner_e}")
-                    return
-            else:
-                self._prev = None
-                self.txt_dark_value.Enable(True)
-                self._show_message(f"Preview failed: {e}")
-                return
+            self._prev = None
+            self.txt_dark_value.Enable(True)
+            self._show_message(f"Preview failed: {e}")
+            return
         except Exception as e:
             self._prev = None
             self.txt_dark_value.Enable(True)
@@ -546,8 +727,8 @@ class MergeRunsDialog(wx.Dialog):
         if self._prev is None:
             return
 
-        new_run_id = new_experiment_id()
-        source_path = self._paths[0]
+        merged_run_id = new_run_id()
+        source_path = self._paths[0] 
 
         metadata = parse_filename(source_path)
         if self._disc is not None:
@@ -555,10 +736,26 @@ class MergeRunsDialog(wx.Dialog):
             metadata["merge_unique_xxxx"] = self._disc.unique_xxxx
             metadata["merge_unique_yyyy"] = self._disc.unique_yyyy
             metadata["merged_files"] = self._disc.files
-            if getattr(self._disc, "is_polarization_merge", False):
-                metadata["polarization_rows"] = list(self._disc.primitive_xxxx or self._disc.unique_xxxx)
+            metadata["filename_template_id"] = self._disc.template_id
+            metadata["merge_profile_id"] = self._disc.profile_id
+            metadata["repeat_mode"] = self._disc.repeat_mode
+            metadata["merge_axis_kind"] = self._disc.row_axis_kind
+            metadata["merge_axis_unit"] = self._disc.row_axis_unit
+            metadata["merge_row_labels"] = list(self._disc.row_labels)
+            metadata["captured_filename_fields"] = dict(self._disc.captured_filename_fields)
+            if self._disc.axis_assessment is not None:
+                metadata["raw_x_assessment"] = {
+                    "minimum": self._disc.axis_assessment.minimum,
+                    "maximum": self._disc.axis_assessment.maximum,
+                    "monotonic": self._disc.axis_assessment.monotonic,
+                    "allowed_units": list(self._disc.axis_assessment.allowed_units),
+                    "confidence": self._disc.axis_assessment.confidence,
+                    "warnings": list(self._disc.axis_assessment.warnings),
+                }
+            if self._disc.row_axis_kind == "polarization":
+                metadata["polarization_rows"] = list(self._disc.row_labels or self._disc.primitive_xxxx or self._disc.unique_xxxx)
                 metadata["raw_y_unit"] = "polarization"
-
+            
             # Set nickname based on sample and pol
             sample = metadata.get("sample")
             pol = metadata.get("pol")
@@ -567,16 +764,56 @@ class MergeRunsDialog(wx.Dialog):
             else:
                 metadata["nickname"] = None
 
-        metadata["raw_x_unit"] = self.choice_input_x_unit.GetStringSelection() or "nm"
+        metadata["raw_x_unit"] = getattr(self._disc, "raw_x_unit", self.choice_input_x_unit.GetStringSelection() or "nm")
+        try:
+            reload_dark_value = float(self.txt_dark_value.GetValue())
+        except ValueError:
+            reload_dark_value = 0.0
+        reload_manual_laser = None
+        if metadata["raw_x_unit"] == "nm" and self.chk_manual_laser.GetValue():
+            try:
+                reload_manual_laser = float(self.txt_manual_nm.GetValue())
+            except ValueError:
+                reload_manual_laser = None
+        cosmic_was_applied = self._disc_cosmic_applied is not None
+        metadata["merge_reload_options"] = {
+            "supported": not cosmic_was_applied,
+            "reason": (
+                "the interactive cosmic-removal selection was not stored as a reproducible recipe"
+                if cosmic_was_applied
+                else ""
+            ),
+            "input_unit": metadata["raw_x_unit"],
+            "filename_template": self._disc.template_id,
+            "merge_profile": self._disc.profile_id,
+            "repeat_mode": self._disc.repeat_mode,
+            "manual_laser_nm": reload_manual_laser,
+            "dark_value": reload_dark_value,
+            "cosmic_policy": "off",
+            "cosmic_indices": [],
+        }
+        if metadata["raw_x_unit"] == "nm" and self._prev.laser_nm is not None:
+            metadata["raman_laser_nm"] = float(self._prev.laser_nm)
+            metadata["raman_laser_source"] = str(self._prev.laser_source or "detected")
+            metadata["raman_axis_conversion"] = {
+                "input_unit": "nm",
+                "laser_nm": float(self._prev.laser_nm),
+                "laser_source": str(self._prev.laser_source or "detected"),
+            }
 
-        intensity_unit = "au"
+        intensity_unit = "au" 
         if self._disc and self._disc.raw_intensity_matrix is not None:
             intensity_unit = infer_intensity_unit(self._disc.raw_intensity_matrix)
 
         new_run = Run(
-            id=new_run_id,
+            id=merged_run_id,
             source_path=source_path,
             source_mtime=None,
+            wl_nm=(
+                np.asarray(self._disc.raw_x, dtype=float).copy()
+                if metadata["raw_x_unit"] == "nm" and self._disc is not None and self._disc.raw_x is not None
+                else None
+            ),
             shift_cm1=self._prev.raman_shift_cm1,
             energy_eV=self._prev.energy_ev,
             intensity=None,
@@ -585,6 +822,7 @@ class MergeRunsDialog(wx.Dialog):
             intensity_unit=intensity_unit,
             angle_unit="deg",
             metadata=metadata,
+            run_type=RunType.RUN_2D,
             raw_table=None,
         )
 
@@ -615,13 +853,11 @@ class MergeRunsDialog(wx.Dialog):
 
     def _row_label_for_index(self, row_index: int) -> str:
         disc = self._disc_active if self._disc_active is not None else self._disc
-        labels = []
-        if disc is not None:
-            labels = list(getattr(disc, "primitive_xxxx", None) or getattr(disc, "unique_xxxx", None) or [])
+        labels = list(getattr(disc, "row_labels", []) or []) if disc is not None else []
         if 0 <= row_index < len(labels):
             return str(labels[row_index])
         try:
-            return f"{float(self._y[row_index]):.1f} deg"
+            return self._row_axis_for_disc(disc).format_value(float(self._y[row_index]), row_index)
         except Exception:
             return f"row {row_index}"
 
@@ -633,11 +869,11 @@ class MergeRunsDialog(wx.Dialog):
 
         # Fully reset layout to prevent colorbar shrinking issues
         self._init_plot_layout()
-
+        
         self._secax_ev = None
         self._laser_vline = None
 
-        self._x = np.asarray(disc.wavelength_nm, dtype=float)
+        self._x = np.asarray(disc.raw_x if disc.raw_x is not None else disc.wavelength_nm, dtype=float)
         self._y = np.asarray(disc.angle_values, dtype=float)
         self._I = np.asarray(disc.intensity_matrix, dtype=float)
         self._orient_x_for_display()
@@ -661,21 +897,23 @@ class MergeRunsDialog(wx.Dialog):
         self._sel_col = int(np.clip(self._sel_col, 0, nx - 1))
 
         # Render Plot A (2D Map)
-        input_unit = self.choice_input_x_unit.GetStringSelection() or "nm"
-        xlabel = "Wavelength (nm)" if input_unit == "nm" else spectral_axis_label(input_unit, latex=False)
+        input_unit = disc.raw_x_unit
+        row_axis = self._row_axis_for_disc(disc)
+        xlabel = self._axis_label(input_unit)
         self.plotterA.render(
             self._x, self._y, self._I,
             title=disc.title,
             xlabel=xlabel,
-            ylabel="Angle (deg)"
+            ylabel=row_axis.label,
+            row_axis=row_axis,
         )
-
+        
         self._original_raw_xlim = self.plotterA.ax.get_xlim()
         self._original_raw_ylim = self.plotterA.ax.get_ylim()
 
         self._apply_contrast_from_sliders()
 
-        if self.chk_manual_laser.GetValue():
+        if input_unit == "nm" and self.chk_manual_laser.GetValue():
             self._update_manual_laser_line()
 
         # Update Highlight & Slice
@@ -715,9 +953,10 @@ class MergeRunsDialog(wx.Dialog):
             self._x, self._y, self._I,
             title=self._prev.title,
             xlabel=spectral_axis_label(self._display_unit),
-            ylabel="Angle (deg)",
+            ylabel=self._row_axis_for_disc(self._disc_active or self._disc).label,
             x_unit_conversion=x_unit_conv,
             secondary_x_label=spectral_axis_label(alternate_spectral_unit(self._display_unit)),
+            row_axis=self._row_axis_for_disc(self._disc_active or self._disc),
         )
 
         self._original_preview_xlim = self.plotterA.ax.get_xlim()
@@ -740,11 +979,13 @@ class MergeRunsDialog(wx.Dialog):
             if self._original_preview_xlim is not None:
                 self.plotterA.ax.set_xlim(self._original_preview_xlim)
                 self.plotterA.ax.set_ylim(self._original_preview_ylim)
+                self.plotterC.ax.set_xlim(self._original_preview_xlim)
                 self.canvas.draw_idle()
         else:
             if self._original_raw_xlim is not None:
                 self.plotterA.ax.set_xlim(self._original_raw_xlim)
                 self.plotterA.ax.set_ylim(self._original_raw_ylim)
+                self.plotterC.ax.set_xlim(self._original_raw_xlim)
                 self.canvas.draw_idle()
 
     def _show_message(self, msg: str) -> None:
@@ -765,17 +1006,18 @@ class MergeRunsDialog(wx.Dialog):
     def _update_highlight_and_slice(self) -> None:
         if self._I is None or self._x is None:
             return
-
+        
         # 1. Update Highlight on Plot A
         x_sel, y_sel = self.plotterA.get_coords_from_index(self._sel_col, self._sel_row)
         self.plotterA.set_highlight(x_sel, y_sel)
 
         # 2. Update Plot C (Spectral Slice)
         r = int(np.clip(self._sel_row, 0, self._I.shape[0] - 1))
-
+        
         slice_title = "Spectral slice"
-        input_unit = self.choice_input_x_unit.GetStringSelection() or "nm"
-        slice_xlabel = "Wavelength (nm)" if input_unit == "nm" else spectral_axis_label(input_unit, latex=False)
+        active_disc = self._disc_active if self._disc_active is not None else self._disc
+        input_unit = getattr(active_disc, "raw_x_unit", self.choice_input_x_unit.GetStringSelection() or "nm")
+        slice_xlabel = self._axis_label(input_unit)
         if self._in_preview_mode:
             slice_title = "Spectral slice (selected angle row)"
             slice_xlabel = spectral_axis_label(getattr(self, "_display_unit", "meV"))
@@ -804,16 +1046,18 @@ class MergeRunsDialog(wx.Dialog):
     def _on_canvas_click(self, event) -> None:
         if event.inaxes is not self.ax_top:
             return
-
+        
         indices = self.plotterA.get_index_at(event.xdata, event.ydata)
         if not indices:
             return
-
+        
         self._sel_col, self._sel_row = indices
         self._update_highlight_and_slice()
 
     def _on_toggle_manual(self, event) -> None:
-        enabled = bool(self.chk_manual_laser.GetValue())
+        enabled = bool(self.chk_manual_laser.GetValue()) and (self.choice_input_x_unit.GetStringSelection() == "nm")
+        if not enabled:
+            self.chk_manual_laser.SetValue(False)
         self.txt_manual_nm.Enable(enabled)
         if not enabled:
             if self._laser_vline is not None:
@@ -834,7 +1078,7 @@ class MergeRunsDialog(wx.Dialog):
             return
         if self.plotterA is None or self.plotterA.mesh is None:
             return
-
+            
         s = self.txt_manual_nm.GetValue().strip()
         if not s:
             if self._laser_vline: self._laser_vline.set_visible(False)
@@ -884,26 +1128,8 @@ class MergeRunsDialog(wx.Dialog):
             dark_value = 0
         cosmic_settings = self._effective_cosmic_detection()
 
-        cosmic_options = MergeCosmicOptions(
-            files=disc.files,
-            pattern_hint=disc.pattern_hint,
-            unique_xxxx=disc.unique_xxxx,
-            unique_yyyy=disc.unique_yyyy,
-            wavelength_nm=disc.wavelength_nm,
-            angle_values=disc.angle_values,
-            intensity_matrix=disc.intensity_matrix,
-            title=disc.title,
-            candidate_laser_nm=disc.candidate_laser_nm,
-            raw_files=disc.raw_files,
-            raw_xxxx=disc.raw_xxxx,
-            raw_yyyy=disc.raw_yyyy,
-            raw_angle_values=disc.raw_angle_values,
-            raw_intensity_matrix=disc.raw_intensity_matrix,
-            raw_rows_by_xxxx=disc.raw_rows_by_xxxx,
-            primitive_xxxx=disc.primitive_xxxx,
-            primitive_matrix=disc.primitive_matrix,
-            cosmic_matrix=disc.cosmic_matrix,
-            is_polarization_merge=disc.is_polarization_merge,
+        cosmic_options = analysis.cosmic_options_from_discover(
+            disc,
             dark_value=dark_value,
             intensity_thresh=cosmic_settings["height"],
             comparison_factor=cosmic_settings["ratio"],
@@ -914,15 +1140,15 @@ class MergeRunsDialog(wx.Dialog):
         except Exception as e:
             self._show_message(f"Cosmic discover failed: {e}")
             return
-
+        
         # Check for shape mismatch
         ny, nx = cosmic_result.intensity_matrix.shape
         ly = len(cosmic_result.angle_values)
-        lx = len(cosmic_result.wavelength_nm)
+        lx = len(cosmic_result.raw_x if cosmic_result.raw_x is not None else cosmic_result.wavelength_nm)
         if ny != ly or nx != lx:
             self._show_message(f"Shape Mismatch: Data ({ny}, {nx}) vs Axes")
             return
-
+        
         if not cosmic_result.peaks:
             self._show_message(f"No cosmic peaks detected.\nEvidence: {cosmic_result.evidence}")
             return

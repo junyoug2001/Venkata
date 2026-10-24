@@ -2,14 +2,21 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.colors import LogNorm, Normalize
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 from matplotlib.collections import QuadMesh
 from typing import Optional, Tuple, Callable, List, Dict, Any, Union
 import ast
+from row_axis import RowAxisSpec
 
 # Constants needed for secondary axis conversions
 EV_PER_CM1 = 1.0 / 8065.544
+
+
+def normalize_color_scale(value: Any) -> str:
+    """Return the supported map color-normalization name."""
+    return "log" if str(value or "").strip().lower() in {"log", "logarithmic"} else "linear"
 
 
 def centers_to_edges(x: np.ndarray) -> np.ndarray:
@@ -61,7 +68,7 @@ class BasePlotter:
 class RamanPlotter2d(BasePlotter):
     """
     Plot A: 2D map (e.g. Angle vs Raman Shift).
-
+    
     Features:
     - pcolormesh rendering with non-uniform grid support.
     - Contrast adjustment (vmin/vmax perceniles).
@@ -74,42 +81,46 @@ class RamanPlotter2d(BasePlotter):
         self.mesh: Optional[QuadMesh] = None
         self.cbar = None
         self.secax = None
-
+        
         # Data Cache
         self._x_centers = None
         self._y_centers = None
         self._x_edges = None
         self._y_edges = None
         self._data = None # 2D array
-
+        self._color_scale = "linear"
+        
         # Highlight Artists
         self._vline = None
         self._hline = None
         self._points_scatter = None
-
+        
         # Config
         self._highlight_mode = "click" # "none", "click"
         self._x_unit_conversion = None # (func_forward, func_inverse) for secondary axis
 
     def render(
-        self,
-        x: np.ndarray,
-        y: np.ndarray,
-        data: np.ndarray,
+        self, 
+        x: np.ndarray, 
+        y: np.ndarray, 
+        data: np.ndarray, 
         title: str = "",
         xlabel: str = "Raman shift (cm$^{-1}$)",
         ylabel: str = "Angle (deg)",
         cmap: str = "OrRd",
         x_unit_conversion: Optional[Tuple[Callable, Callable]] = None,
         secondary_x_label: str = "Energy shift (meV)",
+        row_axis: Optional[RowAxisSpec] = None,
+        color_scale: str = "linear",
     ):
         self.clear()
-
+        
         # 1. Prepare Data
         self._x_centers = np.asarray(x, dtype=float)
         self._y_centers = np.asarray(y, dtype=float)
         self._data = np.asarray(data, dtype=float)
-
+        self._color_scale = normalize_color_scale(color_scale)
+        
         if self._data.ndim < 2:
             self.ax.text(0.5, 0.5, "Data is not 2D", ha='center', va='center', transform=self.ax.transAxes)
             return
@@ -122,7 +133,7 @@ class RamanPlotter2d(BasePlotter):
                 self._data = self._data.T
             else:
                 # Fallback or error
-                self.ax.text(0.5, 0.5, f"Shape Mismatch: Data {self._data.shape} vs Axes",
+                self.ax.text(0.5, 0.5, f"Shape Mismatch: Data {self._data.shape} vs Axes", 
                              ha='center', va='center', transform=self.ax.transAxes)
                 return
 
@@ -136,21 +147,25 @@ class RamanPlotter2d(BasePlotter):
             self._y_edges,
             self._data,
             shading="auto",
-            cmap=cmap
+            cmap=cmap,
+            norm=self._normalization_for_limits(),
         )
-
+        
         self.ax.set_xlim(float(self._x_edges[0]), float(self._x_edges[-1]))
         self.ax.set_ylim(float(self._y_edges[0]), float(self._y_edges[-1]))
-
+        
         # 4. Labels & Title
+        row_axis = row_axis or RowAxisSpec()
         self.set_title(title)
-        self.set_labels(xlabel, ylabel)
-
+        self.set_labels(xlabel, row_axis.label or ylabel)
+        self._configure_row_axis(row_axis)
+        
         # 5. Colorbar
         if self.cbar:
             try: self.cbar.remove()
             except: pass
-        self.cbar = self.ax.figure.colorbar(self.mesh, ax=self.ax, label="Intensity")
+        self.cbar = self.ax.figure.colorbar(self.mesh, ax=self.ax)
+        self._update_colorbar_label()
 
         # 6. Secondary Axis
         if x_unit_conversion:
@@ -164,28 +179,109 @@ class RamanPlotter2d(BasePlotter):
 
         self.draw()
 
+    def _configure_row_axis(self, row_axis: RowAxisSpec) -> None:
+        """Apply either fixed categorical labels or the angular 90° locator."""
+        if row_axis.is_categorical:
+            self.ax.set_yticks(np.asarray(row_axis.tick_positions, dtype=float))
+            self.ax.set_yticklabels(list(row_axis.tick_labels or ()))
+            return
+        if row_axis.major_step and row_axis.major_step > 0:
+            self.ax.yaxis.set_major_locator(mticker.MultipleLocator(float(row_axis.major_step)))
+
+    def full_view_limits(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Return the rendered pixel-edge limits in their original direction."""
+        if self._x_edges is None or self._y_edges is None:
+            return self.ax.get_xlim(), self.ax.get_ylim()
+        return (
+            (float(self._x_edges[0]), float(self._x_edges[-1])),
+            (float(self._y_edges[0]), float(self._y_edges[-1])),
+        )
+
     def set_cmap(self, cmap_name: str):
         """Update the colormap of the 2D mesh."""
         if self.mesh:
             self.mesh.set_cmap(cmap_name)
             self.draw()
 
+    def _finite_data(self, *, positive_only: Optional[bool] = None) -> np.ndarray:
+        if self._data is None:
+            return np.asarray([], dtype=float)
+        values = np.asarray(self._data, dtype=float)
+        values = values[np.isfinite(values)]
+        if positive_only is None:
+            positive_only = self._color_scale == "log"
+        if positive_only:
+            values = values[values > 0.0]
+        return values
+
+    def _safe_color_limits(self, vmin=None, vmax=None) -> Tuple[float, float]:
+        values = self._finite_data(positive_only=self._color_scale == "log")
+        if values.size:
+            data_min = float(np.min(values))
+            data_max = float(np.max(values))
+        elif self._color_scale == "log":
+            data_min, data_max = 1.0, 10.0
+        else:
+            data_min, data_max = 0.0, 1.0
+
+        try:
+            lo = float(vmin) if vmin is not None and np.isfinite(vmin) else data_min
+        except (TypeError, ValueError):
+            lo = data_min
+        try:
+            hi = float(vmax) if vmax is not None and np.isfinite(vmax) else data_max
+        except (TypeError, ValueError):
+            hi = data_max
+
+        if self._color_scale == "log":
+            if lo <= 0.0:
+                lo = data_min
+            if hi <= lo:
+                hi = data_max if data_max > lo else lo * 10.0
+        elif hi <= lo:
+            hi = lo + max(1e-9, abs(lo) * 1e-12)
+        return lo, hi
+
+    def _normalization_for_limits(self, vmin=None, vmax=None):
+        lo, hi = self._safe_color_limits(vmin, vmax)
+        if self._color_scale == "log":
+            return LogNorm(vmin=lo, vmax=hi, clip=False)
+        return Normalize(vmin=lo, vmax=hi, clip=False)
+
+    def _update_colorbar_label(self) -> None:
+        if self.cbar is not None:
+            label = "Intensity (log scale)" if self._color_scale == "log" else "Intensity"
+            self.cbar.set_label(label)
+
+    def set_color_scale(self, color_scale: str) -> None:
+        """Switch between linear and positive-valued logarithmic color mapping."""
+        self._color_scale = normalize_color_scale(color_scale)
+        if self.mesh is None:
+            return
+        current_limits = self.mesh.get_clim()
+        self.mesh.set_norm(self._normalization_for_limits(*current_limits))
+        if self.cbar is not None:
+            self.cbar.update_normal(self.mesh)
+        self._update_colorbar_label()
+        self.draw()
+
+    def get_color_scale(self) -> str:
+        return self._color_scale
+
     def set_contrast(self, vmin_p: float, vmax_p: float):
         """Set contrast based on percentiles [0, 100]."""
         if self.mesh is None or self._data is None:
             return
-
+        
         # Flatten and remove NaNs/Infs for percentile calc
-        valid_data = self._data[np.isfinite(self._data)]
+        valid_data = self._finite_data()
         if valid_data.size == 0:
             return
 
         vmin_val = np.percentile(valid_data, vmin_p)
         vmax_val = np.percentile(valid_data, vmax_p)
-
-        if vmax_val <= vmin_val:
-            vmax_val = vmin_val + 1e-9
-
+        
+        vmin_val, vmax_val = self._safe_color_limits(vmin_val, vmax_val)
         self.mesh.set_clim(vmin_val, vmax_val)
         self.draw()
 
@@ -193,7 +289,7 @@ class RamanPlotter2d(BasePlotter):
         """Calculate intensity value at a specific percentile of the current data."""
         if self._data is None:
             return 0.0
-        valid_data = self._data[np.isfinite(self._data)]
+        valid_data = self._finite_data()
         if valid_data.size == 0:
             return 0.0
         return float(np.percentile(valid_data, p))
@@ -202,8 +298,7 @@ class RamanPlotter2d(BasePlotter):
         """Set absolute color limits for the 2D mesh."""
         if self.mesh is None:
             return
-        if vmax <= vmin:
-            vmax = vmin + 1e-9
+        vmin, vmax = self._safe_color_limits(vmin, vmax)
         self.mesh.set_clim(vmin, vmax)
         self.draw()
 
@@ -211,26 +306,28 @@ class RamanPlotter2d(BasePlotter):
         """Get the min/max intensity values within the currently visible axis limits."""
         if self._data is None or self._x_centers is None or self._y_centers is None:
             return 0.0, 1.0
-
+        
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
-
+        
         # Use a small tolerance or clip to avoid empty selections due to floating point
         ix_min = np.searchsorted(self._x_centers, min(xlim), side='left')
         ix_max = np.searchsorted(self._x_centers, max(xlim), side='right')
         iy_min = np.searchsorted(self._y_centers, min(ylim), side='left')
         iy_max = np.searchsorted(self._y_centers, max(ylim), side='right')
-
+        
         # Slicing
         roi_data = self._data[iy_min:iy_max, ix_min:ix_max]
-
+        
         if roi_data.size == 0:
             return 0.0, 1.0
-
+            
         valid = roi_data[np.isfinite(roi_data)]
+        if self._color_scale == "log":
+            valid = valid[valid > 0.0]
         if valid.size == 0:
             return 0.0, 1.0
-
+            
         return float(np.min(valid)), float(np.max(valid))
 
     def set_points(self, x_vals: List[float], y_vals: List[float], color="cyan", size=30):
@@ -239,16 +336,16 @@ class RamanPlotter2d(BasePlotter):
             try: self._points_scatter.remove()
             except: pass
             self._points_scatter = None
-
+        
         if x_vals and y_vals:
             self._points_scatter = self.ax.scatter(
-                x_vals, y_vals,
-                c=color, s=size,
-                marker='s', alpha=0.8,
+                x_vals, y_vals, 
+                c=color, s=size, 
+                marker='s', alpha=0.8, 
                 edgecolors='white', linewidths=0.5,
                 zorder=5 # ensure markers are above the mesh
             )
-
+        
         self.draw()
 
     def set_highlight(self, x_val: float, y_val: float, visible: bool = True):
@@ -274,7 +371,7 @@ class RamanPlotter2d(BasePlotter):
         else:
             self._hline.set_ydata([y_val, y_val])
             self._hline.set_visible(True)
-
+            
         self.draw()
 
     def set_highlight_mode(self, mode: str):
@@ -287,20 +384,21 @@ class RamanPlotter2d(BasePlotter):
         Convert click coordinates to array indices.
         Returns (col_index, row_index).
         """
-        if self._x_edges is None or self._y_edges is None:
+        return self.get_nearest_index(x, y)
+
+    def get_nearest_index(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        """Return the nearest finite pixel center for physical coordinates."""
+        if self._x_centers is None or self._y_centers is None:
+            return None
+        if x is None or y is None or not np.isfinite(x) or not np.isfinite(y):
             return None
 
-        # searchsorted returns insertion index.
-        # For edges e[i] <= x < e[i+1], searchsorted gives i+1.
-        ix = int(np.searchsorted(self._x_edges, x, side="right") - 1)
-        iy = int(np.searchsorted(self._y_edges, y, side="right") - 1)
-
-        # Clip to valid range
-        nx = self._x_centers.size
-        ny = self._y_centers.size
-        ix = max(0, min(ix, nx - 1))
-        iy = max(0, min(iy, ny - 1))
-
+        finite_x = np.flatnonzero(np.isfinite(self._x_centers))
+        finite_y = np.flatnonzero(np.isfinite(self._y_centers))
+        if finite_x.size == 0 or finite_y.size == 0:
+            return None
+        ix = int(finite_x[np.argmin(np.abs(self._x_centers[finite_x] - float(x)))])
+        iy = int(finite_y[np.argmin(np.abs(self._y_centers[finite_y] - float(y)))])
         return ix, iy
 
     def get_coords_from_index(self, ix: int, iy: int) -> Tuple[float, float]:
@@ -313,7 +411,7 @@ class RamanPlotter2d(BasePlotter):
 class AngularPlotter(BasePlotter):
     """
     Plot B: Angular Slice (Intensity vs Angle).
-
+    
     Features:
     - Switchable Cartesian vs Polar projection.
     - Highlight selected angle.
@@ -327,21 +425,29 @@ class AngularPlotter(BasePlotter):
         self._vline_polar = None # Highlight for Polar
         self._traces: Dict[str, Any] = {} # label -> line artist
 
-    def render(self, angles: np.ndarray, intensity: np.ndarray, mode: str = "cartesian", title: str = "", style: Optional[Any] = None):
+    def render(
+        self,
+        angles: np.ndarray,
+        intensity: np.ndarray,
+        mode: str = "cartesian",
+        title: str = "",
+        style: Optional[Any] = None,
+        xlabel: str = "Angle (deg)",
+    ):
         # Note: Switching projections usually requires clearing/recreating the Axes in Matplotlib.
         # This class assumes 'ax' has the correct projection already, or handles rendering logic
-        # that fits the current ax projection. The GUI layer is responsible for recreating ax if
+        # that fits the current ax projection. The GUI layer is responsible for recreating ax if 
         # projection changes from rectilinear to polar.
-
+        
         self.clear()
         self._traces = {}
         self._mode = mode
-
+        
         if self._mode == "polar":
             self._render_polar(angles, intensity, title, style)
         else:
-            self._render_cartesian(angles, intensity, title, style)
-
+            self._render_cartesian(angles, intensity, title, style, xlabel=xlabel)
+        
         self.draw()
 
     def _safe_ls(self, ls):
@@ -352,35 +458,42 @@ class AngularPlotter(BasePlotter):
                 pass
         return ls
 
-    def _render_cartesian(self, angles, intensity, title, style=None):
+    def _render_cartesian(self, angles, intensity, title, style=None, xlabel: str = "Angle (deg)"):
         color = style.color if style else "black"
         lw = style.linewidth if style else 1.2
         ls = self._safe_ls(style.linestyle) if style else "-"
         mk = style.marker if (style and style.marker) else None
         ms = style.markersize if style else 5
         visible = style.visible if style else True
-
+        
         self._line, = self.ax.plot(angles, intensity, color=color, linewidth=lw, linestyle=ls, marker=mk, markersize=ms)
         self._line.set_visible(visible)
-
+        
         self.set_title(title)
-        self.set_labels("Angle (deg)", "Intensity (a.u.)")
-        self._vline = self.ax.axvline(0, color="red", alpha=0.3, linewidth=1.0, visible=False)
+        self.set_labels(xlabel, "Intensity (a.u.)")
+        # An invisible axvline still participates in Matplotlib autoscaling.
+        # Starting it at zero made wavelength slices around 500 nm appear as a
+        # narrow trace at the far right of a mostly empty plot.  Anchor it to a
+        # finite data coordinate instead.
+        x_arr = np.asarray(angles, dtype=float)
+        finite_x = x_arr[np.isfinite(x_arr)]
+        highlight_x = float(finite_x[0]) if finite_x.size else 0.0
+        self._vline = self.ax.axvline(highlight_x, color="red", alpha=0.3, linewidth=1.0, visible=False)
 
     def _render_polar(self, angles, intensity, title, style=None):
         theta = np.deg2rad(angles)
         self.ax.set_theta_zero_location("N")
         self.ax.set_theta_direction(-1) # Clockwise
-
+        
         color = style.color if style else "black"
         lw = style.linewidth if style else 1.2
         ls_raw = style.linestyle if style else "None"
         ls = self._safe_ls(ls_raw)
         mk = style.marker if (style and style.marker) else None
         ms = style.markersize if style else 5
-
+        
         visible = style.visible if style else True
-
+        
         # Default to dots if no linestyle or marker provided
         if not mk and (isinstance(ls, str) and ls == "None"):
             mk = "o"
@@ -388,14 +501,14 @@ class AngularPlotter(BasePlotter):
 
         self._line, = self.ax.plot(theta, intensity, marker=mk, ms=ms, color=color, linestyle=ls, linewidth=lw)
         self._line.set_visible(visible)
-
+        
         # Adaptive R-limits
         valid = intensity[np.isfinite(intensity)]
         if valid.size > 0:
             rmax = valid.max()
             if rmax > 0:
                 self.ax.set_rlim(0, rmax * 1.05)
-
+                
         self.set_title(title)
         # Create persistent highlight line for polar
         self._vline_polar = self.ax.axvline(0, color="red", alpha=0.3, linewidth=1.0, visible=False)
@@ -407,15 +520,15 @@ class AngularPlotter(BasePlotter):
         if bbox.height > 10:
             target = max(2, min(4, int(bbox.height / 120)))
             self.ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=target))
-
-    def add_trace(self, angles: np.ndarray, intensity: np.ndarray, color="blue", style="-", alpha=1.0, label=None, marker=None, markersize=5):
+    
+    def add_trace(self, angles: np.ndarray, intensity: np.ndarray, color="blue", style="-", alpha=1.0, label=None, marker=None, markersize=5, linewidth=1.0):
         style_safe = self._safe_ls(style)
         if self._mode == "polar":
             theta = np.deg2rad(angles)
-            line, = self.ax.plot(theta, intensity, color=color, linestyle=style_safe, alpha=alpha, label=label, marker=marker, markersize=markersize)
+            line, = self.ax.plot(theta, intensity, color=color, linestyle=style_safe, linewidth=linewidth, alpha=alpha, label=label, marker=marker, markersize=markersize)
         else:
-            line, = self.ax.plot(angles, intensity, color=color, linestyle=style_safe, alpha=alpha, label=label, marker=marker, markersize=markersize)
-
+            line, = self.ax.plot(angles, intensity, color=color, linestyle=style_safe, linewidth=linewidth, alpha=alpha, label=label, marker=marker, markersize=markersize)
+        
         key = label if label else f"trace_{len(self._traces)}"
         self._traces[key] = line
         self.draw()
@@ -436,14 +549,14 @@ class AngularPlotter(BasePlotter):
             if self._vline:
                 self._vline.set_xdata([angle_deg, angle_deg])
                 self._vline.set_visible(True)
-
+        
         self.draw()
 
 
 class SlicePlotter(BasePlotter):
     """
     Plot C: Spectral Slice (Intensity vs Shift/Wavelength).
-
+    
     Features:
     - Cartesian line plot.
     - Multiple traces (e.g. Raw + Processed).
@@ -465,9 +578,9 @@ class SlicePlotter(BasePlotter):
         return ls
 
     def render(
-        self,
-        x: np.ndarray,
-        intensity: np.ndarray,
+        self, 
+        x: np.ndarray, 
+        intensity: np.ndarray, 
         title: str = "",
         xlabel: str = "Raman shift (cm$^{-1}$)",
         ylabel: str = "Intensity (a.u.)",
@@ -477,21 +590,27 @@ class SlicePlotter(BasePlotter):
     ):
         self.clear()
         self._traces = {} # Reset traces
-
+        
         color = style.color if style else "black"
         lw = style.linewidth if style else 1.2
         ls = self._safe_ls(style.linestyle) if style else "-"
         mk = style.marker if (style and style.marker) else None
         ms = style.markersize if style else 5
-
+        
         # Main trace
         line, = self.ax.plot(x, intensity, color=color, linewidth=lw, linestyle=ls, label="Signal", marker=mk, markersize=ms)
         self._traces["main"] = line
-
+        
         self.set_title(title)
         self.set_labels(xlabel, ylabel)
-
-        self._vline = self.ax.axvline(0, color="red", alpha=0.3, linewidth=1.0, visible=False)
+        
+        # Invisible helper artists still participate in Matplotlib autoscale.
+        # Anchor this one to real data so wavelength slices (e.g. 512–529 nm)
+        # never gain an artificial zero endpoint.
+        x_arr = np.asarray(x, dtype=float)
+        finite_x = x_arr[np.isfinite(x_arr)]
+        highlight_x = float(finite_x[0]) if finite_x.size else 0.0
+        self._vline = self.ax.axvline(highlight_x, color="red", alpha=0.3, linewidth=1.0, visible=False)
 
         if x_unit_conversion:
             self._secax = self.ax.secondary_xaxis("top", functions=x_unit_conversion)
@@ -499,10 +618,10 @@ class SlicePlotter(BasePlotter):
 
         self.draw()
 
-    def add_trace(self, x: np.ndarray, y: np.ndarray, color="blue", style="-", alpha=1.0, label=None, marker=None, markersize=5):
+    def add_trace(self, x: np.ndarray, y: np.ndarray, color="blue", style="-", alpha=1.0, label=None, marker=None, markersize=5, linewidth=1.0):
         """Add an additional trace (e.g. raw data, fit)."""
         style_safe = self._safe_ls(style)
-        line, = self.ax.plot(x, y, color=color, linestyle=style_safe, alpha=alpha, label=label, marker=marker, markersize=markersize)
+        line, = self.ax.plot(x, y, color=color, linestyle=style_safe, linewidth=linewidth, alpha=alpha, label=label, marker=marker, markersize=markersize)
         key = label if label else f"trace_{len(self._traces)}"
         self._traces[key] = line
         self.draw()
@@ -510,11 +629,10 @@ class SlicePlotter(BasePlotter):
     def set_highlight(self, x_val: float, visible: bool = True):
         if not self._vline:
             return
-
+            
         if visible:
             self._vline.set_xdata([x_val, x_val])
             self._vline.set_visible(True)
         else:
             self._vline.set_visible(False)
         self.draw()
-

@@ -37,6 +37,12 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Uni
 
 import numpy as np
 import pandas as pd
+from filename_templates import (
+    MergeRowPlan,
+    TemplateValidationError,
+    discover_family,
+    filename_metadata,
+)
 
 
 # ============================================================================
@@ -50,6 +56,10 @@ class MergeDiscoverOptions:
 
     seed_file: str
     assume_xgrid_consistent: bool = True
+    template_id: str = "auto"
+    profile_id: str = "auto"
+    repeat_mode: str = "average"
+    input_x_unit: str = "auto"
 
 
 @dataclass
@@ -74,6 +84,22 @@ class MergePreviewOptions:
     require_laser_nm: bool = False
 
 
+@dataclass(frozen=True)
+class MergeAxisAssessment:
+    """Pre-render validation and unit evidence for a raw merge x axis."""
+
+    minimum: float
+    maximum: float
+    monotonic: str
+    allowed_units: Tuple[str, ...]
+    recommended_unit: Optional[str]
+    confidence: str
+    warnings: Tuple[str, ...] = ()
+    header_hint: Optional[str] = None
+    template_hint: Optional[str] = None
+    valid: bool = True
+
+
 # ============================================================================
 # Cosmic-ray GUI Data Contracts
 # ============================================================================
@@ -95,6 +121,11 @@ class CosmicPeak:
     yyyy: Optional[str] = None
 
     angle_deg: Optional[float] = None
+    center_x: float = float("nan")
+    fwhm_x: float = float("nan")
+    x_unit: str = "nm"
+    # Legacy names retained for existing callers.  New logic uses center_x
+    # and fwhm_x because cosmic review can operate on Raman axes directly.
     center_wavelength_nm: float = float("nan")
     intensity: float = float("nan")
     fwhm_nm: float = float("nan")
@@ -117,7 +148,7 @@ class MergeDiscoverResult:
 
     title: str = "Preview (raw, wavelength axis)"
     candidate_laser_nm: Optional[float] = None
-
+    
     # Store raw data for cosmic ray detection etc.
     raw_files: List[str] = field(default_factory=list, repr=False)
     raw_xxxx: List[Optional[str]] = field(default_factory=list, repr=False) # xxxx from original files
@@ -130,8 +161,21 @@ class MergeDiscoverResult:
     primitive_matrix: Optional[np.ndarray] = field(default=None)  # shape (n_xxxx, nx)
 
     cosmic_matrix: Optional[np.ndarray] = field(default=None) # Mask applied to original raw_intensity_matrix
-
+    
     is_polarization_merge: bool = False # New flag to indicate a polarization merge
+
+    # Neutral raw-axis and template metadata.  wavelength_nm remains an alias
+    # for compatibility with older scripts while these fields drive new code.
+    raw_x: Optional[np.ndarray] = field(default=None, repr=False)
+    raw_x_unit: str = "auto"
+    axis_assessment: Optional[MergeAxisAssessment] = field(default=None, repr=False)
+    template_id: str = "auto"
+    profile_id: str = "auto"
+    repeat_mode: str = "average"
+    row_axis_kind: str = "angle"
+    row_axis_unit: str = "deg"
+    row_labels: List[str] = field(default_factory=list)
+    captured_filename_fields: Dict[str, object] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -144,6 +188,8 @@ class MergePreviewResult:
     intensity_matrix: np.ndarray  # shape (ny, nx)
 
     # cosmic_summary is removed, as this function no longer handles cosmic correction.
+    laser_nm: Optional[float] = None
+    laser_source: Optional[str] = None
     title: str = "Preview (corrected, Raman shift axis)"
 
 @dataclass
@@ -157,6 +203,23 @@ class MergeCosmicOptions(MergeDiscoverResult):
 class MergeCosmicResult(MergeCosmicOptions):
     peaks: List[CosmicPeak] = field(default_factory=list)
     evidence: Dict[str, object] = field(default_factory=dict)
+
+
+def cosmic_options_from_discover(
+    discover: MergeDiscoverResult,
+    **cosmic_options: object,
+) -> MergeCosmicOptions:
+    """Copy every discovery field into the cosmic-review contract.
+
+    Keeping this conversion in one place prevents new axis/template metadata
+    from being lost only in the cosmic-removal path.
+    """
+    payload = {
+        name: getattr(discover, name)
+        for name in MergeDiscoverResult.__dataclass_fields__
+    }
+    payload.update(cosmic_options)
+    return MergeCosmicOptions(**payload)
 
 
 # ============================================================================
@@ -268,7 +331,7 @@ def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], Lis
 
     seed_xxxx, seed_yyyy, is_pol = _parse_xxxx_yyyy_from_path(base)
 
-
+    
 
     if seed_xxxx is None: # Not a parsable file
 
@@ -278,7 +341,7 @@ def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], Lis
 
     cands = []
 
-
+    
 
     # Find a common prefix/pattern based on the seed file type
 
@@ -288,7 +351,7 @@ def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], Lis
 
         if not m_seed: return [seed_file], base, [], [], False
 
-
+        
 
         seed_prefix = m_seed.group("prefix")
         seed_family_prefix = polarization_family_prefix(seed_prefix)
@@ -299,7 +362,7 @@ def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], Lis
 
         pattern_hint = f"*_ {seed_family_prefix}_{{pol_type}}{seed_middle}_{{yyyy}}{seed_ext}".replace("*_ ", "*_")
 
-
+        
 
         for fn in os.listdir(d):
 
@@ -345,7 +408,7 @@ def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], Lis
 
         seed_ext = m_seed.group("ext")
 
-
+        
 
         # Check both one and two-index files
 
@@ -367,7 +430,7 @@ def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], Lis
 
                  cands.append((os.path.join(d, fn), m1.group("xxxx"), None))
 
-
+        
 
         if m_seed.groupdict().get("yyyy"):
 
@@ -389,7 +452,7 @@ def detect_similar_files(seed_file: str) -> Tuple[List[str], str, List[str], Lis
 
         return files, pattern_hint, unique_xxxx, unique_yyyy, False
 
-
+        
 
     return [seed_file], base, [], [], False
 
@@ -484,6 +547,106 @@ def load_1d_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
     return x, y
 
 
+def _header_x_unit_hint(path: str) -> Optional[str]:
+    """Read only the first textual header line; acquisition tokens are ignored."""
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            for _ in range(8):
+                line = handle.readline()
+                if not line:
+                    break
+                stripped = line.strip().lower().lstrip("#").strip()
+                if not stripped:
+                    continue
+                if "wavelength" in stripped and "nm" in stripped:
+                    return "nm"
+                if "mev" in stripped or "energy shift" in stripped:
+                    return "meV"
+                if ("raman" in stripped or "shift" in stripped or "wavenumber" in stripped) and (
+                    "cm-1" in stripped or "cm^-1" in stripped or "cm1" in stripped
+                ):
+                    return "cm-1"
+                break
+    except OSError:
+        pass
+    return None
+
+
+def assess_merge_x_axis(
+    x: np.ndarray,
+    path: str = "",
+    *,
+    header_hint: Optional[str] = None,
+    template_hint: Optional[str] = None,
+) -> MergeAxisAssessment:
+    """Assess a raw spectral axis before it is drawn or converted.
+
+    Numeric data alone is deliberately conservative: it may rule out nm, but
+    never silently decides between positive wavelength, cm⁻¹, and meV values.
+    """
+    values = np.asarray(x, dtype=float)
+    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
+        return MergeAxisAssessment(
+            minimum=float("nan"), maximum=float("nan"), monotonic="invalid", allowed_units=(),
+            recommended_unit=None, confidence="invalid", warnings=("The x axis must contain at least two finite values.",), valid=False,
+        )
+    diff = np.diff(values)
+    if np.all(diff > 0):
+        monotonic = "ascending"
+    elif np.all(diff < 0):
+        monotonic = "descending"
+    else:
+        return MergeAxisAssessment(
+            minimum=float(np.min(values)), maximum=float(np.max(values)), monotonic="non-monotonic", allowed_units=(),
+            recommended_unit=None, confidence="invalid", warnings=("The x axis must be strictly monotonic; duplicate or reordered points were found.",), valid=False,
+        )
+    allowed = ["nm", "cm-1", "meV"]
+    warnings: List[str] = []
+    if np.any(values <= 0):
+        allowed.remove("nm")
+        warnings.append("Nonpositive x values cannot be wavelength (nm).")
+
+    header_hint = header_hint or (_header_x_unit_hint(path) if path else None)
+    normalized_hint = template_hint if template_hint in {"nm", "cm-1", "meV"} else header_hint
+    if normalized_hint in allowed:
+        return MergeAxisAssessment(
+            minimum=float(np.min(values)), maximum=float(np.max(values)), monotonic=monotonic,
+            allowed_units=tuple(allowed), recommended_unit=normalized_hint, confidence="high",
+            warnings=tuple(warnings), header_hint=header_hint, template_hint=template_hint, valid=True,
+        )
+    if normalized_hint == "nm" and "nm" not in allowed:
+        warnings.append("The declared nm axis conflicts with nonpositive data; choose cm-1 or meV.")
+    recommended = "cm-1" if "nm" not in allowed else None
+    return MergeAxisAssessment(
+        minimum=float(np.min(values)), maximum=float(np.max(values)), monotonic=monotonic,
+        allowed_units=tuple(allowed), recommended_unit=recommended, confidence="ambiguous",
+        warnings=tuple(warnings or ["No explicit x-axis unit was found; confirm the unit before plotting."]),
+        header_hint=header_hint, template_hint=template_hint, valid=True,
+    )
+
+
+def validate_merge_x_grids(grids: Sequence[np.ndarray]) -> np.ndarray:
+    """Require same-size, same-coordinate input spectra instead of truncating."""
+    if not grids:
+        raise ValueError("No x-axis grids were loaded.")
+    reference = np.asarray(grids[0], dtype=float)
+    assessment = assess_merge_x_axis(reference)
+    if not assessment.valid:
+        raise ValueError("; ".join(assessment.warnings))
+    step = float(np.median(np.abs(np.diff(reference))))
+    tolerance = max(1e-9, 0.001 * step)
+    for index, grid in enumerate(grids[1:], start=2):
+        candidate = np.asarray(grid, dtype=float)
+        candidate_assessment = assess_merge_x_axis(candidate)
+        if not candidate_assessment.valid:
+            raise ValueError(f"File #{index}: {'; '.join(candidate_assessment.warnings)}")
+        if candidate.size != reference.size:
+            raise ValueError(f"File #{index} has {candidate.size} x points; expected {reference.size}.")
+        if not np.allclose(candidate, reference, rtol=0.0, atol=tolerance, equal_nan=False):
+            raise ValueError(f"File #{index} has an x grid inconsistent with the selected seed (tolerance {tolerance:g}).")
+    return reference
+
+
 
 
 
@@ -541,6 +704,7 @@ def build_raw_matrix_wavelength_axis(
 
     assume_xgrid_consistent: bool = True,
     polarization_as_xxxx: bool = True,
+    row_values: Optional[Sequence[float]] = None,
 
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
@@ -558,63 +722,32 @@ def build_raw_matrix_wavelength_axis(
 
     """
 
-    xs: Optional[np.ndarray] = None
-
-    rows: List[np.ndarray] = []
-
-    angles: List[float] = []
-
-    for idx, p in enumerate(files):
-
-        x, y = load_1d_xy(p)
-
-        if xs is None:
-
-            xs = x
-
-        if assume_xgrid_consistent:
-
-            n = min(xs.size, x.size, y.size)
-
-            if n < xs.size:
-
-                xs = xs[:n]
-
-                # Trim all existing rows to the new minimum size
-
-                rows = [r[:n] for r in rows]
-
-            rows.append(np.asarray(y[:n], float))
-
+    # Load every spectrum before creating a matrix.  The old implementation
+    # truncated mismatched inputs to their shortest length, silently shifting
+    # columns during cosmic review and merging.
+    if row_values is not None and len(row_values) != len(files):
+        raise ValueError("row_values must have one entry per merge file.")
+    grids: List[np.ndarray] = []
+    strict_rows: List[np.ndarray] = []
+    strict_angles: List[float] = []
+    for idx, path in enumerate(files):
+        x, y = load_1d_xy(path)
+        if x.size != y.size:
+            raise ValueError(f"File '{os.path.basename(path)}' has mismatched x/y lengths.")
+        grids.append(np.asarray(x, dtype=float))
+        strict_rows.append(np.asarray(y, dtype=float))
+        if row_values is not None:
+            strict_angles.append(float(row_values[idx]))
         else:
-
-            n = min(xs.size, x.size, y.size)
-
-            if n < xs.size:
-
-                xs = xs[:n]
-
-                rows = [r[:n] for r in rows]
-
-            rows.append(np.asarray(y[:n], float))
-
-        xxxx, yyyy, _ = _parse_merge_xxxx_yyyy_from_path(p, polarization_as_xxxx=polarization_as_xxxx)
-
-        ang = _angle_deg_from_filename(p, xxxx, default=idx)
-
-        angles.append(ang)
-
-    if xs is None or not rows:
-
+            xxxx, _yyyy, _is_pol = _parse_merge_xxxx_yyyy_from_path(path, polarization_as_xxxx=polarization_as_xxxx)
+            strict_angles.append(float(_angle_deg_from_filename(path, xxxx, default=idx)))
+    if not strict_rows:
         raise ValueError("No valid files were loaded.")
-
-    wavelength_nm = np.asarray(xs, float)
-
-    angle_values = np.asarray(angles, float)
-
-    intensity_matrix = np.vstack(rows)
-
-    return wavelength_nm, angle_values, intensity_matrix
+    return (
+        validate_merge_x_grids(grids),
+        np.asarray(strict_angles, dtype=float),
+        np.vstack(strict_rows),
+    )
 
 
 
@@ -634,6 +767,9 @@ def build_primitive_matrix_by_xxxx(
 
     dark_value: float = 0.0,
     polarization_as_xxxx: bool = True,
+    row_keys: Optional[Sequence[str]] = None,
+    primitive_order: Optional[Sequence[str]] = None,
+    primitive_values: Optional[Sequence[float]] = None,
 
 ) -> Tuple[List[str], np.ndarray, np.ndarray, Dict[str, List[int]]]:
 
@@ -652,6 +788,29 @@ def build_primitive_matrix_by_xxxx(
     - Returns (primitive_xxxx, primitive_angle_values, primitive_matrix, raw_rows_by_xxxx)
 
     """
+
+    if row_keys is not None:
+        if len(row_keys) != len(files):
+            raise ValueError("row_keys must have one entry per merge file.")
+        groups: Dict[str, List[int]] = {}
+        for index, key in enumerate(row_keys):
+            groups.setdefault(str(key), []).append(index)
+        order = [str(v) for v in primitive_order] if primitive_order is not None else list(groups)
+        order = [key for key in order if key in groups]
+        value_by_key = {}
+        if primitive_order is not None and primitive_values is not None:
+            value_by_key = {str(key): float(value) for key, value in zip(primitive_order, primitive_values)}
+        matrices: List[np.ndarray] = []
+        values: List[float] = []
+        for key in order:
+            rows = groups[key]
+            matrices.append(np.nanmean(raw_intensity_matrix[rows, :], axis=0))
+            values.append(value_by_key.get(key, float(np.nanmean(raw_angle_values[rows]))))
+        matrix = np.vstack(matrices)
+        if dark_value != 0.0:
+            matrix = matrix - dark_value
+            matrix[matrix < 0] = 0
+        return order, np.asarray(values, dtype=float), matrix, groups
 
     n_raw = len(files)
 
@@ -713,7 +872,7 @@ def build_primitive_matrix_by_xxxx(
 
     primitive_matrix = np.vstack(primitive_matrix_rows)
 
-
+    
 
     if dark_value != 0.0:
 
@@ -721,7 +880,7 @@ def build_primitive_matrix_by_xxxx(
 
         primitive_matrix[primitive_matrix < 0] = 0
 
-
+        
 
     primitive_angle_values_arr = np.asarray(primitive_angle_values, float)
 
@@ -911,7 +1070,7 @@ def _parse_xxxx_yyyy_from_path(path: str) -> Tuple[Optional[str], Optional[str],
 
         return xxxx, yyyy, True
 
-
+    
 
     m_normal = NORMAL_IDX_TWO_RE.match(base)
 
@@ -939,7 +1098,7 @@ def _parse_xxxx_yyyy_from_path(path: str) -> Tuple[Optional[str], Optional[str],
 
         return xxxx, yyyy, False
 
-
+    
 
     _PARSE_CACHE[base] = (None, None, False)
 
@@ -1048,14 +1207,15 @@ def detect_cosmic_peaks_comparative(
         angles = discover_result.angle_values
         files = discover_result.files
 
-    x_nm = discover_result.wavelength_nm
+    x_axis = np.asarray(discover_result.raw_x if discover_result.raw_x is not None else discover_result.wavelength_nm, dtype=float)
+    x_unit = str(getattr(discover_result, "raw_x_unit", "") or "x")
     ny, nx = I.shape
     peaks: List[CosmicPeak] = []
 
     # Structure for reference lookups
     raw_rows_by_xxxx = discover_result.raw_rows_by_xxxx or {}
     primitive_xxxx = discover_result.primitive_xxxx or []
-
+    
     # Ensure primitive_matrix is also dark-subtracted if used as reference
     primitive_matrix = None
     if discover_result.primitive_matrix is not None:
@@ -1078,7 +1238,11 @@ def detect_cosmic_peaks_comparative(
         if cand_cols.size == 0:
             continue
 
-        row_xxxx, row_yyyy, _ = _parse_xxxx_yyyy_from_path(files[r])
+        if use_raw and r < len(discover_result.raw_xxxx):
+            row_xxxx = discover_result.raw_xxxx[r]
+            row_yyyy = discover_result.raw_yyyy[r] if r < len(discover_result.raw_yyyy) else None
+        else:
+            row_xxxx, row_yyyy, _ = _parse_xxxx_yyyy_from_path(files[r])
 
         for c in cand_cols:
             peak_intensity = y[c]
@@ -1099,7 +1263,7 @@ def detect_cosmic_peaks_comparative(
             if not np.isfinite(reference_intensity) and row_xxxx and primitive_matrix is not None:
                 try:
                     prim_idx = primitive_xxxx.index(row_xxxx)
-
+                    
                     # Try with neighbors at distance 1
                     neighbor_prim_indices = []
                     if prim_idx > 0: neighbor_prim_indices.append(prim_idx - 1)
@@ -1114,14 +1278,14 @@ def detect_cosmic_peaks_comparative(
                         neighbor_prim_indices_2 = []
                         if prim_idx > 1: neighbor_prim_indices_2.append(prim_idx - 2)
                         if prim_idx < len(primitive_xxxx) - 2: neighbor_prim_indices_2.append(prim_idx + 2)
-
+                        
                         if neighbor_prim_indices_2:
                             reference_intensity = np.nanmean(primitive_matrix[neighbor_prim_indices_2, c]) # Already dark-subtracted
                             reference_type = "neighbor_dist_2"
 
                 except (ValueError, IndexError):
                     pass
-
+            
             if reference_intensity <= 0:
                 reference_intensity = 0.1 # prevent division by zero
             # 3. Filter the peak and set the confirmation flag
@@ -1146,7 +1310,7 @@ def detect_cosmic_peaks_comparative(
                 z = float("inf")
                 if sigma > 0:
                     z = (peak_intensity - med) / sigma
-
+                
                 is_cosmic = z > z_thresh_fallback
                 test_results = {
                     "method": "z-score",
@@ -1158,7 +1322,7 @@ def detect_cosmic_peaks_comparative(
                 }
 
             # 4. Create a CosmicPeak object for EVERY candidate > thresh
-            fwhm = _estimate_fwhm_nm(x_nm, y, int(c))
+            fwhm = _estimate_fwhm_nm(x_axis, y, int(c))
             peaks.append(
                 CosmicPeak(
                     row_index=int(r),
@@ -1167,9 +1331,12 @@ def detect_cosmic_peaks_comparative(
                     xxxx=row_xxxx,
                     yyyy=row_yyyy,
                     angle_deg=float(angles[r]) if np.isfinite(angles[r]) else None,
-                    center_wavelength_nm=float(x_nm[c]),
+                    center_x=float(x_axis[c]),
+                    fwhm_x=float(fwhm),
+                    x_unit=x_unit,
+                    center_wavelength_nm=float(x_axis[c]) if x_unit == "nm" else float("nan"),
                     intensity=float(peak_intensity),
-                    fwhm_nm=float(fwhm),
+                    fwhm_nm=float(fwhm) if x_unit == "nm" else float("nan"),
                     test_results=test_results,
                 )
             )
@@ -1213,14 +1380,22 @@ def _apply_cosmic_removal_logic(
         files = list(discover_result.files)
         applied_on = "legacy"
 
-    x = np.asarray(discover_result.wavelength_nm, float)
+    x = np.asarray(discover_result.raw_x if discover_result.raw_x is not None else discover_result.wavelength_nm, float)
 
     ny, nx = I.shape
 
     # 4) Build row_meta and rows_by_xxxx from selected files
-    row_meta: List[Tuple[Optional[str], Optional[str], bool]] = [
-        _parse_xxxx_yyyy_from_path(p) for p in files
-    ]
+    if use_raw and len(getattr(discover_result, "raw_xxxx", [])) == len(files):
+        row_meta = [
+            (
+                discover_result.raw_xxxx[index],
+                discover_result.raw_yyyy[index] if index < len(discover_result.raw_yyyy) else None,
+                bool(getattr(discover_result, "is_polarization_merge", False)),
+            )
+            for index in range(len(files))
+        ]
+    else:
+        row_meta = [_parse_xxxx_yyyy_from_path(p) for p in files]
     rows_by_xxxx: Dict[str, List[int]] = {}
     for r, (xxxx, yyyy, _) in enumerate(row_meta):
         if xxxx is None:
@@ -1241,8 +1416,8 @@ def _apply_cosmic_removal_logic(
         if r < 0 or r >= ny or c0 < 0 or c0 >= nx:
             continue
 
-        center = float(pk.center_wavelength_nm)
-        fwhm = float(pk.fwhm_nm)
+        center = float(pk.center_x if np.isfinite(pk.center_x) else pk.center_wavelength_nm)
+        fwhm = float(pk.fwhm_x if np.isfinite(pk.fwhm_x) else pk.fwhm_nm)
         if not np.isfinite(center) or not np.isfinite(fwhm) or fwhm <= 0:
             # If FWHM is not available, fall back to a small fixed window (3 points)
             lo = max(c0 - 1, 0)
@@ -1336,6 +1511,9 @@ def apply_cosmic_removal(
             I2,
             dark_value=0.0, # dark_value already subtracted or handled
             polarization_as_xxxx=bool(getattr(discover_result, "is_polarization_merge", False)),
+            row_keys=discover_result.raw_xxxx or None,
+            primitive_order=discover_result.primitive_xxxx or None,
+            primitive_values=discover_result.angle_values if discover_result.primitive_xxxx else None,
         )
         intensity_matrix_out = primitive_matrix
         angle_values_out = primitive_angle_values_new
@@ -1365,6 +1543,16 @@ def apply_cosmic_removal(
         primitive_matrix=intensity_matrix_out,
         cosmic_matrix=I2, # Store corrected RAW matrix here if raw, else primitive
         is_polarization_merge=bool(getattr(discover_result, "is_polarization_merge", False)),
+        raw_x=discover_result.raw_x,
+        raw_x_unit=discover_result.raw_x_unit,
+        axis_assessment=discover_result.axis_assessment,
+        template_id=discover_result.template_id,
+        profile_id=discover_result.profile_id,
+        repeat_mode=discover_result.repeat_mode,
+        row_axis_kind=discover_result.row_axis_kind,
+        row_axis_unit=discover_result.row_axis_unit,
+        row_labels=list(discover_result.row_labels),
+        captured_filename_fields=dict(discover_result.captured_filename_fields),
     )
 
 
@@ -3550,77 +3738,108 @@ class MapFittingEngine:
 
 
 def discover_merge(options: MergeDiscoverOptions) -> MergeDiscoverResult:
-    files, pattern_hint, unique_xxxx, unique_yyyy, is_polarization_merge = detect_similar_files(options.seed_file)
-    wavelength_nm, raw_angle_values, raw_intensity_matrix = build_raw_matrix_wavelength_axis(
-        files,
-        assume_xgrid_consistent=options.assume_xgrid_consistent,
-        polarization_as_xxxx=is_polarization_merge,
-    )
-    # Parse raw_xxxx, raw_yyyy
-    raw_xxxx = []
-    raw_yyyy = []
-    for p in files:
-        x, y, _ = _parse_merge_xxxx_yyyy_from_path(p, polarization_as_xxxx=is_polarization_merge)
-        raw_xxxx.append(x)
-        raw_yyyy.append(y)
-    # Build primitive matrix (averaged over yyyy for each xxxx)
-    primitive_xxxx, primitive_angle_values, primitive_matrix, raw_rows_by_xxxx = build_primitive_matrix_by_xxxx(
-        files,
-        wavelength_nm,
-        raw_angle_values,
-        raw_intensity_matrix,
-        polarization_as_xxxx=is_polarization_merge,
-    )
-    # For backward compatibility: angle_values = primitive_angle_values, intensity_matrix = primitive_matrix
+    """Discover a merge family and validate its raw x axis before rendering."""
+    if os.path.splitext(options.seed_file)[1].lower() == ".tvf":
+        raise ValueError(".tvf merge import is out of scope; export the spectra as TXT first.")
+    seed_match = None
+    row_plan: Optional[MergeRowPlan] = None
+    profile = None
+    try:
+        seed_match, profile, _matches, row_plan = discover_family(
+            options.seed_file,
+            template_id=options.template_id,
+            profile_id=options.profile_id,
+            repeat_mode=options.repeat_mode,
+        )
+    except TemplateValidationError as exc:
+        # An untemplated standalone file retains the historic discovery path.
+        if options.template_id not in {None, "", "auto"}:
+            raise ValueError(str(exc)) from exc
 
-    # Parse laser wavelength from seed filename, with a default fallback.
-    parsed_laser_nm: Optional[float] = None
-    m = re.search(r"(\d+(?:[\.,]\d+)?)nm", os.path.basename(options.seed_file))
-    if m:
-        try:
-            parsed_laser_nm = float(m.group(1).replace(",", "."))
-        except Exception:
-            parsed_laser_nm = None
+    if row_plan is not None and seed_match is not None and profile is not None:
+        files = list(row_plan.files)
+        labels_by_key = dict(zip(row_plan.primitive_keys, row_plan.primitive_labels))
+        values_by_key = dict(zip(row_plan.primitive_keys, row_plan.primitive_values))
+        raw_group_keys: List[str] = []
+        raw_values: List[float] = []
+        for raw_key, repeat_key in zip(row_plan.raw_row_keys, row_plan.raw_repeat_keys):
+            primitive_key = raw_key if options.repeat_mode == "average" else f"{raw_key}|{repeat_key}"
+            raw_group_keys.append(labels_by_key[primitive_key])
+            raw_values.append(float(values_by_key[primitive_key]))
+        wavelength_nm, raw_angle_values, raw_intensity_matrix = build_raw_matrix_wavelength_axis(
+            files,
+            assume_xgrid_consistent=options.assume_xgrid_consistent,
+            polarization_as_xxxx=row_plan.axis_kind == "polarization",
+            row_values=raw_values,
+        )
+        primitive_xxxx, primitive_angle_values, primitive_matrix, raw_rows_by_xxxx = build_primitive_matrix_by_xxxx(
+            files,
+            wavelength_nm,
+            raw_angle_values,
+            raw_intensity_matrix,
+            row_keys=raw_group_keys,
+            primitive_order=row_plan.primitive_labels,
+            primitive_values=row_plan.primitive_values,
+        )
+        raw_xxxx = raw_group_keys
+        raw_yyyy = list(row_plan.raw_repeat_keys)
+        unique_xxxx = list(row_plan.primitive_labels)
+        unique_yyyy = sorted({key for key in raw_yyyy if key})
+        is_polarization_merge = row_plan.axis_kind == "polarization"
+        pattern_hint = f"{seed_match.template.label} / {profile.label}"
+        template_hint = seed_match.template.x_unit_hint
+        row_axis_kind = row_plan.axis_kind
+        row_axis_unit = row_plan.axis_unit
+        row_labels = list(row_plan.primitive_labels) if row_plan.is_categorical else []
+        captured_fields = dict(seed_match.fields)
+        template_id = seed_match.template.id
+        profile_id = profile.id
+    else:
+        files, pattern_hint, unique_xxxx, unique_yyyy, is_polarization_merge = detect_similar_files(options.seed_file)
+        wavelength_nm, raw_angle_values, raw_intensity_matrix = build_raw_matrix_wavelength_axis(
+            files,
+            assume_xgrid_consistent=options.assume_xgrid_consistent,
+            polarization_as_xxxx=is_polarization_merge,
+        )
+        raw_xxxx, raw_yyyy = [], []
+        for path in files:
+            xxxx, yyyy, _ = _parse_merge_xxxx_yyyy_from_path(path, polarization_as_xxxx=is_polarization_merge)
+            raw_xxxx.append(xxxx)
+            raw_yyyy.append(yyyy)
+        primitive_xxxx, primitive_angle_values, primitive_matrix, raw_rows_by_xxxx = build_primitive_matrix_by_xxxx(
+            files, wavelength_nm, raw_angle_values, raw_intensity_matrix, polarization_as_xxxx=is_polarization_merge,
+        )
+        template_hint = "auto"
+        row_axis_kind = "polarization" if is_polarization_merge else "angle"
+        row_axis_unit = "polarization" if is_polarization_merge else "deg"
+        row_labels = list(primitive_xxxx) if is_polarization_merge else []
+        captured_fields = filename_metadata(options.seed_file)
+        template_id = "legacy"
+        profile_id = "polarization" if is_polarization_merge else "angle"
 
+    selected_hint = options.input_x_unit if options.input_x_unit != "auto" else template_hint
+    assessment = assess_merge_x_axis(wavelength_nm, options.seed_file, template_hint=selected_hint)
+    raw_x_unit = options.input_x_unit if options.input_x_unit != "auto" else (assessment.recommended_unit or "auto")
+
+    parsed_laser_nm = captured_fields.get("laser_nm") if isinstance(captured_fields, dict) else None
     if parsed_laser_nm is None:
-        parsed_laser_nm = 515.0
+        match_laser = re.search(r"(\d+(?:[\.,]\d+)?)nm", os.path.basename(options.seed_file))
+        if match_laser:
+            try:
+                parsed_laser_nm = float(match_laser.group(1).replace(",", "."))
+            except ValueError:
+                parsed_laser_nm = None
+    candidate_laser_nm = float(parsed_laser_nm) if parsed_laser_nm is not None else None
+    if raw_x_unit == "nm" and candidate_laser_nm is not None:
+        order = np.argsort(wavelength_nm)
+        sorted_x = wavelength_nm[order]
+        start = np.searchsorted(sorted_x, candidate_laser_nm - 1.0, side="left")
+        end = np.searchsorted(sorted_x, candidate_laser_nm + 1.0, side="right")
+        if start < end:
+            average = np.nanmean(raw_intensity_matrix[:, order[start:end]], axis=0)
+            candidate_laser_nm = float(sorted_x[start + int(np.nanargmax(average))])
 
-    # Initialize candidate_laser_nm with the parsed value as a fallback.
-    candidate_laser_nm = parsed_laser_nm
-
-    # Calculate candidate laser nm by finding the peak in a trimmed-mean spectrum
-    # around the parsed laser wavelength.
-    # Find the indices for the laser domain using searchsorted for efficiency,
-    # assuming wavelength_nm is sorted.
-    start_index = np.searchsorted(wavelength_nm, parsed_laser_nm - 1.0, side='left')
-    end_index = np.searchsorted(wavelength_nm, parsed_laser_nm + 1.0, side='right')
-
-    if start_index < end_index:
-        # Slicing is more memory-efficient than boolean masking for large arrays
-        domain_wavelengths = wavelength_nm[start_index:end_index]
-        domain_intensities = raw_intensity_matrix[:, start_index:end_index]
-
-        # Calculate trimmed mean for each column (wavelength point)
-        n_rows = domain_intensities.shape[0]
-        trim_count = int(n_rows * 0.1)
-
-        # Sort each column's intensities
-        sorted_intensities = np.sort(domain_intensities, axis=0)
-
-        # Trim top and bottom 10% to remove cosmic ray influence
-        if trim_count > 0:
-            trimmed_intensities = sorted_intensities[trim_count:-trim_count, :]
-        else:
-            trimmed_intensities = sorted_intensities
-
-        # Average the trimmed intensities to get a clean spectrum
-        averaged_spectrum = np.mean(trimmed_intensities, axis=0)
-
-        # Find the most prominent peak in the averaged spectrum
-        if averaged_spectrum.size > 0:
-            peak_index_in_domain = np.argmax(averaged_spectrum)
-            candidate_laser_nm = domain_wavelengths[peak_index_in_domain]
-
+    raw_label = raw_x_unit if raw_x_unit != "auto" else "unconfirmed x"
     return MergeDiscoverResult(
         files=files,
         pattern_hint=pattern_hint,
@@ -3629,7 +3848,7 @@ def discover_merge(options: MergeDiscoverOptions) -> MergeDiscoverResult:
         wavelength_nm=wavelength_nm,
         angle_values=primitive_angle_values,
         intensity_matrix=primitive_matrix,
-        title="Preview (raw, wavelength axis)",
+        title=f"Preview (raw, {raw_label} axis)",
         candidate_laser_nm=candidate_laser_nm,
         raw_files=list(files),
         raw_xxxx=raw_xxxx,
@@ -3641,6 +3860,16 @@ def discover_merge(options: MergeDiscoverOptions) -> MergeDiscoverResult:
         primitive_matrix=primitive_matrix,
         cosmic_matrix=None,
         is_polarization_merge=is_polarization_merge,
+        raw_x=np.asarray(wavelength_nm, dtype=float),
+        raw_x_unit=raw_x_unit,
+        axis_assessment=assessment,
+        template_id=template_id,
+        profile_id=profile_id,
+        repeat_mode=options.repeat_mode,
+        row_axis_kind=row_axis_kind,
+        row_axis_unit=row_axis_unit,
+        row_labels=row_labels,
+        captured_filename_fields=dict(captured_fields or {}),
     )
 
 
@@ -3669,34 +3898,50 @@ def preview_merge(
 
     # The input matrix is used directly.
     I2 = np.asarray(discover_result.intensity_matrix, float)
+    raw_x = np.asarray(
+        discover_result.raw_x if discover_result.raw_x is not None else discover_result.wavelength_nm,
+        dtype=float,
+    )
 
     if options.use_raman_x:
         if options.raman_x_mode == "meV":
             return MergePreviewResult(
-            raman_shift_cm1=cm1_from_ev(np.asarray(discover_result.wavelength_nm, dtype=float) / 1000.0),
-            energy_ev=np.asarray(discover_result.wavelength_nm, dtype=float) / 1000.0,
+            raman_shift_cm1=cm1_from_ev(raw_x / 1000.0),
+            energy_ev=raw_x / 1000.0,
             angle_values=np.asarray(discover_result.angle_values, float),
             intensity_matrix=I2,
+            laser_nm=None,
+            laser_source="input_meV",
             title="Preview (Raman shift axis)",
             )
         elif options.raman_x_mode == "cm-1":
             return MergePreviewResult(
-            raman_shift_cm1=discover_result.wavelength_nm,
-            energy_ev=ev_from_cm1(discover_result.wavelength_nm),
+            raman_shift_cm1=raw_x,
+            energy_ev=ev_from_cm1(raw_x),
             angle_values=np.asarray(discover_result.angle_values, float),
             intensity_matrix=I2,
+            laser_nm=None,
+            laser_source="input_cm-1",
             title="Preview (Raman shift axis)",
             )
 
+    if discover_result.axis_assessment is not None and "nm" not in discover_result.axis_assessment.allowed_units:
+        raise ValueError("Input x axis contains nonpositive values and cannot be treated as wavelength (nm).")
+    if np.any(raw_x <= 0):
+        raise ValueError("Input wavelength values must be > 0; choose cm-1 or meV instead.")
+
     # Determine laser wavelength
     laser_nm: Optional[float] = None
+    laser_source: Optional[str] = None
     if options.manual_laser_nm is not None:
         laser_nm = float(options.manual_laser_nm)
+        laser_source = "manual"
     else:
         # Use candidate laser wavelength from discovery stage
         candidate_laser_nm = discover_result.candidate_laser_nm
         if candidate_laser_nm is not None:
             laser_nm = candidate_laser_nm
+            laser_source = "detected"
         else:
             if options.require_laser_nm:
                 raise ValueError(
@@ -3707,10 +3952,10 @@ def preview_merge(
                 laser_nm = None
 
     if laser_nm is not None:
-        shift_cm1 = raman_shift_cm1_from_wavelength_nm(discover_result.wavelength_nm, laser_nm)
+        shift_cm1 = raman_shift_cm1_from_wavelength_nm(raw_x, laser_nm)
         energy = ev_from_cm1(shift_cm1)
     else:
-        shift_cm1 = np.full_like(discover_result.wavelength_nm, np.nan)
+        shift_cm1 = np.full_like(raw_x, np.nan)
         energy = None
 
     return MergePreviewResult(
@@ -3718,17 +3963,23 @@ def preview_merge(
         energy_ev=energy,
         angle_values=np.asarray(discover_result.angle_values, float),
         intensity_matrix=I2,
+        laser_nm=laser_nm,
+        laser_source=laser_source,
         title="Preview (Raman shift axis)",
     )
 
 
 def infer_merge_input_unit(path: str, default: str = "nm") -> str:
-    """Infer the raw x-axis unit for merge input files from a filename."""
-    base = os.path.basename(path or "").lower()
-    if "mev" in base:
-        return "meV"
-    if "cm-1" in base or "cm^-1" in base or "cm1" in base or "wavenumber" in base or "raman_shift" in base:
-        return "cm-1"
+    """Return only a high-confidence raw x unit; otherwise retain default."""
+    try:
+        x, _y = load_1d_xy(path)
+        metadata = filename_metadata(path)
+        hint = metadata.get("filename_x_unit_hint") if isinstance(metadata, dict) else None
+        assessment = assess_merge_x_axis(x, path, template_hint=hint)
+        if assessment.confidence == "high" and assessment.recommended_unit:
+            return assessment.recommended_unit
+    except Exception:
+        pass
     return default
 
 
@@ -3753,6 +4004,9 @@ def merge_raw_to_run(
     seed_file: str,
     *,
     input_unit: str = "auto",
+    filename_template: str = "auto",
+    merge_profile: str = "auto",
+    repeat_mode: str = "average",
     manual_laser_nm: Optional[float] = None,
     dark_value: float = 0.0,
     cosmic_policy: str = "off",
@@ -3767,38 +4021,45 @@ def merge_raw_to_run(
     """
     from data_structure import Run, RunType, infer_intensity_unit, new_run_id, parse_filename
 
-    input_unit = infer_merge_input_unit(seed_file) if input_unit in {None, "", "auto"} else str(input_unit)
-    if input_unit not in {"nm", "cm-1", "meV"}:
+    requested_unit = "auto" if input_unit in {None, "", "auto"} else str(input_unit)
+    if requested_unit not in {"auto", "nm", "cm-1", "meV"}:
         raise ValueError("input_unit must be auto, nm, cm-1, or meV.")
     cosmic_policy = str(cosmic_policy or "off").lower()
     if cosmic_policy not in {"off", "detect", "apply-auto", "apply-indices"}:
         raise ValueError("cosmic_policy must be off, detect, apply-auto, or apply-indices.")
 
-    disc = discover_merge(MergeDiscoverOptions(seed_file=seed_file))
+    disc = discover_merge(
+        MergeDiscoverOptions(
+            seed_file=seed_file,
+            template_id=filename_template or "auto",
+            profile_id=merge_profile or "auto",
+            repeat_mode=repeat_mode or "average",
+            input_x_unit=requested_unit,
+        )
+    )
+    assessment = disc.axis_assessment
+    if requested_unit == "auto":
+        if assessment is None or assessment.confidence != "high" or not assessment.recommended_unit:
+            allowed = ", ".join(assessment.allowed_units if assessment else ("nm", "cm-1", "meV"))
+            raise ValueError(
+                "Input x-axis unit is ambiguous. Re-run with --input-unit one of: "
+                f"{allowed}."
+            )
+        input_unit = assessment.recommended_unit
+        disc = replace(disc, raw_x_unit=input_unit, title=f"Preview (raw, {input_unit} axis)")
+    else:
+        input_unit = requested_unit
+        if assessment is not None and input_unit not in assessment.allowed_units:
+            raise ValueError(
+                f"Input unit '{input_unit}' is invalid for this x axis: "
+                + "; ".join(assessment.warnings)
+            )
     active_disc = disc
     cosmic_report = None
 
     if cosmic_policy != "off":
-        cosmic_options = MergeCosmicOptions(
-            files=active_disc.files,
-            pattern_hint=active_disc.pattern_hint,
-            unique_xxxx=active_disc.unique_xxxx,
-            unique_yyyy=active_disc.unique_yyyy,
-            wavelength_nm=active_disc.wavelength_nm,
-            angle_values=active_disc.angle_values,
-            intensity_matrix=active_disc.intensity_matrix,
-            title=active_disc.title,
-            candidate_laser_nm=active_disc.candidate_laser_nm,
-            raw_files=active_disc.raw_files,
-            raw_xxxx=active_disc.raw_xxxx,
-            raw_yyyy=active_disc.raw_yyyy,
-            raw_angle_values=active_disc.raw_angle_values,
-            raw_intensity_matrix=active_disc.raw_intensity_matrix,
-            raw_rows_by_xxxx=active_disc.raw_rows_by_xxxx,
-            primitive_xxxx=active_disc.primitive_xxxx,
-            primitive_matrix=active_disc.primitive_matrix,
-            cosmic_matrix=active_disc.cosmic_matrix,
-            is_polarization_merge=active_disc.is_polarization_merge,
+        cosmic_options = cosmic_options_from_discover(
+            active_disc,
             dark_value=float(dark_value or 0.0),
         )
         cosmic_result = discover_cosmics(cosmic_options)
@@ -3813,9 +4074,10 @@ def merge_raw_to_run(
                     "xxxx": pk.xxxx,
                     "yyyy": pk.yyyy,
                     "angle_deg": pk.angle_deg,
-                    "center_wavelength_nm": pk.center_wavelength_nm,
+                    "center_x": pk.center_x,
+                    "x_unit": pk.x_unit,
                     "intensity": pk.intensity,
-                    "fwhm_nm": pk.fwhm_nm,
+                    "fwhm_x": pk.fwhm_x,
                     "is_confirmed_cosmic": bool(pk.is_confirmed_cosmic),
                     "test_results": pk.test_results,
                 }
@@ -3854,8 +4116,43 @@ def merge_raw_to_run(
     metadata["merge_unique_yyyy"] = disc.unique_yyyy
     metadata["merged_files"] = disc.files
     metadata["raw_x_unit"] = input_unit
-    if disc.is_polarization_merge:
-        metadata["polarization_rows"] = list(disc.primitive_xxxx or disc.unique_xxxx)
+    if input_unit == "nm" and preview.laser_nm is not None:
+        metadata["raman_laser_nm"] = float(preview.laser_nm)
+        metadata["raman_laser_source"] = str(preview.laser_source or "detected")
+        metadata["raman_axis_conversion"] = {
+            "input_unit": "nm",
+            "laser_nm": float(preview.laser_nm),
+            "laser_source": str(preview.laser_source or "detected"),
+        }
+    metadata["filename_template_id"] = disc.template_id
+    metadata["merge_profile_id"] = disc.profile_id
+    metadata["repeat_mode"] = disc.repeat_mode
+    metadata["merge_axis_kind"] = disc.row_axis_kind
+    metadata["merge_axis_unit"] = disc.row_axis_unit
+    metadata["merge_row_labels"] = list(disc.row_labels)
+    metadata["captured_filename_fields"] = dict(disc.captured_filename_fields)
+    metadata["merge_reload_options"] = {
+        "supported": True,
+        "input_unit": input_unit,
+        "filename_template": disc.template_id,
+        "merge_profile": disc.profile_id,
+        "repeat_mode": disc.repeat_mode,
+        "manual_laser_nm": None if manual_laser_nm is None else float(manual_laser_nm),
+        "dark_value": float(dark_value or 0.0),
+        "cosmic_policy": cosmic_policy,
+        "cosmic_indices": [int(value) for value in (cosmic_indices or [])],
+    }
+    if disc.axis_assessment is not None:
+        metadata["raw_x_assessment"] = {
+            "minimum": disc.axis_assessment.minimum,
+            "maximum": disc.axis_assessment.maximum,
+            "monotonic": disc.axis_assessment.monotonic,
+            "allowed_units": list(disc.axis_assessment.allowed_units),
+            "confidence": disc.axis_assessment.confidence,
+            "warnings": list(disc.axis_assessment.warnings),
+        }
+    if disc.row_axis_kind == "polarization":
+        metadata["polarization_rows"] = list(disc.row_labels or disc.primitive_xxxx or disc.unique_xxxx)
         metadata["raw_y_unit"] = "polarization"
     if nickname:
         metadata["nickname"] = nickname
@@ -3870,6 +4167,7 @@ def merge_raw_to_run(
         id=new_run_id(prefix="run"),
         source_path=source_path,
         source_mtime=None,
+        wl_nm=np.asarray(preview_disc.raw_x, dtype=float).copy() if input_unit == "nm" and preview_disc.raw_x is not None else None,
         shift_cm1=preview.raman_shift_cm1,
         energy_eV=preview.energy_ev,
         intensity=None,
@@ -3894,10 +4192,67 @@ def merge_raw_to_run(
         "unique_yyyy": list(disc.unique_yyyy),
         "shape": list(np.asarray(preview.intensity_matrix).shape),
         "raw_x_unit": metadata.get("raw_x_unit"),
+        "filename_template_id": disc.template_id,
+        "merge_profile_id": disc.profile_id,
+        "repeat_mode": disc.repeat_mode,
+        "merge_axis_kind": disc.row_axis_kind,
         "polarization_rows": metadata.get("polarization_rows", []),
         "cosmic_policy": cosmic_policy,
     }
     return run, summary, cosmic_report
+
+
+def reload_merged_run(run) -> Dict[str, object]:
+    """Rebuild a merged 2D run with its recorded merge settings.
+
+    Older merged runs without a complete reload recipe are rejected instead
+    of being silently replaced by the seed file's one-dimensional spectrum.
+    """
+    metadata = run.metadata if isinstance(getattr(run, "metadata", None), dict) else {}
+    options = metadata.get("merge_reload_options")
+    if not isinstance(options, dict):
+        raise ValueError(
+            "This merged run predates saved reload settings. Recreate it with Merge Run; "
+            "Update from file will not replace it with a single source spectrum."
+        )
+    if not bool(options.get("supported", True)):
+        reason = str(options.get("reason") or "the original merge cannot be reproduced automatically")
+        raise ValueError(f"This merged run cannot be reloaded automatically because {reason}.")
+    seed_file = str(run.source_path or "")
+    if not seed_file or not os.path.exists(seed_file):
+        raise FileNotFoundError(f"Merge seed file not found: {seed_file}")
+
+    nickname = run.nickname
+    fresh, summary, _cosmic_report = merge_raw_to_run(
+        seed_file,
+        input_unit=str(options.get("input_unit") or metadata.get("raw_x_unit") or "auto"),
+        filename_template=str(options.get("filename_template") or metadata.get("filename_template_id") or "auto"),
+        merge_profile=str(options.get("merge_profile") or metadata.get("merge_profile_id") or "auto"),
+        repeat_mode=str(options.get("repeat_mode") or metadata.get("repeat_mode") or "average"),
+        manual_laser_nm=options.get("manual_laser_nm"),
+        dark_value=float(options.get("dark_value") or 0.0),
+        cosmic_policy=str(options.get("cosmic_policy") or "off"),
+        cosmic_indices=options.get("cosmic_indices") or [],
+        nickname=nickname,
+    )
+    previous_metadata = copy.deepcopy(metadata)
+    previous_metadata.update(fresh.metadata)
+    previous_metadata["nickname"] = nickname
+    run.source_path = fresh.source_path
+    run.source_mtime = fresh.source_mtime
+    run.wl_nm = fresh.wl_nm
+    run.shift_cm1 = fresh.shift_cm1
+    run.energy_eV = fresh.energy_eV
+    run.intensity = None
+    run.intensity_2d = fresh.intensity_2d
+    run.angle_values = fresh.angle_values
+    run.intensity_unit = fresh.intensity_unit
+    run.angle_unit = fresh.angle_unit
+    run.metadata = previous_metadata
+    run.run_type = fresh.run_type
+    run.raw_table = None
+    summary["run_id"] = run.id
+    return summary
 
 
 # ============================================================================
@@ -3929,33 +4284,12 @@ def discover_cosmics(
     )
     ev = cosmic_detect_evidence(matrix_for_evidence)
 
-    return MergeCosmicResult(
-        files=options.files,
-        pattern_hint=options.pattern_hint,
-        unique_xxxx=options.unique_xxxx,
-        unique_yyyy=options.unique_yyyy,
-        wavelength_nm=options.wavelength_nm,
-        angle_values=options.angle_values,
-        intensity_matrix=options.intensity_matrix,
-        title=options.title,
-        candidate_laser_nm=options.candidate_laser_nm,
-        raw_files=options.raw_files,
-        raw_xxxx=options.raw_xxxx,
-        raw_yyyy=options.raw_yyyy,
-        raw_angle_values=options.raw_angle_values,
-        raw_intensity_matrix=options.raw_intensity_matrix,
-        raw_rows_by_xxxx=options.raw_rows_by_xxxx,
-        primitive_xxxx=options.primitive_xxxx,
-        primitive_matrix=options.primitive_matrix,
-        cosmic_matrix=options.cosmic_matrix,
-        is_polarization_merge=options.is_polarization_merge,
-        dark_value=options.dark_value,
-        intensity_thresh=options.intensity_thresh,
-        comparison_factor=options.comparison_factor,
-        z_thresh_fallback=options.z_thresh_fallback,
-        peaks=peaks,
-        evidence=ev,
-    )
+    payload = {
+        name: getattr(options, name)
+        for name in MergeCosmicOptions.__dataclass_fields__
+        if name not in {"peaks", "evidence"}
+    }
+    return MergeCosmicResult(**payload, peaks=peaks, evidence=ev)
 
 
 def cosmic_apply_for_gui(
@@ -4081,23 +4415,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # --- Cosmic ray detection and correction ---
     active_disc_result = disc # This will hold the result, potentially with cosmic corrections
-
+    
     if prev_opts.cosmic_enable:
         prompt.info("\n--- Cosmic Ray Detection ---")
-        cosmic_options = MergeCosmicOptions(**asdict(active_disc_result),
-                                            dark_value=0.0, # Defaulting, will be set by GUI
-                                            intensity_thresh=1200.0, # Defaulting, will be set by GUI
-                                            comparison_factor=20.0, # Defaulting, will be set by GUI
-                                            z_thresh_fallback=8.0 # Defaulting, will be set by GUI
-                                            )
+        cosmic_options = cosmic_options_from_discover(
+            active_disc_result,
+            dark_value=0.0,
+            intensity_thresh=1200.0,
+            comparison_factor=20.0,
+            z_thresh_fallback=8.0,
+        )
         cosmic_result = discover_cosmics(cosmic_options)
-
+        
         if not cosmic_result.peaks:
             prompt.info("No cosmic ray peaks detected.")
         else:
             prompt.info(f"Detected {len(cosmic_result.peaks)} cosmic ray candidates.")
             prompt.info(f"Evidence: {cosmic_result.evidence}")
-
+            
             remove_mask: List[bool] = []
             confirmed_peaks_indices = [i for i, peak in enumerate(cosmic_result.peaks) if peak.is_confirmed_cosmic]
 
@@ -4109,7 +4444,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         remove_mask.append(True)
                     else:
                         remove_mask.append(False)
-
+            
             # Create a full-length remove_mask
             full_remove_mask = [False] * len(cosmic_result.peaks)
             for i, mask_val in zip(confirmed_peaks_indices, remove_mask):
@@ -4119,7 +4454,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 prompt.info("Applying cosmic ray corrections...")
                 # Apply corrections to the active_disc_result.intensity_matrix
                 active_disc_result = apply_cosmic_removal(cosmic_result, full_remove_mask)
-
+                
                 # Note: cosmic_apply_for_gui returns a MergePreviewResult which has intensity_matrix on wavelength axis
                 # We need to transfer this corrected matrix back into a MergeDiscoverResult structure
                 # to be consumed by the final preview_merge which calculates Raman shift.

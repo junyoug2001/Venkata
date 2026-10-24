@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FormatStrFormatter
+from row_axis import row_axis_from_metadata
 
 import analysis
 import polar_area_fitting
@@ -55,6 +56,7 @@ from fit_overlay import (
 from plotting import centers_to_edges
 
 import plot_export_cli
+from cpl import attach_opposite_chirality_overlays
 
 
 def _visible_runs(exp: ExperimentSet) -> List[Run]:
@@ -160,8 +162,14 @@ def _plot_map(ax, run: Run, view: Optional[ViewState], args):
     x = cm1_to_unit(shift, unit)
     cmap = _normalize_colormap_name(args.cmap) or config.get("default_colormap", config.get("colormap", "OrRd"))
     mesh = ax.pcolormesh(centers_to_edges(x), centers_to_edges(angles), intensity, shading="auto", cmap=cmap)
+    row_axis = row_axis_from_metadata(getattr(run, "metadata", None), angles)
     ax.set_xlabel(spectral_axis_label(unit))
-    ax.set_ylabel("Angle (deg)")
+    ax.set_ylabel(row_axis.label)
+    if row_axis.is_categorical:
+        ax.set_yticks(row_axis.tick_positions)
+        ax.set_yticklabels(row_axis.tick_labels)
+    elif row_axis.major_step:
+        ax.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(row_axis.major_step))
     ax.set_title(args.title or f"{run.nickname}: 2D map")
     if args.xlim is not None:
         ax.set_xlim(args.xlim)
@@ -190,6 +198,7 @@ def _add_fit_markers(ax, exp: ExperimentSet, run: Run, unit: str, mode: str) -> 
 
 def _plot_slice(ax, exp: ExperimentSet, run: Run, view: Optional[ViewState], args, kind: str):
     shift, angles, intensity = _oriented_2d(run)
+    row_axis = row_axis_from_metadata(getattr(run, "metadata", None), angles)
     unit = _display_unit(view, args)
     mode = normalize_fit_overlay_mode(args.fit_overlay)
     fit_data = overlay_data(exp, run, mode)
@@ -201,7 +210,7 @@ def _plot_slice(ax, exp: ExperimentSet, run: Run, view: Optional[ViewState], arg
         x = angles
         y = intensity[:, idx]
         display_val = float(cm1_to_unit(shift[idx], unit))
-        if args.angle_slice == "polar":
+        if args.angle_slice == "polar" and row_axis.uses_polar_plot:
             theta = np.deg2rad(x)
             ax.set_theta_zero_location("N")
             ax.set_theta_direction(-1)
@@ -220,9 +229,10 @@ def _plot_slice(ax, exp: ExperimentSet, run: Run, view: Optional[ViewState], arg
             if fit_data and fit_data.row_matrix is not None:
                 ax.plot(x, fit_data.row_matrix[:, idx], color="#1f77b4", linestyle="--", linewidth=args.linewidth, label="Row fit")
                 added_fit = True
-            ax.set_xlabel("Angle (deg)")
+            ax.set_xlabel(row_axis.label)
             ax.set_ylabel("Intensity (a.u.)")
-        ax.set_title(args.title or f"Angular slice @ {display_val:.2f} {unit}")
+        slice_name = "Angular slice" if row_axis.is_angle else "Row slice"
+        ax.set_title(args.title or f"{slice_name} @ {display_val:.2f} {unit}")
     else:
         idx = _nearest_index(angles, args.y_value)
         x = cm1_to_unit(shift, unit)
@@ -236,7 +246,7 @@ def _plot_slice(ax, exp: ExperimentSet, run: Run, view: Optional[ViewState], arg
             added_fit = True
         ax.set_xlabel(spectral_axis_label(unit))
         ax.set_ylabel("Intensity (a.u.)")
-        ax.set_title(args.title or f"Spectral slice @ {angles[idx]:.2f} deg")
+        ax.set_title(args.title or f"Spectral slice @ {row_axis.format_value(angles[idx], idx)}")
         if args.xlim is not None:
             ax.set_xlim(args.xlim)
 
@@ -2866,7 +2876,8 @@ def cmd_plot(args) -> int:
             raise ValueError("--view is required for --kind full.")
         fig = plot_export_cli._render_full_view(exp, view, args)
     else:
-        projection = "polar" if kind == "slice-b" and args.angle_slice == "polar" else None
+        row_axis = row_axis_from_metadata(getattr(run, "metadata", None), getattr(run, "angle_values", None))
+        projection = "polar" if kind == "slice-b" and args.angle_slice == "polar" and row_axis.uses_polar_plot else None
         fig = plt.figure(figsize=(args.width, args.height), dpi=args.dpi)
         ax = fig.add_axes([0, 0, 1, 1], projection=projection) if args.data_only else fig.add_subplot(1, 1, 1, projection=projection)
         if kind == "map":
@@ -2965,6 +2976,7 @@ def cmd_create_experiment(args) -> int:
     for key in ("1A", "2A"):
         view.get_graph_config(key).cmap = cmap
     exp.add_view(view)
+    created_cpl_runs, cpl_warnings = attach_opposite_chirality_overlays(exp, view, run_ids[:2])
     exp.metadata["num_runs"] = len(exp.runs)
 
     output = os.path.abspath(args.output)
@@ -2973,6 +2985,8 @@ def cmd_create_experiment(args) -> int:
     print(output)
     for run in exp.runs.values():
         print(f"{run.id}\t{run.nickname}")
+    for warning in cpl_warnings:
+        print(f"warning\t{warning}", file=sys.stderr)
     return 0
 
 
@@ -2982,6 +2996,9 @@ def cmd_merge(args) -> int:
     run, summary, cosmic_report = analysis.merge_raw_to_run(
         args.seed,
         input_unit=args.input_unit,
+        filename_template=args.filename_template,
+        merge_profile=args.merge_profile,
+        repeat_mode=args.repeat_mode,
         manual_laser_nm=args.manual_laser_nm,
         dark_value=args.dark_value,
         cosmic_policy=args.cosmic,
@@ -2991,6 +3008,8 @@ def cmd_merge(args) -> int:
     _ensure_unique_run_id(exp, run)
     exp.add_run(run)
     unit = normalize_spectral_unit(args.display_unit or config.get("default_spectral_unit", config.get("unit", "meV")))
+    created_cpl_runs = []
+    cpl_warnings = []
     if args.view_title or not args.append:
         view = ViewState(
             id=new_view_id(),
@@ -3000,6 +3019,8 @@ def cmd_merge(args) -> int:
             x_axis="energy_eV" if unit == "meV" else "shift_cm1",
         )
         exp.add_view(view)
+        created_cpl_runs, cpl_warnings = attach_opposite_chirality_overlays(exp, view, [run.id])
+    exp.metadata["num_runs"] = len(exp.runs)
     output = _write_experiment(exp, args.output)
     if args.cosmic_report and cosmic_report is not None:
         report_path = os.path.abspath(args.cosmic_report)
@@ -3008,6 +3029,8 @@ def cmd_merge(args) -> int:
             json.dump(cosmic_report, f, indent=2, default=_json_default)
         summary["cosmic_report"] = report_path
     summary["output"] = output
+    summary["cpl_virtual_run_ids"] = [item.id for item in created_cpl_runs]
+    summary["cpl_warnings"] = cpl_warnings
     print(json.dumps(summary, indent=2, default=_json_default))
     return 0
 
@@ -3602,6 +3625,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_merge.add_argument("-o", "--output", required=True)
     p_merge.add_argument("--append", help="Append the merged run to an existing ExperimentSet.")
     p_merge.add_argument("--input-unit", choices=["auto", "nm", "cm-1", "meV"], default="auto")
+    p_merge.add_argument("--filename-template", default="auto", help="Filename template ID, or auto.")
+    p_merge.add_argument("--merge-profile", default="auto", help="Merge profile ID within the selected template, or auto.")
+    p_merge.add_argument("--repeat-mode", choices=["average", "separate"], default="average")
     p_merge.add_argument("--display-unit", choices=["meV", "cm-1"])
     p_merge.add_argument("--manual-laser-nm", type=float)
     p_merge.add_argument("--dark-value", type=float, default=0.0)

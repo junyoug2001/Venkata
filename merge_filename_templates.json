@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "templates": [
+    {
+      "id": "pfdirk_cpl_indexed_txt",
+      "label": "PfDirk CPL indexed TXT",
+      "priority": 310,
+      "enabled": true,
+      "pattern": "^(?P<category>(?P<date_ymd>\\d{6})(?P<acquisition_id>\\d{2}))_(?P<sample>[^_]+)_(?P<inttime>\\d+sx\\d+)_(?P<grating>\\d+g)_(?P<slit>\\d+mu)_(?P<laser_nm>\\d+(?:[,.]\\d+)?nm)_(?P<power_mW>[^_]+)_(?P<polarization>RR|RL|LL|LR)_(?P<temperature_K>\\d+(?:[,.]\\d+)?K)_(?P<rep_idx>\\d{4})(?P<extension>\\.txt)$",
+      "converters": {"laser_nm": "unit_float", "temperature_K": "unit_float", "acquisition_id": "int", "rep_idx": "int"},
+      "x_unit_hint": "auto",
+      "examples": ["26091019_mono_30sx2_1200g_50mu_514.37nm_0,3mW_RR_300K_0002.txt"],
+      "merge_profiles": [
+        {"id": "polarization", "label": "Polarization", "axis": {"source": "polarization", "kind": "categorical", "unit": "polarization", "order": ["RR", "RL", "LL", "LR"]}, "family_fields": ["date_ymd", "sample", "inttime", "grating", "slit", "laser_nm", "power_mW", "temperature_K", "extension"], "repeat_fields": ["rep_idx"]}
+      ]
+    },
+    {
+      "id": "pfdirk_angular_txt",
+      "label": "PfDirk angular TXT",
+      "priority": 300,
+      "enabled": true,
+      "pattern": "^(?P<category>\\d{8})_(?P<sample>[^_]+)_(?P<inttime>\\d+sx\\d+)_(?P<grating>\\d+g)_(?P<slit>\\d+mu)_(?P<laser_nm>\\d+(?:,\\d+)?nm)_(?P<power_mW>[^_]+)_(?P<polarization>xx|xy|yx|yy|RL|LR|LL|RR)_(?P<temperature_K>\\d+(?:,\\d+)?K)-(?P<angle_step_deg>-?\\d+(?:\\.\\d+)?)deg_(?P<row_index>\\d{4})_(?P<rep_idx>\\d{4})(?P<extension>\\.txt)$",
+      "converters": {"laser_nm": "unit_float", "temperature_K": "unit_float", "angle_step_deg": "float", "row_index": "int", "rep_idx": "int"},
+      "x_unit_hint": "auto",
+      "examples": ["24111310_MnTe2_20sx1_1800g_50mu_515nm_0,3mW_xx_5K-8deg_0001_0001.txt"],
+      "merge_profiles": [
+        {"id": "angle", "label": "Angle", "axis": {"source": "row_index", "kind": "indexed_step", "unit": "deg", "index_origin": 1, "step_source": "angle_step_deg"}, "family_fields": ["category", "sample", "inttime", "grating", "slit", "laser_nm", "power_mW", "polarization", "temperature_K", "angle_step_deg", "extension"], "repeat_fields": ["rep_idx"]}
+      ]
+    },
+    {
+      "id": "pfdirk_cpl_exported_txt",
+      "label": "PfDirk CPL exported TXT",
+      "priority": 290,
+      "enabled": true,
+      "pattern": "^(?P<category>(?P<date_ymd>\\d{6})(?P<acquisition_id>\\d{2}))_(?P<sample>[^_]+)_(?P<inttime>\\d+sx\\d+)_(?P<grating>\\d+g)_(?P<slit>\\d+mu)_(?P<laser_nm>\\d+(?:[,.]\\d+)?nm)_(?P<power_mW>[^_]+)_(?P<polarization>RL|LR|RR|LL)_(?P<temperature_K>\\d+(?:[,.]\\d+)?K)-(?P<scan_repeat>\\d{2})_(?P<export_index>\\d{4})(?P<extension>\\.txt)$",
+      "converters": {"laser_nm": "unit_float", "temperature_K": "unit_float", "scan_repeat": "int", "export_index": "int"},
+      "x_unit_hint": "auto",
+      "examples": ["24111331_MnTe2_60sx1_1800g_50mu_515nm_0,15mW_LR_80K-01_0001.txt"],
+      "merge_profiles": [
+        {"id": "temperature", "label": "Temperature", "axis": {"source": "temperature_K", "kind": "numeric", "unit": "K"}, "family_fields": ["category", "sample", "inttime", "grating", "slit", "laser_nm", "power_mW", "polarization", "extension"], "repeat_fields": ["scan_repeat", "export_index"]},
+        {"id": "polarization", "label": "Polarization", "axis": {"source": "polarization", "kind": "categorical", "unit": "polarization", "order": ["RR", "RL", "LL", "LR"]}, "family_fields": ["date_ymd", "sample", "inttime", "grating", "slit", "laser_nm", "power_mW", "temperature_K", "extension"], "repeat_fields": ["scan_repeat", "export_index"]}
+      ]
+    },
+    {
+      "id": "pfdirk_cpl_combined_txt",
+      "label": "PfDirk CPL combined TXT",
+      "priority": 280,
+      "enabled": true,
+      "pattern": "^(?P<category>(?P<date_ymd>\\d{6})(?P<acquisition_id>\\d{2}))_(?P<sample>[^_]+)_(?P<inttime>\\d+sx\\d+)_(?P<grating>\\d+g)_(?P<slit>\\d+mu)_(?P<laser_nm>\\d+(?:[,.]\\d+)?nm)_(?P<power_mW>[^_]+)_(?P<polarization>RL|LR|RR|LL)_(?P<temperature_K>\\d+(?:[,.]\\d+)?K)(?P<extension>\\.txt)$",
+      "converters": {"laser_nm": "unit_float", "temperature_K": "unit_float"},
+      "x_unit_hint": "auto",
+      "examples": ["24111349_MnTe2_60sx2_1800g_50mu_515nm_0,15mW_LR_250K.txt"],
+      "merge_profiles": [
+        {"id": "temperature", "label": "Temperature", "axis": {"source": "temperature_K", "kind": "numeric", "unit": "K"}, "family_fields": ["category", "sample", "inttime", "grating", "slit", "laser_nm", "power_mW", "polarization", "extension"], "repeat_fields": []},
+        {"id": "polarization", "label": "Polarization", "axis": {"source": "polarization", "kind": "categorical", "unit": "polarization", "order": ["RR", "RL", "LL", "LR"]}, "family_fields": ["date_ymd", "sample", "inttime", "grating", "slit", "laser_nm", "power_mW", "temperature_K", "extension"], "repeat_fields": []}
+      ]
+    },
+    {
+      "id": "legacy_dated_polarization",
+      "label": "Legacy dated circular polarization",
+      "priority": 110,
+      "enabled": true,
+      "pattern": "^(?P<category>(?P<date_ymd>\\d{6})(?P<acquisition_id>\\d{2}))_(?P<family_prefix>.+?)_(?P<polarization>RR|RL|LR|LL)(?P<middle>.*)_(?P<rep_idx>\\d{4})(?P<extension>\\.[^.]+)$",
+      "converters": {"acquisition_id": "int", "rep_idx": "int"},
+      "x_unit_hint": "auto",
+      "merge_profiles": [
+        {"id": "polarization", "label": "Polarization", "axis": {"source": "polarization", "kind": "categorical", "unit": "polarization", "order": ["RR", "RL", "LL", "LR"]}, "family_fields": ["date_ymd", "family_prefix", "middle", "extension"], "repeat_fields": ["rep_idx"]}
+      ]
+    },
+    {
+      "id": "legacy_polarization",
+      "label": "Legacy circular polarization",
+      "priority": 100,
+      "enabled": true,
+      "pattern": "^(?P<category>[^_]+)_(?P<family_prefix>.+?)_(?P<polarization>RR|RL|LR|LL)(?P<middle>.*)_(?P<rep_idx>\\d{4})(?P<extension>\\.[^.]+)$",
+      "converters": {"rep_idx": "int"},
+      "x_unit_hint": "auto",
+      "merge_profiles": [
+        {"id": "polarization", "label": "Polarization", "axis": {"source": "polarization", "kind": "categorical", "unit": "polarization", "order": ["RR", "RL", "LL", "LR"]}, "family_fields": ["category", "family_prefix", "middle", "extension"], "repeat_fields": ["rep_idx"]}
+      ]
+    },
+    {
+      "id": "legacy_two_index",
+      "label": "Legacy index and repetition",
+      "priority": 50,
+      "enabled": true,
+      "pattern": "^(?P<family>.+)_(?P<row_index>\\d{4})_(?P<rep_idx>\\d{4})(?P<extension>\\.[^.]+)$",
+      "converters": {"row_index": "int", "rep_idx": "int"},
+      "x_unit_hint": "auto",
+      "merge_profiles": [
+        {"id": "angle", "label": "Angle", "axis": {"source": "row_index", "kind": "indexed_step", "unit": "deg", "index_origin": 1, "step_from_filename": true}, "family_fields": ["family", "extension"], "repeat_fields": ["rep_idx"]}
+      ]
+    },
+    {
+      "id": "legacy_one_index",
+      "label": "Legacy index",
+      "priority": 40,
+      "enabled": true,
+      "pattern": "^(?P<family>.+)_(?P<row_index>\\d{4})(?P<extension>\\.[^.]+)$",
+      "converters": {"row_index": "int"},
+      "x_unit_hint": "auto",
+      "merge_profiles": [
+        {"id": "angle", "label": "Angle", "axis": {"source": "row_index", "kind": "indexed_step", "unit": "deg", "index_origin": 1, "step_from_filename": true}, "family_fields": ["family", "extension"], "repeat_fields": []}
+      ]
+    },
+    {
+      "id": "lab_standard_metadata",
+      "label": "Laboratory standard metadata",
+      "priority": 200,
+      "enabled": true,
+      "pattern": "^(?P<category>\\d{8})_(?P<sample>[^_]+)_(?P<inttime>\\d+sx\\d+)_(?P<grating>\\d+g)_(?P<slit>\\d+mu)_(?:(?P<cm_val>\\d+cm-1)_)?(?P<laser_nm>\\d+(?:,\\d+)?nm)_(?P<power_mW>[^_]+)_(?P<polarization>xx|xy|yx|yy|RL|LR|LL|RR)_(?P<temperature_K>\\d+(?:,\\d+)?K)(?:-(?P<angle_step_deg>-?\\d+(?:\\.\\d+)?)deg_(?P<row_index>\\d{4})_(?P<rep_idx>\\d{4}))?(?P<tail>.*?)$",
+      "converters": {"laser_nm": "unit_float", "temperature_K": "unit_float", "angle_step_deg": "float", "row_index": "int", "rep_idx": "int"},
+      "x_unit_hint": "auto",
+      "merge_profiles": [
+        {"id": "angle", "label": "Angle", "axis": {"source": "row_index", "kind": "indexed_step", "unit": "deg", "index_origin": 1, "step_source": "angle_step_deg"}, "family_fields": ["category", "sample", "inttime", "grating", "slit", "cm_val", "laser_nm", "power_mW", "polarization", "temperature_K"], "repeat_fields": ["rep_idx"]}
+      ]
+    }
+  ]
+}

@@ -1033,6 +1033,62 @@ def _is_automatic_fit_cache(run: Run) -> bool:
     )
 
 
+def invalidate_fit_caches_for_sources(
+    exp: ExperimentSet,
+    source_run_ids: Sequence[str],
+    *,
+    fit_owner_ids: Sequence[str] = (),
+) -> Dict[str, int]:
+    """Remove only regenerable caches and links tied to selected source runs."""
+    source_ids = {str(value) for value in source_run_ids if str(value)}
+    owner_ids = {str(value) for value in fit_owner_ids if str(value)}
+    removed_ids = []
+    for run in list(exp.runs.values()):
+        if not _is_automatic_fit_cache(run):
+            continue
+        metadata = run.metadata or {}
+        linked_sources = {str(metadata.get("source_run_id", ""))}
+        linked_sources.update(str(value) for value in (metadata.get("source_run_ids") or []))
+        owner_id = str(metadata.get("fit_params_run_id", ""))
+        if linked_sources & source_ids or owner_id in owner_ids:
+            removed_ids.append(str(run.id))
+    for run_id in removed_ids:
+        exp.runs.pop(run_id, None)
+
+    stripped = 0
+    for run in exp.runs.values():
+        if str(run.id) not in source_ids | owner_ids:
+            continue
+        metadata = run.metadata or {}
+        for key in tuple(_CACHE_LINK_KEYS):
+            if key not in metadata:
+                continue
+            value = metadata.get(key)
+            if isinstance(value, dict):
+                filtered = {
+                    str(map_key): map_value
+                    for map_key, map_value in value.items()
+                    if str(map_key) not in source_ids
+                    and str(map_value) not in removed_ids
+                }
+                if filtered:
+                    metadata[key] = filtered
+                else:
+                    metadata.pop(key, None)
+                stripped += 1
+            elif str(value) in removed_ids or key.endswith("_hash"):
+                metadata.pop(key, None)
+                stripped += 1
+
+    # These dictionaries contain only derived matrices and are cheap to rebuild.
+    _ROW_RECON_CACHE.clear()
+    _GLOBAL_RECON_CACHE.clear()
+    return {
+        "removed_matrix_caches": len(removed_ids),
+        "stripped_cache_links": stripped,
+    }
+
+
 def compact_experiment_fit_caches(
     exp: ExperimentSet,
     *,

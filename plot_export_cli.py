@@ -27,6 +27,7 @@ from data_structure import (
     unit_to_cm1,
 )
 from plotting import centers_to_edges
+from row_axis import row_axis_from_metadata
 
 
 def _register_custom_colormaps() -> None:
@@ -188,7 +189,13 @@ def _render_map(ax, run: Run, view: Optional[ViewState], panel_key: str, args):
     )
     ax.set_title(args.title or f"{run.nickname}: 2D map")
     ax.set_xlabel(spectral_axis_label(unit))
-    ax.set_ylabel("Angle (deg)")
+    row_axis = row_axis_from_metadata(getattr(run, "metadata", None), angles)
+    ax.set_ylabel(row_axis.label)
+    if row_axis.is_categorical:
+        ax.set_yticks(row_axis.tick_positions)
+        ax.set_yticklabels(row_axis.tick_labels)
+    elif row_axis.major_step:
+        ax.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(row_axis.major_step))
     _apply_axis_config(ax, graph_cfg, args, spectral_x=True, unit=unit)
     _apply_color_config(mesh, graph_cfg, args, intensity)
     return mesh
@@ -202,22 +209,24 @@ def _nearest_index(values: np.ndarray, target: Optional[float]) -> int:
 
 def _render_slice(ax, run: Run, view: Optional[ViewState], panel_key: str, args):
     shift, angles, intensity = _oriented_2d(run)
+    row_axis = row_axis_from_metadata(getattr(run, "metadata", None), angles)
     unit = _display_unit(view, args)
     if panel_key.endswith("B"):
         x_value_cm1 = None if args.x_value is None else float(unit_to_cm1(args.x_value, unit))
         idx = _nearest_index(shift, x_value_cm1)
         x = angles
         y = intensity[:, idx]
-        ax.set_xlabel("Angle (deg)")
+        ax.set_xlabel(row_axis.label)
         display_val = float(cm1_to_unit(shift[idx], unit))
-        ax.set_title(args.title or f"Angular slice @ {display_val:.2f} {unit}")
+        slice_name = "Angular slice" if row_axis.is_angle else "Row slice"
+        ax.set_title(args.title or f"{slice_name} @ {display_val:.2f} {unit}")
         spectral_x = False
     else:
         idx = _nearest_index(angles, args.y_value)
         x = cm1_to_unit(shift, unit)
         y = intensity[idx, :]
         ax.set_xlabel(spectral_axis_label(unit))
-        ax.set_title(args.title or f"Spectral slice @ {angles[idx]:.2f} deg")
+        ax.set_title(args.title or f"Spectral slice @ {row_axis.format_value(angles[idx], idx)}")
         spectral_x = True
     ax.plot(x, y, color=args.line_color, linewidth=args.linewidth)
     ax.set_ylabel("Intensity (a.u.)")

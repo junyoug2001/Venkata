@@ -1,5 +1,6 @@
 import io
 import os
+import copy
 import analysis
 from merge_runs_gui import MergeRunsDialog
 from typing import List, Optional, Dict, Any, Tuple
@@ -33,8 +34,10 @@ from data_structure import (
     unit_to_cm1,
 )
 from config_manager import config
+from cpl import display_angles as cpl_display_angles, primary_run_ids
 from fit_overlay import normalize_fit_overlay_mode, overlay_data
-from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
+from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter, normalize_color_scale
+from row_axis import RowAxisSpec, row_axis_from_metadata
 from wx_left_lower_panel import PlotConfigPanel
 
 
@@ -89,7 +92,7 @@ class ViewPanel(wx.Panel):
         self.plotterA1: Optional[RamanPlotter2d] = None
         self.plotterB1: Optional[AngularPlotter] = None
         self.plotterC1: Optional[SlicePlotter] = None
-
+        
         self.plotterA2: Optional[RamanPlotter2d] = None
         self.plotterB2: Optional[AngularPlotter] = None
         self.plotterC2: Optional[SlicePlotter] = None
@@ -112,11 +115,12 @@ class ViewPanel(wx.Panel):
         # Persistent selection state (indices)
         self._sel_idx1: Optional[tuple[int, int]] = None
         self._sel_idx2: Optional[tuple[int, int]] = None
-
+        
         # Track contrast state
         self._contrast_percent = (0.0, 100.0)
         self.current_cmap = "OrRd"
-
+        self.current_color_scale = "linear"
+        
         self._suppress_config_save = False
 
         # Optional second run to visualize in the bottom row
@@ -139,50 +143,33 @@ class ViewPanel(wx.Panel):
 
     def _refresh_after_home(self) -> None:
         self._apply_selection_from_indices(reason="home")
-
+    
     def go_home(self):
         """Reset the view to the full data range."""
         if not self.current_run:
             return
 
-        # Determine full ranges from the primary run
-        # We assume Plot A (Map) is the master for Shift and Angle limits.
-
-        # 1. Shift Range (X-axis of Plot A, X-axis of Plot C)
-        xmin, xmax = 0.0, 1.0
-        x_axis = spectral_axis_for_run(self.current_run, self.get_spectral_unit())
-        if x_axis is not None:
-            xmin = np.min(x_axis)
-            xmax = np.max(x_axis)
-
-        # 2. Angle Range (Y-axis of Plot A, X-axis of Plot B)
-        ymin, ymax = 0.0, 1.0
-        if self.current_run.angle_values is not None:
-            try:
-                _shift, display_angles, _I = self._display_2d_for_run(self.current_run)
-                ymin = np.min(display_angles)
-                ymax = np.max(display_angles)
-            except Exception:
-                ymin = np.min(self.current_run.angle_values)
-                ymax = np.max(self.current_run.angle_values)
-
-        # Apply to Plot A (Map)
-        # This should trigger sync callbacks to update C(x) and B(x)
+        # RamanPlotter2d renders center coordinates as pcolormesh pixel edges.
+        # Restoring center extrema here clipped half a pixel at each end (for
+        # example 0..360 at 8° became 0..360 instead of -4..364).
         if self.plotterA1 and self.plotterA1.ax:
+            (xmin, xmax), (ymin, ymax) = self.plotterA1.full_view_limits()
             self.plotterA1.ax.set_xlim(xmin, xmax)
             self.plotterA1.ax.set_ylim(ymin, ymax)
+        if self.plotterA2 and self.plotterA2.ax:
+            (xmin, xmax), (ymin, ymax) = self.plotterA2.full_view_limits()
+            self.plotterA2.ax.set_xlim(xmin, xmax)
+            self.plotterA2.ax.set_ylim(ymin, ymax)
 
-        # Reset Intensity limits for B and C (Auto-scale)
-        # We don't have a specific "full intensity range" stored easily without scanning data,
-        # but relim() + autoscale_view() usually works if data is plotted.
+        # Plot B remains independently autoscaled in intensity.  Plot C is a
+        # reset point, so it follows its paired map's current color limits.
         if self.plotterB1 and self.plotterB1.ax:
             self.plotterB1.ax.relim()
             self.plotterB1.ax.autoscale_view()
-
-        if self.plotterC1 and self.plotterC1.ax:
-            self.plotterC1.ax.relim()
-            self.plotterC1.ax.autoscale_view()
-
+        if self.plotterB2 and self.plotterB2.ax:
+            self.plotterB2.ax.relim()
+            self.plotterB2.ax.autoscale_view()
+        self._reset_paired_slice_ylims()
         self.canvas.draw_idle()
 
     # --- Public API for external controls ---
@@ -212,7 +199,28 @@ class ViewPanel(wx.Panel):
         return "meV"
 
     def _display_2d_for_run(self, run: Run):
-        return analysis.display_2d_from_run(run)
+        shift, angles, intensity = analysis.display_2d_from_run(run)
+        return shift, cpl_display_angles(run, angles), intensity
+
+    @staticmethod
+    def _row_axis_for_run(run: Run, values=None) -> RowAxisSpec:
+        return row_axis_from_metadata(getattr(run, "metadata", None), values if values is not None else run.angle_values)
+
+    @staticmethod
+    def _slice_axis_had_data(plotter: Optional[SlicePlotter]) -> bool:
+        return bool(plotter and plotter.ax and plotter.ax.has_data())
+
+    @staticmethod
+    def _reset_slice_ylim_from_map(map_plotter: Optional[RamanPlotter2d], slice_plotter: Optional[SlicePlotter]) -> None:
+        if not map_plotter or not slice_plotter or not map_plotter.mesh or not slice_plotter.ax:
+            return
+        lo, hi = map_plotter.mesh.get_clim()
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            slice_plotter.ax.set_ylim(float(lo), float(hi))
+
+    def _reset_paired_slice_ylims(self) -> None:
+        self._reset_slice_ylim_from_map(self.plotterA1, self.plotterC1)
+        self._reset_slice_ylim_from_map(self.plotterA2, self.plotterC2)
 
     def set_spectral_unit(self, unit: str) -> None:
         unit = normalize_spectral_unit(unit)
@@ -445,6 +453,9 @@ class ViewPanel(wx.Panel):
             cfg.vmax = float(self._contrast_percent[1])
             cmap = plotter.mesh.get_cmap()
             cfg.cmap = cmap.name if cmap is not None else self.current_cmap
+            cfg.color_scale = plotter.get_color_scale()
+            if cfg.clim is not None:
+                cfg.clim = tuple(float(v) for v in plotter.mesh.get_clim())
 
             # Mirror primary map settings into legacy fields for old experiments.
             if key == "1A":
@@ -481,12 +492,13 @@ class ViewPanel(wx.Panel):
                     continue
 
                 ax = plotter.ax
-                if cfg.xlim is not None and not (key.endswith("B") and self.angle_slice_type == "polar"):
+                if cfg.xlim is not None and not (key.endswith("B") and getattr(ax, "name", "") == "polar"):
                     ax.set_xlim(self._axis_xlim_from_stored(key, cfg.xlim))
                 if cfg.ylim is not None:
                     ax.set_ylim(cfg.ylim)
 
                 if key.endswith("A") and getattr(plotter, "mesh", None) is not None:
+                    plotter.set_color_scale(cfg.color_scale)
                     cmap = cfg.cmap or self.current_cmap
                     if cmap:
                         try:
@@ -518,14 +530,14 @@ class ViewPanel(wx.Panel):
 
         if not target or not target.ax:
             return
-
+        
         target_unit = self.get_spectral_unit()
         input_unit = normalize_spectral_unit(unit)
         if self._uses_spectral_x(target_key) and input_unit != target_unit:
             x_cm1 = unit_to_cm1(np.asarray([xmin, xmax], dtype=float), input_unit)
             x_axis = cm1_to_unit(x_cm1, target_unit)
             xmin, xmax = float(x_axis[0]), float(x_axis[1])
-
+        
         target.ax.set_xlim(xmin, xmax)
         self._save_all_graph_configs()
         self.canvas.draw_idle()
@@ -550,12 +562,13 @@ class ViewPanel(wx.Panel):
                 cfg.vmin = float(vmin)
                 cfg.vmax = float(vmax)
                 cfg.clim = None
-
+            
         if self.plotterA1:
             self.plotterA1.set_contrast(vmin, vmax)
         if self.plotterA2:
             self.plotterA2.set_contrast(vmin, vmax)
-
+        self._reset_paired_slice_ylims()
+        
         # Update absolute value displays in config panel
         if self.plot_config_panel:
             v_abs = self.get_absolute_vlim_for_percentiles(vmin, vmax)
@@ -563,16 +576,18 @@ class ViewPanel(wx.Panel):
 
     def set_vlim_absolute(self, vmin, vmax):
         """Set absolute intensity limits for contrast."""
-        if self._view_state:
-            for key in ("1A", "2A"):
+        for key, plotter in (("1A", self.plotterA1), ("2A", self.plotterA2)):
+            if plotter:
+                plotter.set_clim(vmin, vmax)
+            if self._view_state:
                 cfg = self._view_state.get_graph_config(key)
-                cfg.clim = (float(vmin), float(vmax))
+                actual = plotter.mesh.get_clim() if plotter and plotter.mesh else (float(vmin), float(vmax))
+                cfg.clim = (float(actual[0]), float(actual[1]))
                 cfg.vmin = self._contrast_percent[0]
                 cfg.vmax = self._contrast_percent[1]
-        if self.plotterA1:
-            self.plotterA1.set_clim(vmin, vmax)
-        if self.plotterA2:
-            self.plotterA2.set_clim(vmin, vmax)
+        self._reset_paired_slice_ylims()
+        if self.plot_config_panel and self.plotterA1 and self.plotterA1.mesh:
+            self.plot_config_panel.update_absolute_vlim_display(*self.plotterA1.mesh.get_clim())
         self.canvas.draw_idle()
 
     def get_roi_vlim(self) -> Tuple[float, float]:
@@ -582,10 +597,10 @@ class ViewPanel(wx.Panel):
             lims.append(self.plotterA1.get_roi_limits())
         if self.plotterA2:
             lims.append(self.plotterA2.get_roi_limits())
-
+        
         if not lims:
             return 0.0, 1.0
-
+        
         vmin = min(l[0] for l in lims)
         vmax = max(l[1] for l in lims)
         return vmin, vmax
@@ -605,12 +620,34 @@ class ViewPanel(wx.Panel):
             self._view_state.cmap = cmap_name
             for key in ("1A", "2A"):
                 self._view_state.get_graph_config(key).cmap = cmap_name
-
+            
         if self.plotterA1 and self.plotterA1.mesh:
             self.plotterA1.mesh.set_cmap(cmap_name)
         if self.plotterA2 and self.plotterA2.mesh:
             self.plotterA2.mesh.set_cmap(cmap_name)
         self.canvas.draw_idle()
+
+    def set_color_scale(self, color_scale: str) -> None:
+        """Apply one color normalization mode to both 2D maps in this view."""
+        self.current_color_scale = normalize_color_scale(color_scale)
+        for key, plotter in (("1A", self.plotterA1), ("2A", self.plotterA2)):
+            if plotter:
+                plotter.set_color_scale(self.current_color_scale)
+            if self._view_state:
+                cfg = self._view_state.get_graph_config(key)
+                cfg.color_scale = self.current_color_scale
+                if cfg.clim is not None and plotter and plotter.mesh:
+                    cfg.clim = tuple(float(v) for v in plotter.mesh.get_clim())
+        self._reset_paired_slice_ylims()
+        if self.plot_config_panel:
+            lo, hi = self.get_absolute_vlim_for_percentiles(*self._contrast_percent)
+            self.plot_config_panel.update_absolute_vlim_display(lo, hi)
+        self.canvas.draw_idle()
+
+    def get_color_scale(self) -> str:
+        if self.plotterA1:
+            return self.plotterA1.get_color_scale()
+        return self.current_color_scale
 
     def refresh_current_colormap(self) -> None:
         """Re-apply the currently selected colormap after its definition changes."""
@@ -774,6 +811,7 @@ class ViewPanel(wx.Panel):
                 data,
                 shading="auto",
                 cmap=plotter.mesh.get_cmap(),
+                norm=copy.copy(plotter.mesh.norm),
             )
             mesh.set_clim(*plotter.mesh.get_clim())
             ax.set_xlim(source_ax.get_xlim())
@@ -876,7 +914,7 @@ class ViewPanel(wx.Panel):
         # Prefer live limits from plot if available
         xlim, ylim = self.get_plot_limits()
         graph_key = self._primary_graph_key()
-
+        
         # Fallback to ViewState if live limits are invalid (e.g. plot not drawn yet)
         if (xlim[0] is None or ylim[0] is None) and self._view_state:
             cfg = self._view_state.graph_configs.get(graph_key)
@@ -887,18 +925,18 @@ class ViewPanel(wx.Panel):
                 xlim = self._axis_xlim_from_stored(graph_key, self._view_state.xlim)
             if ylim[0] is None and self._view_state.ylim:
                 ylim = self._view_state.ylim
-
+            
         if xlim[0] is None: xlim = (0, 1)
         if ylim[0] is None: ylim = (0, 1)
-
+        
         vmin = self._contrast_percent[0]
         vmax = self._contrast_percent[1]
-
+        
         if self._view_state:
             cfg = self._view_state.graph_configs.get("1A")
             vmin = cfg.vmin if cfg and cfg.vmin is not None else self._view_state.vmin
             vmax = cfg.vmax if cfg and cfg.vmax is not None else self._view_state.vmax
-
+        
         slice_cfg = self.get_slice_binning_config()
         return {
             'graph': graph_key,
@@ -908,6 +946,7 @@ class ViewPanel(wx.Panel):
             'vmin_p': vmin,
             'vmax_p': vmax,
             'cmap': self.get_colormap(),
+            'color_scale': self.get_color_scale(),
             'slice_x_binning': slice_cfg["x_bin"],
             'slice_y_binning': slice_cfg["y_bin"],
             'slice_binning_mode': slice_cfg["mode"],
@@ -939,16 +978,16 @@ class ViewPanel(wx.Panel):
 
     def _rebind_limit_sync_callbacks(self) -> None:
         """
-        Re-attach axis synchronization callbacks.
+        Re-attach axis synchronization callbacks. 
         Note: We access .ax directly from the plotters.
         """
         self._disconnect_limit_sync_callbacks()
-
+        
         # Helpers to get axes safely
         axA1 = self.plotterA1.ax if self.plotterA1 else None
         axB1 = self.plotterB1.ax if self.plotterB1 else None
         axC1 = self.plotterC1.ax if self.plotterC1 else None
-
+        
         axA2 = self.plotterA2.ax if self.plotterA2 else None
         axB2 = self.plotterB2.ax if self.plotterB2 else None
         axC2 = self.plotterC2.ax if self.plotterC2 else None
@@ -956,23 +995,23 @@ class ViewPanel(wx.Panel):
         # ---------------------------------------------------------
         # Sync Logic Groups
         # ---------------------------------------------------------
-
+        
         # Group 1: Shift (X-axis) -> A1, C1, A2, C2
         def sync_shift(source_ax):
             if self._syncing_limits: return
             self._syncing_limits = True
             try:
                 xlim = source_ax.get_xlim()
-
+                
                 # Apply to A1, C1
                 if axA1 and axA1 != source_ax: axA1.set_xlim(xlim)
                 if axC1 and axC1 != source_ax: axC1.set_xlim(xlim)
-
+                
                 # Apply to A2, C2
                 if axA2 and axA2 != source_ax: axA2.set_xlim(xlim)
                 if axC2 and axC2 != source_ax: axC2.set_xlim(xlim)
-
-            finally:
+                
+            finally: 
                 self._syncing_limits = False
             self._notify_limits_changed()
 
@@ -991,11 +1030,12 @@ class ViewPanel(wx.Panel):
                 if axA1 and axA1 != source_ax: axA1.set_ylim(angle_lim)
                 if axA2 and axA2 != source_ax: axA2.set_ylim(angle_lim)
 
-                # Apply to B1 (X), B2 (X) - ONLY if not polar
-                if self.angle_slice_type != "polar":
-                    if axB1 and axB1 != source_ax: axB1.set_xlim(angle_lim)
-                    if axB2 and axB2 != source_ax: axB2.set_xlim(angle_lim)
-
+                # Apply to Cartesian row slices only.
+                if axB1 and axB1 != source_ax and getattr(axB1, "name", "") != "polar":
+                    axB1.set_xlim(angle_lim)
+                if axB2 and axB2 != source_ax and getattr(axB2, "name", "") != "polar":
+                    axB2.set_xlim(angle_lim)
+            
             finally:
                 self._syncing_limits = False
             self._notify_limits_changed()
@@ -1029,9 +1069,9 @@ class ViewPanel(wx.Panel):
             # C1 Y -> Intensity (Independent)
             cid = axC1.callbacks.connect("ylim_changed", save_only)
             self._limit_cb_ids.append((axC1.callbacks, cid))
-
+        
         if axB1:
-            if self.angle_slice_type != "polar":
+            if getattr(axB1, "name", "") != "polar":
                 # B1 X -> Angle
                 cid = axB1.callbacks.connect("xlim_changed", lambda ax: sync_angle(ax, is_y_axis=False))
                 self._limit_cb_ids.append((axB1.callbacks, cid))
@@ -1047,16 +1087,16 @@ class ViewPanel(wx.Panel):
             # A2 Y -> Angle
             cid = axA2.callbacks.connect("ylim_changed", lambda ax: sync_angle(ax, is_y_axis=True))
             self._limit_cb_ids.append((axA2.callbacks, cid))
-
+        
         if axC2:
             # C2 X -> Shift
             cid = axC2.callbacks.connect("xlim_changed", sync_shift)
             self._limit_cb_ids.append((axC2.callbacks, cid))
             cid = axC2.callbacks.connect("ylim_changed", save_only)
             self._limit_cb_ids.append((axC2.callbacks, cid))
-
+            
         if axB2:
-            if self.angle_slice_type != "polar":
+            if getattr(axB2, "name", "") != "polar":
                 # B2 X -> Angle
                 cid = axB2.callbacks.connect("xlim_changed", lambda ax: sync_angle(ax, is_y_axis=False))
                 self._limit_cb_ids.append((axB2.callbacks, cid))
@@ -1069,12 +1109,12 @@ class ViewPanel(wx.Panel):
         ax = self.figure.add_subplot(1, 1, 1)
         ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
-
+        
         self.plotterA1 = self.plotterB1 = self.plotterC1 = None
         self.plotterA2 = self.plotterB2 = self.plotterC2 = None
-
+        
         self._disconnect_limit_sync_callbacks()
-
+        
         if self._cid_click:
             self.canvas.mpl_disconnect(self._cid_click)
             self._cid_click = None
@@ -1093,12 +1133,12 @@ class ViewPanel(wx.Panel):
                 if run.run_type == RunType.DERIVED:
                     # Derived Run Logic (Formula)
                     run_config = self._view_state.get_run_config(run.id) if self._view_state else None
-                    if not run_config: return
+                    if not run_config: return 
 
                     n_points = run_config.derived_n_points or run.metadata.get("default_n_points", 100)
                     autorange = run_config.derived_autorange
                     if autorange is None: autorange = run.metadata.get("default_autorange", False)
-
+                    
                     def get_eval_x(target_ax, default_range):
                         if autorange and target_ax:
                             xlim = target_ax.get_xlim()
@@ -1108,7 +1148,7 @@ class ViewPanel(wx.Panel):
                             return np.linspace(rng[0], rng[1], n_points)
 
                     x_unit = run.metadata.get("raw_x_unit", "")
-
+                    
                     if "deg" not in x_unit: # Assume Spectral
                         run_unit = normalize_spectral_unit(x_unit, self.get_spectral_unit())
                         if autorange and pC.ax:
@@ -1131,7 +1171,7 @@ class ViewPanel(wx.Panel):
                         )
                         if pB.ax: pB.ax.clear(); pB.ax.set_axis_off()
                         if pA.ax: pA.ax.clear(); pA.ax.set_axis_off()
-
+                        
                     else: # Assume Angular
                         x_b = get_eval_x(pB.ax, run.metadata.get("default_range"))
                         y_b = run.evaluate(x_b)
@@ -1144,13 +1184,13 @@ class ViewPanel(wx.Panel):
                 if run.run_type == RunType.RUN_1D:
                     # Static 1D Run Logic (Extracted or Imported)
                     run_config = self._view_state.get_run_config(run.id) if self._view_state else None
-
+                    
                     # Determine X and Y
                     # Try standard fields
                     x_data = None
                     x_label = ""
                     y_data = run.intensity
-
+                    
                     if run.shift_cm1 is not None:
                         x_data = run.shift_cm1
                         x_label = "shift"
@@ -1163,13 +1203,13 @@ class ViewPanel(wx.Panel):
                     elif run.energy_eV is not None:
                         x_data = run.energy_eV
                         x_label = "eV"
-
+                        
                     # Fallback to metadata hint if array is None but metadata says what it is
                     # (This handles the case where from_arrays put x in shift_cm1 but we need to match it)
                     # Actually from_arrays populates one of the arrays.
-
+                    
                     if x_data is None: return # Can't plot
-
+                    
                     if x_label == "angle" or "deg" in run.metadata.get("raw_x_unit", ""):
                         # Plot on B
                         styleB = run_config.get_style("B") if run_config else None
@@ -1199,18 +1239,19 @@ class ViewPanel(wx.Panel):
                 # Standard 2D Run Logic
                 # 1. Get Data
                 shift_cm1, angles, I = self._display_2d_for_run(run)
+                row_axis = self._row_axis_for_run(run, angles)
                 shift_axis = spectral_axis_for_run(run, self.get_spectral_unit())
                 if shift_axis is None:
                     return
 
                 # 2. Get coords from index
                 x_sel, y_sel = pA.get_coords_from_index(ix, iy)
-
+                
                 # 3. Update Highlights
                 pA.set_highlight(x_sel, y_sel, visible=True)
                 pB.set_highlight(y_sel, visible=True)
                 pC.set_highlight(x_sel, visible=True)
-
+                
                 # 4. Update Slice Data
                 # Get style from view_state
                 run_config = self._view_state.get_run_config(run.id) if self._view_state else None
@@ -1221,21 +1262,39 @@ class ViewPanel(wx.Panel):
                 # Plot B: Intensity vs Angle at selected Shift (column ix)
                 if ix < I.shape[1]:
                     x_title = f"{x_sel:.2f} {self.get_spectral_unit()}"
-                    pB.render(angles, angular_slice, mode=self.angle_slice_type,
-                              title=f"Angular Slice @ {x_title}{self._format_binning_suffix('B')}",
-                              style=styleB)
-
+                    b_mode = self.angle_slice_type if row_axis.uses_polar_plot else "cartesian"
+                    slice_name = "Angular Slice" if row_axis.is_angle else "Row Slice"
+                    pB.render(
+                        angles,
+                        angular_slice,
+                        mode=b_mode,
+                        title=f"{slice_name} @ {x_title}{self._format_binning_suffix('B')}",
+                        style=styleB,
+                        xlabel=row_axis.label,
+                    )
+                    if row_axis.is_categorical:
+                        pB.ax.set_xticks(np.asarray(row_axis.tick_positions, dtype=float))
+                        pB.ax.set_xticklabels(list(row_axis.tick_labels or ()))
+                
                 # Plot C: Intensity vs Shift at selected Angle (row iy)
                 if iy < I.shape[0]:
+                    previous_c_ylim = pC.ax.get_ylim() if self._slice_axis_had_data(pC) else None
                     # SlicePlotter creates a new line in render(), which is efficient enough here
                     conversion, secondary_label = self._spectral_x_conversion()
                     show_secondary = True if self._view_state is None else self._view_state.show_secondary_unit_axis
-                    pC.render(shift_axis, spectral_slice,
-                              title=f"Spectral Slice @ {y_sel:.1f} deg{self._format_binning_suffix('C')}",
-                              xlabel=spectral_axis_label(self.get_spectral_unit()),
-                              x_unit_conversion=conversion if show_secondary else None,
-                              secondary_x_label=secondary_label,
-                              style=styleC)
+                    pC.render(
+                        shift_axis,
+                        spectral_slice,
+                        title=f"Spectral Slice @ {row_axis.format_value(y_sel, iy)}{self._format_binning_suffix('C')}",
+                        xlabel=spectral_axis_label(self.get_spectral_unit()),
+                        x_unit_conversion=conversion if show_secondary else None,
+                        secondary_x_label=secondary_label,
+                        style=styleC,
+                    )
+                    if previous_c_ylim is None:
+                        self._reset_slice_ylim_from_map(pA, pC)
+                    else:
+                        pC.ax.set_ylim(previous_c_ylim)
 
                 self._apply_fit_overlay(run, ix, iy, pA, pB, pC)
 
@@ -1245,13 +1304,13 @@ class ViewPanel(wx.Panel):
                     # Sync C (Shift)
                     if pC.ax:
                         pC.ax.set_xlim(pA.ax.get_xlim())
-
-                    # Sync B (Angle) if Cartesian
-                    if self.angle_slice_type != "polar" and pB.ax:
+                    
+                    # Sync B (row axis) if Cartesian.
+                    if pB.ax and getattr(pB.ax, "name", "") != "polar":
                         pB.ax.set_xlim(pA.ax.get_ylim())
 
             # Update Run 1
-            _update_run_plots(self.current_run, self._sel_idx1[0], self._sel_idx1[1],
+            _update_run_plots(self.current_run, self._sel_idx1[0], self._sel_idx1[1], 
                               self.plotterA1, self.plotterB1, self.plotterC1)
 
             # Update Run 2
@@ -1262,7 +1321,7 @@ class ViewPanel(wx.Panel):
                     # Or physical sync? Let's do physical sync logic
                     # For now, let's reuse idx1 if idx2 is missing, assuming close grids
                     self._sel_idx2 = self._sel_idx1
-
+                
                 _update_run_plots(self._second_run, self._sel_idx2[0], self._sel_idx2[1],
                                   self.plotterA2, self.plotterB2, self.plotterC2)
 
@@ -1271,20 +1330,20 @@ class ViewPanel(wx.Panel):
                 for rid in self._view_state.run_ids:
                     r_overlay = self._experiment.get_run(rid)
                     if not r_overlay: continue
-
+                    
                     cfg = self._view_state.get_run_config(rid)
                     target_str = cfg.overlay_target
                     if not target_str: continue
-
+                    
                     # Handle multiple targets (comma-separated)
                     targets = [t.strip() for t in target_str.split(",") if t.strip()]
-
+                    
                     for target in targets:
                         # Identify target plotter and reference selection
                         target_plotter = None
                         ref_run = None
                         ref_idx = None
-
+                        
                         if target == "1B":
                             target_plotter = self.plotterB1
                             ref_run = self.current_run
@@ -1301,10 +1360,10 @@ class ViewPanel(wx.Panel):
                             target_plotter = self.plotterC2
                             ref_run = self._second_run
                             ref_idx = self._sel_idx2
-
+                        
                         if not target_plotter or not ref_run or not ref_idx:
                             continue
-
+                            
                         # Overlay logic
                         x_data = None
                         y_data = None
@@ -1318,7 +1377,7 @@ class ViewPanel(wx.Panel):
                              autorange = cfg.derived_autorange
                              if autorange is None: autorange = r_overlay.metadata.get("default_autorange", False)
                              overlay_unit = normalize_spectral_unit(r_overlay.metadata.get("raw_x_unit", self.get_spectral_unit()), self.get_spectral_unit())
-
+                             
                              if autorange and target_plotter.ax:
                                  xlim = target_plotter.ax.get_xlim()
                                  x_data = np.linspace(xlim[0], xlim[1], n_points)
@@ -1327,7 +1386,7 @@ class ViewPanel(wx.Panel):
                                  rng = cfg.derived_range or r_overlay.metadata.get("default_range", (0, 100))
                                  eval_x = np.linspace(rng[0], rng[1], n_points)
                                  x_data = cm1_to_unit(unit_to_cm1(eval_x, overlay_unit), self.get_spectral_unit()) if "C" in target else eval_x
-
+                             
                              y_data = r_overlay.evaluate(eval_x)
                              label += " (D)"
 
@@ -1372,23 +1431,24 @@ class ViewPanel(wx.Panel):
 
                         # Plot if data is valid
                         if x_data is not None and y_data is not None and style:
-                            if x_data.size != y_data.size:
+                            if x_data.size != y_data.size: 
                                 # Safety for 2D slicing mismatch
                                 if y_data.ndim > 1:
                                      if x_data.size == y_data.shape[0]: y_data = y_data[:, 0] # or similar
                                      elif x_data.size == y_data.shape[1]: y_data = y_data[0, :]
-
+                            
                             if x_data.size == y_data.size:
                                 target_plotter.add_trace(
-                                    x_data, y_data,
-                                    color=style.color,
-                                    style=style.linestyle,
+                                    x_data, y_data, 
+                                    color=style.color, 
+                                    style=style.linestyle, 
                                     alpha=style.alpha,
                                     label=label,
                                     marker=style.marker,
-                                    markersize=style.markersize
+                                    markersize=style.markersize,
+                                    linewidth=style.linewidth,
                                 )
-
+            
             # Post-render: Synchronize Radial/Intensity Scale for Plot B
             if self.plotterB1 and self.plotterB1.ax and self.plotterB2 and self.plotterB2.ax:
                 ylim1 = self.plotterB1.ax.get_ylim()
@@ -1396,7 +1456,7 @@ class ViewPanel(wx.Panel):
                 common_max = max(ylim1[1], ylim2[1])
                 self.plotterB1.ax.set_ylim(0, common_max)
                 self.plotterB2.ax.set_ylim(0, common_max)
-
+        
         finally:
             self._rebind_limit_sync_callbacks()
             self._syncing_limits = False
@@ -1422,11 +1482,15 @@ class ViewPanel(wx.Panel):
         spectral_unit = self.get_spectral_unit()
         conversion, secondary_label = self._spectral_x_conversion()
         show_secondary = True if self._view_state is None else self._view_state.show_secondary_unit_axis
-
+        
         # --- Run 1 ---
         run0 = runs[0]
+        row_axis0 = self._row_axis_for_run(run0)
         axA1 = self.figure.add_subplot(gs[0, 0])
-        axB1 = self.figure.add_subplot(gs[0, 1], projection="polar" if self.angle_slice_type == "polar" else None)
+        axB1 = self.figure.add_subplot(
+            gs[0, 1],
+            projection="polar" if self.angle_slice_type == "polar" and row_axis0.uses_polar_plot else None,
+        )
         axC1 = self.figure.add_subplot(gs[0, 2])
 
         self.plotterA1 = RamanPlotter2d(axA1)
@@ -1436,6 +1500,7 @@ class ViewPanel(wx.Panel):
         nickname0 = self._experiment.get_run_nickname(run0.id) if self._experiment else run0.nickname
         x0 = spectral_axis_for_run(run0, spectral_unit)
         _shift0, angles0, intensity0 = self._display_2d_for_run(run0)
+        row_axis0 = self._row_axis_for_run(run0, angles0)
         self.plotterA1.render(
             x0, angles0, intensity0,
             title=f"{nickname0}: 2D map",
@@ -1443,14 +1508,20 @@ class ViewPanel(wx.Panel):
             cmap=self.current_cmap,
             x_unit_conversion=conversion if show_secondary else None,
             secondary_x_label=secondary_label,
+            row_axis=row_axis0,
+            color_scale=self.current_color_scale,
         )
         self.plotterA1.set_highlight_mode(self.highlight_mode)
 
         # --- Run 2 ---
         if len(runs) > 1:
             run1 = runs[1]
+            row_axis1 = self._row_axis_for_run(run1)
             axA2 = self.figure.add_subplot(gs[1, 0])
-            axB2 = self.figure.add_subplot(gs[1, 1], projection="polar" if self.angle_slice_type == "polar" else None)
+            axB2 = self.figure.add_subplot(
+                gs[1, 1],
+                projection="polar" if self.angle_slice_type == "polar" and row_axis1.uses_polar_plot else None,
+            )
             axC2 = self.figure.add_subplot(gs[1, 2])
 
             self.plotterA2 = RamanPlotter2d(axA2)
@@ -1460,6 +1531,7 @@ class ViewPanel(wx.Panel):
             nickname1 = self._experiment.get_run_nickname(run1.id) if self._experiment else run1.nickname
             x1 = spectral_axis_for_run(run1, spectral_unit)
             _shift1, angles1, intensity1 = self._display_2d_for_run(run1)
+            row_axis1 = self._row_axis_for_run(run1, angles1)
             self.plotterA2.render(
                 x1, angles1, intensity1,
                 title=f"{nickname1}: 2D map",
@@ -1467,6 +1539,8 @@ class ViewPanel(wx.Panel):
                 cmap=self.current_cmap,
                 x_unit_conversion=conversion if show_secondary else None,
                 secondary_x_label=secondary_label,
+                row_axis=row_axis1,
+                color_scale=self.current_color_scale,
             )
             self.plotterA2.set_highlight_mode(self.highlight_mode)
         else:
@@ -1478,10 +1552,10 @@ class ViewPanel(wx.Panel):
 
         # Connect Callbacks
         self._rebind_limit_sync_callbacks()
-
+        
         if self._cid_click: self.canvas.mpl_disconnect(self._cid_click)
         self._cid_click = self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
-
+        
         self.figure.subplots_adjust(top=0.862)
         self._apply_selection_from_indices()
         self._apply_saved_graph_configs()
@@ -1508,7 +1582,7 @@ class ViewPanel(wx.Panel):
         # Determine which plotter was clicked
         clicked_plotter = None
         is_run1 = False
-
+        
         if self.plotterA1 and event.inaxes == self.plotterA1.ax:
             clicked_plotter = self.plotterA1
             is_run1 = True
@@ -1527,7 +1601,7 @@ class ViewPanel(wx.Panel):
         elif self.plotterC2 and event.inaxes == self.plotterC2.ax:
             clicked_plotter = self.plotterC2
             is_run1 = False
-
+        
         if not clicked_plotter:
             return
 
@@ -1540,18 +1614,25 @@ class ViewPanel(wx.Panel):
             indices = clicked_plotter.get_index_at(event.xdata, event.ydata)
             if indices:
                 ix, iy = indices
+                x_sel, y_sel = clicked_plotter.get_coords_from_index(ix, iy)
                 if is_run1:
                     self._sel_idx1 = (ix, iy)
-                    self._sel_idx2 = (ix, iy) # Simple sync
+                    if self.plotterA2:
+                        paired = self.plotterA2.get_nearest_index(x_sel, y_sel)
+                        if paired is not None:
+                            self._sel_idx2 = paired
                 else:
                     self._sel_idx2 = (ix, iy)
-                    self._sel_idx1 = (ix, iy)
+                    if self.plotterA1:
+                        paired = self.plotterA1.get_nearest_index(x_sel, y_sel)
+                        if paired is not None:
+                            self._sel_idx1 = paired
                 self._apply_selection_from_indices(reason="click")
 
         # 2. Handle Right Click Menu
         if event.button == 3:
             menu = wx.Menu()
-
+            
             # Helper to add Highlight mode submenu
             highlight_menu = wx.Menu()
             modes = ["none", "click", "line_profile", "peak_fit"]
@@ -1574,7 +1655,7 @@ class ViewPanel(wx.Panel):
             # Plot B: Angular Slice (Angle vs Intensity)
             if clicked_plotter in [self.plotterB1, self.plotterB2]:
                 target_run = self.current_run if is_run1 else self._second_run
-
+                
                 # Submenu for slice type
                 sub = wx.Menu()
                 item_cart = sub.AppendRadioItem(wx.ID_ANY, "Cartesian")
@@ -1584,18 +1665,18 @@ class ViewPanel(wx.Panel):
                 self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("cartesian"), item_cart)
                 self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("polar"), item_polar)
                 menu.AppendSubMenu(sub, "Angle slice type")
-
+                
                 menu.AppendSeparator()
                 item_create = menu.Append(wx.ID_ANY, "Create separate run")
                 self.Bind(wx.EVT_MENU, lambda e: self._create_run_from_trace(clicked_plotter, target_run, "B"), item_create)
-
+                
                 item_fit = menu.Append(wx.ID_ANY, "Curve Fit...")
                 self.Bind(wx.EVT_MENU, lambda e: self._request_curve_fit(clicked_plotter, target_run, "B"), item_fit)
-
+                
             # Plot C: Spectral Slice (Shift vs Intensity)
             elif clicked_plotter in [self.plotterC1, self.plotterC2]:
                 target_run = self.current_run if is_run1 else self._second_run
-
+                
                 item_create = menu.Append(wx.ID_ANY, "Create separate run")
                 self.Bind(wx.EVT_MENU, lambda e: self._create_run_from_trace(clicked_plotter, target_run, "C"), item_create)
 
@@ -1607,7 +1688,7 @@ class ViewPanel(wx.Panel):
                 item_fit = menu.Append(wx.ID_ANY, "Curve Fit (Row-by-Row)...")
                 target_run = self.current_run if is_run1 else self._second_run
                 self.Bind(wx.EVT_MENU, lambda e: self._request_2d_fit(target_run), item_fit)
-
+            
             self.PopupMenu(menu)
             menu.Destroy()
             return
@@ -1650,7 +1731,7 @@ class ViewPanel(wx.Panel):
         shift_display = spectral_axis_for_run(source_run, self.get_spectral_unit())
 
         x_data, y_data = None, None
-
+        
         # 2D Case
         if I is not None and shift is not None and angles is not None:
              selection = self._sel_idx1 if source_run == self.current_run else self._sel_idx2
@@ -1658,14 +1739,14 @@ class ViewPanel(wx.Panel):
                  return
              ix, iy = selection
              angular_slice, spectral_slice = self._slice_data_for_indices(I, ix, iy)
-
+             
              if plot_type == "B" and ix < I.shape[1]:
                  x_data = angles
                  y_data = angular_slice
              elif plot_type == "C" and iy < I.shape[0]:
                  x_data = shift_display
                  y_data = spectral_slice
-
+                 
         # 1D Case (if user clicked on a 1D run overlay) - Wait, overlays don't trigger this menu yet.
         # The menu is attached to the AXES click.
         # The logic `target_run = self.current_run` picks the PRIMARY run.
@@ -1688,13 +1769,13 @@ class ViewPanel(wx.Panel):
         """
         if not plotter or not source_run:
             return
-
+            
         # We need to grab the data currently being displayed.
-        # Plotters usually have 'ax.lines' or similar.
-        # But our plotters (AngularPlotter, SlicePlotter) don't expose data directly easily
-        # unless we stored it.
+        # Plotters usually have 'ax.lines' or similar. 
+        # But our plotters (AngularPlotter, SlicePlotter) don't expose data directly easily 
+        # unless we stored it. 
         # However, we know what data is displayed based on self._sel_idx1 / self._sel_idx2.
-
+        
         # Re-derive the data logic from _apply_selection_from_indices
         shift, angles, I = self._display_2d_for_run(source_run)
         shift_display = spectral_axis_for_run(source_run, self.get_spectral_unit())
@@ -1706,11 +1787,11 @@ class ViewPanel(wx.Panel):
             return
         ix, iy = selection
         angular_slice, spectral_slice = self._slice_data_for_indices(I, ix, iy)
-
+        
         x_data, y_data = None, None
         x_label, y_label = "", "Intensity (au)"
         nickname = ""
-
+        
         if plot_type == "B": # Angular Slice @ fixed shift (ix)
             if ix >= I.shape[1]: return
             # x = angles, y = intensity
@@ -1719,7 +1800,7 @@ class ViewPanel(wx.Panel):
             val = shift[ix]
             nickname = f"{source_run.nickname}_ang_{val:.1f}cm-1"
             x_label = "Angle (deg)"
-
+            
         elif plot_type == "C": # Spectral Slice @ fixed angle (iy)
             if iy >= I.shape[0]: return
             # x = shift, y = intensity
@@ -1744,14 +1825,14 @@ class ViewPanel(wx.Panel):
         sub = wx.Menu()
         item_cart = sub.AppendRadioItem(wx.ID_ANY, "Cartesian")
         item_polar = sub.AppendRadioItem(wx.ID_ANY, "Polar")
-
+        
         if self.angle_slice_type == "polar": item_polar.Check(True)
         else: item_cart.Check(True)
 
         self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("cartesian"), item_cart)
         self.Bind(wx.EVT_MENU, lambda e: self._set_angle_slice_type("polar"), item_polar)
         menu.AppendSubMenu(sub, "Angle slice type")
-
+        
         self.PopupMenu(menu)
         menu.Destroy()
 
@@ -1773,23 +1854,19 @@ class ViewPanel(wx.Panel):
     def set_view_model(self, experiment: ExperimentSet, view_state: ViewState, preserve_state: bool = False) -> None:
         # 1. Determine if we should preserve interactive state (Zoom, Selection)
         # We preserve if requested AND the primary runs currently displayed match the new ones.
-
-        new_ids = []
-        # Pre-calculate which runs will be loaded
-        for rid in view_state.run_ids:
-            r = experiment.runs.get(rid)
-            if r:
-                new_ids.append(r.id)
-                if len(new_ids) == 2: break
+        
+        # Explicit overlays belong to the view but must not consume one of the
+        # two primary map slots.
+        new_ids = primary_run_ids(view_state, experiment)
 
         should_preserve = False
         if preserve_state:
             old_ids = []
             if self.current_run: old_ids.append(self.current_run.id)
             if self._second_run: old_ids.append(self._second_run.id)
-
+            
             should_preserve = (len(old_ids) > 0) and (old_ids == new_ids)
-
+        
         saved_xlim = (None, None)
         saved_ylim = (None, None)
         saved_sel1 = None
@@ -1809,7 +1886,7 @@ class ViewPanel(wx.Panel):
         self.current_run_id = None
         self.current_run = None
         self._second_run = None
-
+        
         # Reset indices initially (will override if preserving)
         self._sel_idx1 = (0, 0)
         self._sel_idx2 = (0, 0)
@@ -1834,6 +1911,9 @@ class ViewPanel(wx.Panel):
             map_cfg.cmap if map_cfg and map_cfg.cmap else
             view_state.cmap if view_state.cmap else "OrRd"
         )
+        self.current_color_scale = normalize_color_scale(
+            map_cfg.color_scale if map_cfg else config.get("default_color_scale", "linear")
+        )
         if map_cfg and map_cfg.vmin is not None and map_cfg.vmax is not None:
             self._contrast_percent = (map_cfg.vmin, map_cfg.vmax)
         elif view_state.vmin is not None and view_state.vmax is not None:
@@ -1845,15 +1925,15 @@ class ViewPanel(wx.Panel):
             if saved_sel2: self._sel_idx2 = saved_sel2
 
         self._draw_runs(runs)
-
+        
         # 5. Restore Zoom Limits
         # Priority: Preserved Live Limits > per-graph persisted limits applied by _draw_runs.
         if should_preserve and saved_xlim[0] is not None:
              self.set_x_range(saved_xlim[0], saved_xlim[1], unit=saved_unit)
-
+             
         if should_preserve and saved_ylim[0] is not None:
              self.set_y_range(saved_ylim[0], saved_ylim[1])
-
+            
         # Apply contrast unless an absolute color scale was saved for the map.
         if not (map_cfg and map_cfg.clim is not None):
             self.set_vlim(self._contrast_percent[0], self._contrast_percent[1])

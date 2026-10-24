@@ -40,9 +40,12 @@ from __future__ import annotations
 import copy
 import os
 import analysis
+from filename_templates import TemplateValidationError, discover_family
 import polar_area_fitting
 import fit_overlay
 from merge_runs_gui import MergeRunsDialog
+from raman_axis_correction import apply_raman_axis_correction
+from raman_axis_correction_gui import RamanAxisCorrectionDialog
 from two_d_map_fitting_gui import MapFittingDialog
 from normalization_gui import NormalizeDialog
 from qe_raman_gui import QeRamanImportDialog
@@ -72,12 +75,17 @@ from data_structure import (
     RunType,
     unit_to_cm1,
 )
-from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter
+from plotting import RamanPlotter2d, AngularPlotter, SlicePlotter, normalize_color_scale
 
 from wx_left_panel import FilesPanel, RunsPanel, ExperimentPanel, LogPanel
 from wx_left_lower_panel import PreviewPanel, FitResultsPanel, PlotConfigPanel, AppearancesPanel, PreferencesPanel
 from wx_right_panel import RamanToolbar, ViewPanel
 from config_manager import config
+from cpl import (
+    attach_opposite_chirality_overlays,
+    primary_run_ids,
+    synchronize_opposite_chirality_run,
+)
 
 
 class PolarAreaFittingDialog(wx.Dialog):
@@ -545,7 +553,7 @@ class MainFrame(wx.Frame):
         item_calc = file_menu.Append(wx.ID_ANY, "Calculate from run...")
         file_menu.AppendSeparator()
         item_quit = file_menu.Append(wx.ID_EXIT, "Quit\tCtrl-Q")
-
+        
         self.Bind(wx.EVT_MENU, self.on_open_experiment, item_open)
         self.Bind(wx.EVT_MENU, self.on_save_experiment, item_save)
         self.Bind(wx.EVT_MENU, self.on_export_igor, item_export_igor)
@@ -561,7 +569,7 @@ class MainFrame(wx.Frame):
         view_menu = wx.Menu()
         item_new_view = view_menu.Append(wx.ID_ANY, "New View Tab\tCtrl+T")
         item_close_view = view_menu.Append(wx.ID_ANY, "Close View Tab\tCtrl+W")
-
+        
         self.Bind(wx.EVT_MENU, self.on_new_view, item_new_view)
         self.Bind(wx.EVT_MENU, self.on_close_current_view, item_close_view)
         menubar.Append(view_menu, "&View")
@@ -594,7 +602,7 @@ class MainFrame(wx.Frame):
             self.preferences_panel.update_experiment(self.experiment)
         except Exception:
             pass
-
+        
         # Refresh appearances panel if a view is active
         try:
             view_id = self._get_current_view_id()
@@ -629,32 +637,21 @@ class MainFrame(wx.Frame):
         if not paths:
             return
 
-        # Group paths by seed patterns to identify unique merge operations
+        # Group selections by the same JSON template/profile family used by
+        # discovery itself.  Legacy grouping remains the fallback for files
+        # that intentionally have no catalog match.
         unique_seeds = {}
         for p in paths:
             abs_p = os.path.abspath(p)
             d = os.path.dirname(abs_p)
             base = os.path.basename(abs_p)
-            m = analysis.POLARIZATION_IDX_RE.match(base)
-            if m:
-                key = (
-                    d,
-                    "pol",
-                    analysis.polarization_family_prefix(m.group("prefix")),
-                    m.group("middle"),
-                    m.group("ext"),
-                )
-            else:
-                m = analysis.NORMAL_IDX_TWO_RE.match(base)
-                if not m:
-                    m = analysis.NORMAL_IDX_ONE_RE.match(base)
-            if m and not analysis.POLARIZATION_IDX_RE.match(base):
-                # Experiment pattern: group by (dir, prefix, ext)
-                key = (d, m.group("prefix"), m.group("ext"))
-            elif not analysis.POLARIZATION_IDX_RE.match(base):
-                # Standalone file: each is its own seed
-                key = (d, base, "")
-
+            try:
+                match, profile, _matches, _plan = discover_family(abs_p)
+                key = (d, match.template.id, profile.id, tuple(match.fields.get(name) for name in profile.family_fields))
+            except TemplateValidationError:
+                m = analysis.POLARIZATION_IDX_RE.match(base) or analysis.NORMAL_IDX_TWO_RE.match(base) or analysis.NORMAL_IDX_ONE_RE.match(base)
+                key = (d, m.group("prefix") if m and "prefix" in m.groupdict() else base, m.group("ext") if m and "ext" in m.groupdict() else "")
+            
             if key not in unique_seeds:
                 unique_seeds[key] = abs_p
 
@@ -674,7 +671,7 @@ class MainFrame(wx.Frame):
                     f"Merged run created as {nickname} ({new_run.id}) from seed {os.path.basename(seed_path)}."
                 )
                 self._refresh_left_panels()
-                self._refresh_all_view_panels()
+                self._refresh_all_view_panels() 
             else:
                 self.log_panel.append_log(f"Merge operation cancelled for seed {os.path.basename(seed_path)}.")
         finally:
@@ -691,13 +688,13 @@ class MainFrame(wx.Frame):
             return
 
         choices = [f"{self.experiment.get_run_nickname(rid)} ({rid})" for rid in run_ids]
-
+        
         with wx.SingleChoiceDialog(self, "Select a run to calculate from:", "Calculate from Run", choices) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
             selection = dlg.GetSelection()
             run_id = run_ids[selection]
-
+        
         run = self.experiment.get_run(run_id)
         if not run:
              return
@@ -714,9 +711,9 @@ class MainFrame(wx.Frame):
              return
 
         summed_intensity = np.sum(run.intensity_2d, axis=0)
-
+        
         new_nickname = f"{run.nickname}_summed"
-
+        
         new_metadata = run.metadata.copy()
         new_metadata["nickname"] = new_nickname
         new_metadata["calculation"] = "angle_sum"
@@ -725,7 +722,7 @@ class MainFrame(wx.Frame):
 
         new_run = Run(
             id=new_run_id(prefix="calc"),
-            source_path=run.source_path,
+            source_path=run.source_path, 
             source_mtime=run.source_mtime,
             wl_nm=run.wl_nm,
             shift_cm1=run.shift_cm1,
@@ -746,15 +743,15 @@ class MainFrame(wx.Frame):
 
     def on_2d_map_fitting(self, event):
         """
-        Open the 2D map fitting tool.
+        Open the 2D map fitting tool. 
         Supports selecting one or two 2D runs, OR one FIT_PARAMS run.
         """
         run_ids = self._selected_or_current_view_run_ids()
-
+        
         run1, run2 = None, None
         params_run = None
         single_config = "parallel"
-
+        
         if len(run_ids) == 1:
             selected_run = self.experiment.get_run(run_ids[0])
             if selected_run is None:
@@ -762,11 +759,11 @@ class MainFrame(wx.Frame):
             if selected_run.run_type == RunType.FIT_PARAMS:
                 params_run = selected_run
                 source_ids = selected_run.metadata.get("source_run_ids") or selected_run.metadata.get("fit_params_source_run_ids") or []
-
+                
                 if len(source_ids) == 2:
                     run1 = self.experiment.get_run(source_ids[0])
                     run2 = self.experiment.get_run(source_ids[1])
-
+                    
                     if not (run1 and run2):
                         wx.MessageBox("One or more source runs for this FIT_PARAMS run could not be found.", "Error", wx.OK | wx.ICON_ERROR)
                         return
@@ -799,7 +796,7 @@ class MainFrame(wx.Frame):
         elif len(run_ids) == 2:
             run1 = self.experiment.get_run(run_ids[0])
             run2 = self.experiment.get_run(run_ids[1])
-
+            
             if not (run1 and run2 and run1.is_2d and run2.is_2d):
                 wx.MessageBox("Both selected runs must be 2D runs.", "Selection Error", wx.OK | wx.ICON_ERROR)
                 return
@@ -829,7 +826,7 @@ class MainFrame(wx.Frame):
                 elif len(source_runs) == 1:
                     run1, run2 = source_runs[0], None
                     single_config = polar_area_fitting.infer_config(run1)
-
+            
         dlg = MapFittingDialog(self, run1, run2, params_run=params_run, single_config=single_config, roles_preassigned=(run2 is not None))
         modal_result = dlg.ShowModal()
         if modal_result == wx.ID_OK and dlg.commit_action:
@@ -1208,13 +1205,13 @@ class MainFrame(wx.Frame):
             return
 
         choices = [f"{self.experiment.get_run_nickname(rid)} ({rid})" for rid in run_ids]
-
+        
         with wx.SingleChoiceDialog(self, "Select a run to normalize:", "Normalization", choices) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
             selection = dlg.GetSelection()
             run_id = run_ids[selection]
-
+        
         run = self.experiment.get_run(run_id)
         if not run:
              return
@@ -1273,6 +1270,7 @@ class MainFrame(wx.Frame):
             on_rename_run=self.on_rename_run,
             on_export_run=self.on_export_run,
             on_update_from_file=self.on_update_run_from_file,
+            on_redo_raman_conversion=self.on_redo_raman_conversion,
             on_remove_run=self.on_remove_run,
             on_edit_formula=self.on_edit_formula,
         )
@@ -1304,8 +1302,8 @@ class MainFrame(wx.Frame):
             on_view_config_change=self._update_fit_results_panel,
         )
         self.appearances_panel = AppearancesPanel(
-            bottom_notebook,
-            on_rename_run=self.on_rename_run,
+            bottom_notebook, 
+            on_rename_run=self.on_rename_run, 
             on_style_change=self.on_style_change
         )
 
@@ -1315,10 +1313,13 @@ class MainFrame(wx.Frame):
         bottom_notebook.AddPage(self.fit_results_panel, "Fit Results")
 
         # Put the two notebooks into the left vertical splitter
-        # Initial sash position: ~40% of left panel height.
+        # Give both tab areas enough room for their tab strip and useful
+        # content.  The previous default sash could start at an edge before
+        # the first layout pass on compact Windows displays.
         self.left_splitter.SplitHorizontally(top_notebook, bottom_notebook)
-        self.left_splitter.SetMinimumPaneSize(80)
-        self.left_splitter.SetSashGravity(0.4)
+        self.left_splitter.SetMinimumPaneSize(130)
+        self.left_splitter.SetSashGravity(0.5)
+        wx.CallAfter(self._set_initial_left_split_ratio)
 
         # --- right: notebook of Views ---
         view_notebook_style = (
@@ -1347,7 +1348,7 @@ class MainFrame(wx.Frame):
 
         # After layout, create the initial view tab and view state
         wx.CallAfter(self._init_view_tab)
-
+        
         # Bind AUI notebook page changed.
         self.view_notebook.Bind(aui.EVT_AUINOTEBOOK_PAGE_CHANGED, self.on_view_page_changed)
 
@@ -1378,6 +1379,7 @@ class MainFrame(wx.Frame):
         map_cfg = view_state.graph_configs.get("1A")
         config.set("default_spectral_unit", normalize_spectral_unit(view_state.spectral_unit))
         config.set("default_colormap", panel.get_colormap())
+        config.set("default_color_scale", panel.get_color_scale())
         config.set("default_vmin_percent", float(map_cfg.vmin if map_cfg and map_cfg.vmin is not None else view_state.vmin))
         config.set("default_vmax_percent", float(map_cfg.vmax if map_cfg and map_cfg.vmax is not None else view_state.vmax))
         config.set("default_angle_slice_type", view_state.angle_slice_type)
@@ -1396,6 +1398,22 @@ class MainFrame(wx.Frame):
             return
         sash_pos = int(width * (1.0 / 3.0))
         self.main_splitter.SetSashPosition(sash_pos)
+
+    def _set_initial_left_split_ratio(self):
+        """Initialize the stacked left notebooks without collapsing either."""
+        height = self.left_splitter.GetClientSize().height
+        if height <= 0:
+            return
+        minimum = self.left_splitter.GetMinimumPaneSize()
+        sash_size = self.left_splitter.GetSashSize()
+        upper = height - minimum - sash_size
+        if upper >= minimum:
+            sash_pos = min(max(int(height * 0.55), minimum), upper)
+        else:
+            # There is not enough space for both ideal minima, but a centered
+            # sash still avoids an entirely hidden notebook.
+            sash_pos = max(0, int((height - sash_size) / 2))
+        self.left_splitter.SetSashPosition(sash_pos)
 
     # -------- experiment / runs --------
 
@@ -1517,7 +1535,7 @@ class MainFrame(wx.Frame):
         self.experiment.add_run(new_run)
         self.log_panel.append_log(f"Created new formula run: {new_run.id}")
         self._refresh_left_panels()
-
+        
     def on_export_run(self, run_ids: List[str]):
         if not run_ids:
             return
@@ -1530,7 +1548,7 @@ class MainFrame(wx.Frame):
         ) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
                 return
-
+            
             output_dir = dlg.GetPath()
 
         exported_count = 0
@@ -1549,7 +1567,7 @@ class MainFrame(wx.Frame):
             except Exception as e:
                 self.log_panel.append_log(f"Failed to export run {run.nickname}: {e}")
                 failed_count += 1
-
+        
         self.log_panel.append_log(f"Finished export operation to {output_dir}.")
         self.log_panel.append_log(f"Successfully exported {exported_count} runs.")
         if failed_count > 0:
@@ -1565,7 +1583,7 @@ class MainFrame(wx.Frame):
 
         run.metadata["formula"] = new_formula
         run.metadata["formula_params"] = new_params
-
+        
         nickname = self.experiment.get_run_nickname(run_id)
         self.log_panel.append_log(f"Updated formula for derived run '{nickname}' ({run_id})")
 
@@ -1573,7 +1591,7 @@ class MainFrame(wx.Frame):
         for view_id, view_state in self.experiment.views.items():
             if run_id in view_state.run_ids:
                 self._update_view_plot(view_id, preserve_state=True)
-
+        
         # Also refresh metadata tree to show updated formula
         self.experiment_panel.refresh_from_experiment(self.experiment)
 
@@ -1584,13 +1602,13 @@ class MainFrame(wx.Frame):
         run = self.experiment.get_run(run_id)
         if not run or run.run_type != RunType.DERIVED:
             return
-
+            
         run.metadata["default_n_points"] = n_points
         run.metadata["default_autorange"] = autorange
         run.metadata["default_range"] = x_range
-
+        
         self.log_panel.append_log(f"Updated properties for derived run {run.nickname}")
-
+        
         # Refresh views
         for view_id, view_state in self.experiment.views.items():
             if run_id in view_state.run_ids:
@@ -1621,12 +1639,13 @@ class MainFrame(wx.Frame):
 
         default_unit = normalize_spectral_unit(config.get("default_spectral_unit", config.get("unit", "meV")))
         default_cmap = config.get("default_colormap", config.get("colormap", "OrRd"))
+        default_color_scale = normalize_color_scale(config.get("default_color_scale", "linear"))
         default_vmin = float(config.get("default_vmin_percent", 0.0))
         default_vmax = float(config.get("default_vmax_percent", 100.0))
         view_state = ViewState(
             id=view_id,
             title=title,
-            run_ids=run_ids or [],
+            run_ids=list(run_ids or []),
             spectral_unit=default_unit,
             x_axis="energy_eV" if default_unit == "meV" else "shift_cm1",
             angle_slice_type=config.get("default_angle_slice_type", "polar"),
@@ -1643,7 +1662,13 @@ class MainFrame(wx.Frame):
             graph_cfg.vmin = default_vmin
             graph_cfg.vmax = default_vmax
             graph_cfg.cmap = default_cmap
+            graph_cfg.color_scale = default_color_scale
         self.experiment.add_view(view_state)
+        created_cpl_runs, cpl_warnings = attach_opposite_chirality_overlays(
+            self.experiment,
+            view_state,
+            list(run_ids or []),
+        )
 
         panel = ViewPanel(
             self.view_notebook,
@@ -1667,8 +1692,14 @@ class MainFrame(wx.Frame):
         # Update the Experiment tab's views list and metadata tree
         self.runs_panel.refresh_from_experiment(self.experiment)
         self.experiment_panel.refresh_from_experiment(self.experiment)
+        for run in created_cpl_runs:
+            self.log_panel.append_log(
+                f"Created CPL opposite-chirality overlay '{run.nickname}' targeting this view."
+            )
+        for warning in cpl_warnings:
+            self.log_panel.append_log(f"CPL overlay skipped: {warning}")
         return view_state
-
+    
     def on_run_created(self, new_run: Run, overlay_target_run: Optional[Run] = None, overlay_plot_type: str = None) -> None:
         """Callback from ViewPanel or CurveFitPanel when a new run is created."""
         self.experiment.add_run(new_run)
@@ -1676,7 +1707,7 @@ class MainFrame(wx.Frame):
         self.log_panel.append_log(
             f"Created new run '{nickname}' ({new_run.id})."
         )
-
+        
         # Handle automatic overlay if requested
         if overlay_target_run and overlay_plot_type:
             view_id = self._get_current_view_id()
@@ -1684,25 +1715,24 @@ class MainFrame(wx.Frame):
                 view_state = self.experiment.get_view(view_id)
                 # Check if target run is in this view
                 slot_prefix = None
-                if len(view_state.run_ids) > 0 and view_state.run_ids[0] == overlay_target_run.id:
-                    slot_prefix = "1"
-                elif len(view_state.run_ids) > 1 and view_state.run_ids[1] == overlay_target_run.id:
-                    slot_prefix = "2"
-
+                primary_ids = primary_run_ids(view_state, self.experiment)
+                if overlay_target_run.id in primary_ids:
+                    slot_prefix = str(primary_ids.index(overlay_target_run.id) + 1)
+                
                 if slot_prefix:
                     target_code = f"{slot_prefix}{overlay_plot_type}"
-
+                    
                     # Add new run to view if not present (it shouldn't be yet)
                     if new_run.id not in view_state.run_ids:
                         view_state.run_ids.append(new_run.id)
-
+                    
                     # Set overlay config
                     cfg = view_state.get_run_config(new_run.id)
                     cfg.overlay_target = target_code
-
+                    
                     # Also default the style color to red or something distinct?
                     # For now default black is fine, or random.
-
+                    
                     self.log_panel.append_log(f"Overlaying {nickname} onto {target_code}")
 
         self._refresh_left_panels()
@@ -1741,7 +1771,7 @@ class MainFrame(wx.Frame):
                 break
         wx.MessageBox("Interactive fitting is now done in Tools -> Make 2D Fit. This panel shows saved fit results.", "Fit Results", wx.OK | wx.ICON_INFORMATION)
 
-
+    
     # -------- view management helpers --------
 
     def _get_current_view_id(self) -> Optional[str]:
@@ -1814,7 +1844,7 @@ class MainFrame(wx.Frame):
     def on_view_page_changed(self, event=None):
         view_panel = self.get_current_view_panel()
         self.plot_config_panel.set_target_view(view_panel)
-
+        
         # Sync Appearances Panel
         view_id = self._get_current_view_id()
         if view_id:
@@ -1823,7 +1853,7 @@ class MainFrame(wx.Frame):
         else:
             self.appearances_panel.update_view(None, None)
         self._update_fit_results_panel()
-
+        
         if event is not None:
             event.Skip()
 
@@ -1857,6 +1887,12 @@ class MainFrame(wx.Frame):
             if rid not in view_state.run_ids:
                 view_state.run_ids.append(rid)
 
+        created_cpl_runs, cpl_warnings = attach_opposite_chirality_overlays(
+            self.experiment,
+            view_state,
+            run_ids,
+        )
+
         labels = [
             f"{self.experiment.get_run_nickname(rid)}({rid})"
             for rid in run_ids
@@ -1864,6 +1900,12 @@ class MainFrame(wx.Frame):
         self.log_panel.append_log(
             f"Added runs {', '.join(labels)} to view {view_state.title}"
         )
+        for run in created_cpl_runs:
+            self.log_panel.append_log(
+                f"Created CPL opposite-chirality overlay '{run.nickname}' for {view_state.title}."
+            )
+        for warning in cpl_warnings:
+            self.log_panel.append_log(f"CPL overlay skipped: {warning}")
 
         # Refresh the views listing and update plotting
         self.runs_panel.refresh_from_experiment(self.experiment)
@@ -2008,16 +2050,16 @@ class MainFrame(wx.Frame):
         view_id = self._get_current_view_id()
         if not view_id:
             return
-
+        
         view_state = self.experiment.get_view(view_id)
         if not view_state:
             return
 
         run_config = view_state.get_run_config(run_id)
-
+        
         # Determine targets: specific component or all
         targets = [component] if component else ["A", "B", "C"]
-
+        
         for comp in targets:
             style = run_config.get_style(comp)
             if attr == "style_string":
@@ -2053,7 +2095,7 @@ class MainFrame(wx.Frame):
             elif attr == "derived_range":
                 if isinstance(value, (tuple, list)) and len(value) == 2:
                     run_config.derived_range = tuple(value)
-
+        
         self.log_panel.append_log(f"Updated style '{attr}' for run {run_id} (comp={component or 'all'})")
         # If overlay_target changed, we might need a full redraw because the primary run list might change
         if attr in ["overlay_target", "derived_n_points", "derived_autorange", "derived_range"]:
@@ -2077,8 +2119,28 @@ class MainFrame(wx.Frame):
                     )
                     continue
                 try:
-                    run.reload_data()
+                    metadata = run.metadata or {}
+                    if metadata.get("cpl_virtual"):
+                        source_id = str(metadata.get("cpl_virtual_source_run_id") or "")
+                        source = self.experiment.get_run(source_id)
+                        if source is None:
+                            raise ValueError("the CPL source run is missing")
+                        synchronize_opposite_chirality_run(source, run)
+                    elif metadata.get("merged_files"):
+                        analysis.reload_merged_run(run)
+                    else:
+                        run.reload_data()
                     self.log_panel.append_log(f"Reloaded data for {run.nickname} ({run.source_path})")
+                    if not metadata.get("cpl_virtual"):
+                        for view_state in self.experiment.views.values():
+                            if run.id in view_state.run_ids:
+                                _created, warnings = attach_opposite_chirality_overlays(
+                                    self.experiment,
+                                    view_state,
+                                    [run.id],
+                                )
+                                for warning in warnings:
+                                    self.log_panel.append_log(f"CPL overlay skipped after reload: {warning}")
                     updated_any = True
                 except Exception as e:
                     self.log_panel.append_log(f"Failed to reload {run.nickname}: {e}")
@@ -2091,10 +2153,62 @@ class MainFrame(wx.Frame):
                 wx.OK | wx.ICON_INFORMATION,
                 self,
             )
-
+        
         if updated_any:
             self._refresh_left_panels()
             self._refresh_all_view_panels()
+
+    def on_redo_raman_conversion(self, run_id: str) -> None:
+        """Preview and atomically replace a merged run's Raman-shift calibration."""
+        try:
+            dialog = RamanAxisCorrectionDialog(self, self.experiment, run_id)
+        except Exception as exc:
+            wx.MessageBox(str(exc), "Redo Raman-shift conversion", wx.OK | wx.ICON_ERROR, self)
+            return
+        try:
+            if dialog.ShowModal() != wx.ID_OK or dialog.plan is None:
+                return
+            plan = dialog.plan
+        finally:
+            dialog.Destroy()
+
+        if len(plan.corrections) > 1:
+            names = "\n".join(f"• {item.nickname}" for item in plan.corrections)
+            message = (
+                "This run belongs to a shared fit. The same laser correction will be applied "
+                f"to all linked runs and the shared fit will be translated:\n\n{names}\n\nContinue?"
+            )
+            confirm = wx.MessageDialog(
+                self,
+                message,
+                "Correct linked Raman runs",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING,
+            )
+            try:
+                if confirm.ShowModal() != wx.ID_YES:
+                    return
+            finally:
+                confirm.Destroy()
+        try:
+            summary = apply_raman_axis_correction(self.experiment, plan)
+        except Exception as exc:
+            wx.MessageBox(
+                f"The conversion was not applied:\n{exc}",
+                "Redo Raman-shift conversion",
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+            return
+
+        names = ", ".join(self.experiment.get_run_nickname(run_id) for run_id in summary["affected_run_ids"])
+        self.log_panel.append_log(
+            f"Recalibrated Raman-shift axis for {len(summary['affected_run_ids'])} run(s) "
+            f"at {summary['new_laser_nm']:.9g} nm: {names}; "
+            f"translated fits={len(summary['fit_owner_ids'])}, "
+            f"removed caches={summary['removed_matrix_caches']}."
+        )
+        self._refresh_left_panels()
+        self._refresh_all_view_panels()
 
     def on_remove_run(self, run_ids: List[str]) -> None:
         """
@@ -2107,7 +2221,7 @@ class MainFrame(wx.Frame):
             run = self.experiment.get_run(run_id)
             if run is None:
                 continue
-
+            
             nickname = run.nickname
             self.experiment.remove_run(run_id)
             self.log_panel.append_log(f"Removed run {nickname} ({run_id})")
@@ -2184,6 +2298,18 @@ class MainFrame(wx.Frame):
 
         # Add tabs back
         for vid, vstate in self.experiment.views.items():
+            source_ids = primary_run_ids(vstate, self.experiment)
+            created_cpl_runs, cpl_warnings = attach_opposite_chirality_overlays(
+                self.experiment,
+                vstate,
+                source_ids,
+            )
+            for run in created_cpl_runs:
+                self.log_panel.append_log(
+                    f"Added missing CPL opposite-chirality overlay '{run.nickname}' to {vstate.title}."
+                )
+            for warning in cpl_warnings:
+                self.log_panel.append_log(f"CPL overlay skipped while loading {vstate.title}: {warning}")
             panel = ViewPanel(
                 self.view_notebook,
                 view_label=vstate.title,
@@ -2198,6 +2324,9 @@ class MainFrame(wx.Frame):
             self._view_id_to_panel[vid] = panel
             panel.set_view_model(self.experiment, vstate)
 
+        # Backfilling an old source-only CPL view may have added virtual runs.
+        self._refresh_left_panels()
+        
         # Ensure panels are connected to the current (first) view
         if self.view_notebook.GetPageCount() > 0:
             # Manually trigger updates as if the page changed

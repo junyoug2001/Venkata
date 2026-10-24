@@ -1,13 +1,17 @@
-# Venkata: Raman GUI for 1D / 2D / Angular Maps
+# Venkata: Raman GUI for 1D, 2D, angular, and CPL maps
 
 Venkata is a small, experiment-driven Raman spectroscopy GUI aimed at day-to-day use by physicists.
+
+This update adds filename-aware merge families, circular-polarization (CPL)
+maps and opposite-chirality overlays, repeatable merged-run reloads, Raman-shift
+axis correction, and linear/logarithmic map color scales.
 
 It is designed to:
 
 - Load 1D and 2D / angular Raman data from simple text / CSV / Excel files.
 - Organize measurements into an **ExperimentSet** (runs + views + metadata).
 - Inspect up to **two runs side-by-side** in a VESTA-like layout with synchronized interactions.
-- Provide a simple workflow for merging multiple 1D spectra into a 2D angular map.
+- Merge related 1D spectra into angular or CPL maps.
 - Export 2D data to publication-ready CSV files.
 - Keep the GUI relatively simple and lightweight, while pushing heavy analysis
   (cosmic rays, curve fitting, etc.) into a separate non-GUI layer.
@@ -20,43 +24,49 @@ The codebase is split into a few cooperating layers:
 - `wx_gui.py` – main frame, menus, event wiring, and application control.
 - `wx_left_panel.py`, `wx_left_lower_panel.py`, `wx_right_panel.py` – file/run panels, plot controls, appearance controls, and view rendering.
 - `merge_runs_gui.py` – merge-preview dialog and merge-specific plotting controls.
+- `filename_templates.py`, `merge_filename_templates.json`, `cpl.py` – filename-family discovery, circular-polarization ordering, and opposite-chirality virtual maps.
+- `raman_axis_correction.py`, `raman_axis_correction_gui.py` – merged-run Raman-shift recalibration and its review dialog.
 - `qe_raman.py`, `qe_raman_gui.py` – wx-free Quantum ESPRESSO `ph.x` parsing/spectrum generation and its desktop import dialog.
 - `plot_export_cli.py` – headless plot export from saved experiment files.
 - `agent_cli.py` – agent-friendly command line wrapper for listing runs, exporting maps/slices, exporting data, and creating temporary experiments.
 - `fit_overlay.py`, `polar_area_fitting.py` – fit reconstruction overlays and polar peak-area fitting exports.
 - `config_manager.py`, `settings.example.json` – application defaults, example custom colormaps, and local preference persistence.
 
-The intent is that each file remains small and well-scoped so that another person (or an AI assistant)
-can safely modify one layer without breaking the others.
+These modules separate data, analysis, rendering, and GUI responsibilities.
 
 ---
 
-## 1. Running the application
+## 1. Install and run
 
-Venkata is tested with Python 3.12. From the `Venkata` directory, install the
-runtime dependencies and launch the application:
+Venkata is tested with Python 3.12. Download the complete repository from
+GitHub (use **Code → Download ZIP** if Git is unavailable), open a terminal in
+the extracted `Venkata` directory, and install the dependencies. A conda
+environment named `calculation` is the recommended setup:
 
 ```bash
+conda create -n calculation python=3.12 -y
+conda activate calculation
 python -m pip install -r requirements.txt
 python wx_gui.py
 ```
 
-Optional Seaborn and Crameri colormaps are listed separately:
+If you already have a suitable `calculation` environment, skip the
+`conda create` step. Optional Seaborn and Crameri colormaps can be installed with:
 
 ```bash
 python -m pip install -r requirements-optional.txt
 ```
 
-The application runs with defaults when `settings.json` is absent and creates
-that local file as preferences are changed. To start from the included custom
-colormap examples, copy `settings.example.json` to `settings.json`. Runtime
-`settings.json` is intentionally ignored because it contains machine-specific
-paths and window state. The command-line exporters use the same project modules,
-although they render with Matplotlib's headless Agg backend.
+The GUI runs with built-in defaults when `settings.json` is absent. Preferences
+create or update that file. If you want the included custom-colormap examples,
+copy `settings.example.json` to `settings.json` before first launch. Keep your
+own `settings.json` local because it can contain machine-specific paths and
+window state. The command-line exporters use the same installed dependencies
+but render without opening a GUI window.
 
 While you can still provide initial files as command-line arguments, the primary way to load data is through the `File` menu.
 
-- **`File -> Import Run(s)...`**: Opens a dialog to select one or more data files to import as individual runs.
+- **`File -> Import Run...`**: Opens a dialog to select one or more data files to import as individual runs.
 - **`File -> Import Quantum ESPRESSO Raman...`**: Reads a `ph.x` output and creates paired frequency-only `<name>_DFT_xx` / `<name>_DFT_yx` runs, with optional relative heights and widths from a saved Fit Parameters run.
 - **`File -> Merge Run...`**: Starts the process of combining multiple 1D spectra into a 2D run.
 - **`File -> Export to Igor Pro...`**: Writes all numeric runs in the current experiment to Igor Text (`.itx`) without requiring `igor2`.
@@ -68,6 +78,9 @@ python wx_gui.py export-plot RamanData.dat --list
 python wx_gui.py export-plot RamanData.dat --view "View 3" --panel full --output view3.pdf
 python wx_gui.py export-plot RamanData.dat --run CPS_bulk_xx --panel A --unit meV --xlim 0.62 50 --output cps_bulk_xx_map.pdf
 ```
+
+Replace `RamanData.dat` and the run/view names with names from your own saved
+experiment; the example data file is not required for installation.
 
 ---
 
@@ -126,12 +139,12 @@ Provides numerical and I/O helpers without GUI dependencies:
 ### Main Window
 - **Left Pane**: Contains notebooks for file browsing, experiment management (listing runs and views), metadata display, and logging.
 - **Right Pane**: Contains one or more "View" tabs for data visualization.
-- **Plots**: Each view shows up to two runs in a 2x3 layout: 2D map (Plot A), angular slice (Plot B), and spectral slice (Plot C).
+- **Plots**: Each view shows up to two primary runs in a 2x3 layout: 2D map (Plot A), angular or categorical row slice (Plot B), and spectral slice (Plot C). Additional runs can remain attached as overlay-only traces without consuming a primary slot.
 
 ### Key Features and Interactions
 
 - **Data Import**:
-  - Load individual runs via `File -> Import Run(s)...`.
+  - Load individual runs via `File -> Import Run...`.
   - Load Quantum ESPRESSO phonon results via `File -> Import Quantum ESPRESSO Raman...`. The editable mapping table can pair positive Raman-active QE modes with fitted Venkata peaks, then previews and creates native XX/YX 1D runs.
   - Runs are listed in the "Experiment" panel.
 
@@ -139,6 +152,12 @@ Provides numerical and I/O helpers without GUI dependencies:
   - Initiate a merge via `File -> Merge Run...`.
   - A dialog appears to preview the merge, allowing for cosmic ray correction and selection of the final X-axis units (`cm-1` or `meV`).
   - The newly created 2D run is added to the experiment.
+  - Dedicated CPL templates recognize `RR`, `RL`, `LL`, and `LR` files separately from linear-polarization/angular templates. Files with different two-digit acquisition IDs are grouped when their six-digit date and all measurement settings match; files from genuinely different dates are not combined.
+  - CPL rows use the fixed order `RR`, `RL`, `LL`, `LR` and display coordinates `0`, `90`, `180`, and `270` degrees. Repeat suffixes such as `_0001` and `_0002` are averaged within each polarization unless separate-repeat mode is requested.
+  - A complete four-polarization CPL map added to a view automatically gets a persisted opposite-chirality virtual map. The virtual map exchanges `RR` with `LL` and `RL` with `LR`, remains overlay-only, and is drawn on the corresponding Plot C as a thinner red line.
+  - Merged runs store a reload recipe. **Update from file** rebuilds the complete family and refreshes its CPL virtual map. Legacy merges without a recipe, and GUI merges with an interactive cosmic selection that cannot be reproduced exactly, are rejected with an explanatory message instead of being replaced by a single 1D seed spectrum.
+  - For a merged Raman run, right-click it and choose **Redo Raman-shift conversion…** to preview a laser-wavelength correction. Linked runs and shared fit parameters are updated together after confirmation.
+  - See [260921 CPL Workflow](260921%20CPL%20Workflow.md) for the filename, view, lifecycle, and verification contract.
 
 - **Data Export**:
   - In the "Experiment" panel, right-click on one or more runs and select "Export Run...".
@@ -179,9 +198,11 @@ Example row-rule file (later matching rules override earlier ones):
 ```
 
 - **Plot Interaction**:
-  - Clicking on a 2D map selects a Raman shift and angle, updating the slice plots.
+  - Clicking on a 2D map selects a Raman shift and row coordinate, updating the slice plots. For angular maps the row coordinate is an angle; for CPL maps it is a polarization category.
+  - CPL Plot B is Cartesian and places `RR`, `RL`, `LL`, and `LR` at 90-degree intervals. Plot C shows the selected source spectrum together with its automatic opposite-chirality overlay when present.
   - Plot Config includes per-view X/Y/All slice binning controls. Cross binning averages only the orthogonal direction; Box binning also smooths along the slice direction.
   - Plot Config includes a per-view fit overlay mode (`Off`, `Global`, `Row`, `Both`) for fitted 2D map runs.
+  - Map color scales can be linear or logarithmic; the default for new views is set in Preferences.
   - Zoom and pan are synchronized across all relevant plots.
   - The 2D maps are rendered with `pcolormesh` for accurate visualization of non-uniform data.
   - Right-click on a plot panel to copy the visible data region as a bitmap; 1D panels also offer a lightweight single-panel vector copy for editing lines and axes in illustration tools.
@@ -247,6 +268,8 @@ When a requested spectral range mixes units, choose one output unit and convert 
 - `Run` is the source of truth for loaded numeric data. Prefer adding data import/export logic there or in small helpers that do not import wx.
 - `ExperimentSet` owns persistence. When adding persistent view fields, make the loader tolerant of older HDF5/JSON dicts and preserve existing legacy fields.
 - `ViewState.run_configs` controls per-run style and overlay behavior. `ViewState.graph_configs` controls per-panel plot appearance and limits.
+- CPL virtual runs are managed in `cpl.py`. They store `cpl_virtual_source_run_id`, the chirality mapping, and the row permutation in metadata. Reuse must synchronize arrays from the source, and deleting the source must remove its generated virtual run and view configuration.
+- Filename-family rules belong in `merge_filename_templates.json`. CPL family keys may ignore the two-digit acquisition ID but must retain the six-digit date and measurement settings to avoid cross-experiment merges.
 - `ViewPanel` owns live matplotlib axes. It should push live axis/color state back into `ViewState` before save/close and after user-driven range or colormap changes.
 - `PlotConfigPanel` edits the currently targeted `ViewPanel`; it should not directly mutate experiments except through the view panel API.
 - Custom colormaps live in `settings.json` under `custom_colormaps` and are registered into matplotlib before plotting or CLI export.

@@ -23,19 +23,19 @@ class ParamsGrid(wx.grid.Grid):
     def __init__(self, parent):
         super().__init__(parent)
         self.CreateGrid(0, 4)
-        for i, l in enumerate(["Param", "Value", "Min", "Max"]):
+        for i, l in enumerate(["Param", "Value", "Min", "Max"]): 
             self.SetColLabelValue(i, l)
         self.SetRowLabelSize(0)
 
     def load_data(self, labels, data_lists):
-        if self.GetNumberRows() > 0:
+        if self.GetNumberRows() > 0: 
             self.DeleteRows(0, self.GetNumberRows())
         for label, dlist in zip(labels, data_lists):
             row = self.GetNumberRows()
             self.InsertRows(row, 1)
             self.SetCellValue(row, 0, label)
             self.SetReadOnly(row, 0, True)
-            for i in range(3):
+            for i in range(3): 
                 self.SetCellValue(row, i+1, f"{dlist[i]:.6g}")
                 if label == "Profile_X_Shift":
                     self.SetReadOnly(row, i+1, True)
@@ -43,9 +43,9 @@ class ParamsGrid(wx.grid.Grid):
     def save_to_lists(self, data_lists):
         for row in range(self.GetNumberRows()):
             for i in range(3):
-                try:
+                try: 
                     data_lists[row][i] = float(self.GetCellValue(row, i+1))
-                except:
+                except: 
                     pass
 
 class RowFitSettingsDialog(wx.Dialog):
@@ -438,7 +438,6 @@ class ValidationFrame(wx.Dialog):
         splitter = wx.SplitterWindow(self)
         left_panel = wx.Panel(splitter)
         right_panel = wx.Panel(splitter)
-
         left_sizer = wx.BoxSizer(wx.VERTICAL)
         heading = wx.StaticText(left_panel, label="Row-by-Row Fit Reconstruction")
         heading_font = heading.GetFont()
@@ -572,7 +571,7 @@ class ValidationFrame(wx.Dialog):
         ds_idx = -1
         if e.inaxes in [self.ax_raw1, self.ax_rec1]: ds_idx = 0
         elif e.inaxes in [self.ax_raw2, self.ax_rec2]: ds_idx = 1
-
+        
         if ds_idx != -1 and ds_idx < len(self.results):
             res = self.results[ds_idx]
             if e.xdata is not None and e.ydata is not None:
@@ -950,8 +949,10 @@ class ValidationFrame(wx.Dialog):
 
             ax_raw.clear(); ax_rec.clear()
             ax_raw.pcolormesh(x, ang, z_raw, vmin=vmin, vmax=vmax, cmap='inferno', shading='auto')
+            ax_raw.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(90.0))
             ax_raw.set_title(f"{res['label']} Data")
             ax_rec.pcolormesh(x, ang, z_rec, vmin=vmin, vmax=vmax, cmap='inferno', shading='auto')
+            ax_rec.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(90.0))
             anomaly_rows = [
                 row_index for row_index, status in enumerate(res.get("row_status") or [])
                 if isinstance(status, dict) and status.get("anomalies") and row_index < ang.size
@@ -997,13 +998,13 @@ class ValidationFrame(wx.Dialog):
         else:
             for ax in [self.ax_raw2, self.ax_rec2, self.ax_spec2, self.ax_ang2]:
                 ax.clear()
-
+        
         if saved_xlim != (0.0, 1.0) and saved_ylim != (0.0, 1.0):
             self.ax_raw1.set_xlim(saved_xlim)
             self.ax_raw1.set_ylim(saved_ylim)
             self.ax_ang1.set_xlim(saved_ylim)
             self.ax_ang2.set_xlim(saved_ylim)
-
+            
         self.canvas.draw()
 
 
@@ -1012,16 +1013,16 @@ class ExportOptionsDialog(wx.Dialog):
         super().__init__(parent, title="Export Options", size=(400, 500))
         self.peak_names = peak_names
         self.init_ui()
-
+        
     def init_ui(self):
         sizer = wx.BoxSizer(wx.VERTICAL)
-
+        
         sizer.Add(wx.StaticText(self, label="Select data to export to experiment:"), 0, wx.ALL, 10)
-
+        
         self.cb_full_rec = wx.CheckBox(self, label="Full Reconstruction (Total)")
         self.cb_full_rec.SetValue(True)
         sizer.Add(self.cb_full_rec, 0, wx.LEFT|wx.RIGHT|wx.BOTTOM, 10)
-
+        
         self.cb_polar_areas = wx.CheckBox(self, label="Peak-wise Polar Peak Area Map (Angle vs Peak)")
         self.cb_polar_areas.SetValue(True)
         sizer.Add(self.cb_polar_areas, 0, wx.LEFT|wx.RIGHT|wx.BOTTOM, 10)
@@ -1036,17 +1037,17 @@ class ExportOptionsDialog(wx.Dialog):
 
         sizer.Add(wx.StaticLine(self), 0, wx.EXPAND|wx.ALL, 5)
         sizer.Add(wx.StaticText(self, label="Individual Peak Reconstructions:"), 0, wx.ALL, 10)
-
+        
         self.peak_cbs = []
         for name in self.peak_names:
             cb = wx.CheckBox(self, label=f"Peak: {name}")
             cb.SetValue(False)
             self.peak_cbs.append(cb)
             sizer.Add(cb, 0, wx.LEFT|wx.RIGHT|wx.BOTTOM, 10)
-
+            
         btn_sizer = self.CreateButtonSizer(wx.OK | wx.CANCEL)
         sizer.Add(btn_sizer, 0, wx.ALL | wx.ALIGN_RIGHT, 10)
-
+        
         self.SetSizer(sizer)
 
     def get_options(self):
@@ -1070,10 +1071,10 @@ class MapFittingDialog(wx.Dialog):
     ):
         super().__init__(parent, title=f"Joint 2D Fitting", size=(1400, 900),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX)
-
+        
         self.engine = analysis.MapFittingEngine()
         self.params_run = params_run
-
+        
         self.single_config = "cross" if str(single_config).lower().startswith("cross") else "parallel"
 
         if run2 is None:
@@ -1084,16 +1085,16 @@ class MapFittingDialog(wx.Dialog):
             # Determine which is XX and which is YX based on pol metadata
             r1_pol = str(run1.metadata.get("pol", "")).lower()
             r2_pol = str(run2.metadata.get("pol", "")).lower()
-
+            
             swap = False
             if not roles_preassigned and ("yx" in r1_pol or "xy" in r1_pol or "cross" in r1_pol) and not ("xx" in r2_pol or "para" in r2_pol):
                 swap = True
-
+            
             if swap:
                 self.run1, self.run2 = run2, run1
             else:
                 self.run1, self.run2 = run1, run2
-
+            
         if self.run1.is_2d:
             shift1, angles1, intensity1, background_angles1 = analysis.display_2d_with_acquisition_angles_from_run(self.run1)
             self.engine.set_data(
@@ -1116,11 +1117,11 @@ class MapFittingDialog(wx.Dialog):
                 self.run2.nickname,
                 background_ang=background_angles2,
             )
-
+        
         if params_run:
             # The dialog is transactional: never let engine edits alias saved metadata.
             self.engine.from_dict(copy.deepcopy(params_run.metadata.get("fit_state", {})))
-
+        
         if self.run2 is None:
             self.SetTitle(f"2D Fitting: {self.run1.nickname} ({self.engine.datasets[0]['label']})")
         else:
@@ -1128,7 +1129,7 @@ class MapFittingDialog(wx.Dialog):
 
         self.last_sel = 0
         self.selected_slice = self._default_selected_slice()
-
+        
         self.result_runs = []
         self.pending_row_results = None
         self.commit_action = None
@@ -1141,7 +1142,7 @@ class MapFittingDialog(wx.Dialog):
         self._fit_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_fit_timer, self._fit_timer)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
-
+        
         self.init_ui()
         self.refresh_ui()
         self.update_plots()
@@ -1261,21 +1262,26 @@ class MapFittingDialog(wx.Dialog):
 
     def init_ui(self):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
-
+        
         splitter = wx.SplitterWindow(self)
         left_panel = wx.Panel(splitter)
         right_panel = wx.Panel(splitter)
-
+        # Keep the range and fit controls available when the dialog is used
+        # on a compact/high-DPI display.  Without this, the plot pane can
+        # shrink the left controls to an unusable width.
+        left_panel.SetMinSize((300, -1))
+        
         # Left Panel (Controls)
         left_sizer = wx.BoxSizer(wx.VERTICAL)
-
+        
         # Range
         range_box = wx.FlexGridSizer(2, 2, 5, 5)
+        range_box.AddGrowableCol(1, 1)
         self.txt_min_x = wx.TextCtrl(left_panel, value="", style=wx.TE_PROCESS_ENTER)
         self.txt_max_x = wx.TextCtrl(left_panel, value="", style=wx.TE_PROCESS_ENTER)
         self.txt_min_x.Bind(wx.EVT_TEXT_ENTER, self.on_range_change)
         self.txt_max_x.Bind(wx.EVT_TEXT_ENTER, self.on_range_change)
-        range_box.AddMany([wx.StaticText(left_panel, label="Min X:"), self.txt_min_x,
+        range_box.AddMany([wx.StaticText(left_panel, label="Min X:"), self.txt_min_x, 
                            wx.StaticText(left_panel, label="Max X:"), self.txt_max_x])
         left_sizer.Add(range_box, 0, wx.ALL|wx.EXPAND, 5)
 
@@ -1286,7 +1292,7 @@ class MapFittingDialog(wx.Dialog):
         self.peak_list.Bind(wx.EVT_KEY_DOWN, self.on_peak_list_key)
         left_sizer.Add(wx.StaticText(left_panel, label="Peaks:"), 0, wx.ALL, 5)
         left_sizer.Add(self.peak_list, 0, wx.EXPAND|wx.ALL, 5)
-
+        
         p_box = wx.BoxSizer(wx.HORIZONTAL)
         btn_add = wx.Button(left_panel, label="Add Peak")
         btn_add.Bind(wx.EVT_BUTTON, self.on_add_peak)
@@ -1318,7 +1324,7 @@ class MapFittingDialog(wx.Dialog):
         si_btns.Add(btn_si_clear, 0, wx.ALL, 2)
         si_box.Add(si_btns, 0, wx.EXPAND)
         left_sizer.Add(si_box, 0, wx.EXPAND|wx.LEFT|wx.RIGHT|wx.BOTTOM, 5)
-
+        
         self.grid = ParamsGrid(left_panel)
         left_sizer.Add(self.grid, 1, wx.EXPAND|wx.ALL, 5)
 
@@ -1328,14 +1334,14 @@ class MapFittingDialog(wx.Dialog):
         self.txt_vmax = wx.TextCtrl(left_panel, value="1000", style=wx.TE_PROCESS_ENTER)
         self.txt_vmin.Bind(wx.EVT_TEXT_ENTER, self.on_viz)
         self.txt_vmax.Bind(wx.EVT_TEXT_ENTER, self.on_viz)
-        v_box.AddMany([wx.StaticText(left_panel, label="VMin:"), self.txt_vmin,
+        v_box.AddMany([wx.StaticText(left_panel, label="VMin:"), self.txt_vmin, 
                            wx.StaticText(left_panel, label="VMax:"), self.txt_vmax])
         left_sizer.Add(v_box, 0, wx.ALL|wx.EXPAND, 5)
 
         # Actions
         act_box = wx.FlexGridSizer(3, 2, 5, 5)
         self._fit_action_buttons = []
-        for lbl, cb in [("Preview", self.on_preview), ("FIT Global", self.on_fit),
+        for lbl, cb in [("Preview", self.on_preview), ("FIT Global", self.on_fit), 
                         ("Validate (RowFit)", self.on_validate), ("Export Text", self.on_export_text),
                         ("Import Text", self.on_import_text), ("Export CSV Diag", self.on_export_diagnostics)]:
             btn = wx.Button(left_panel, label=lbl)
@@ -1361,25 +1367,26 @@ class MapFittingDialog(wx.Dialog):
         right_sizer.Add(self.toolbar, 0, wx.EXPAND)
         right_sizer.Add(self.canvas, 1, wx.EXPAND)
         right_panel.SetSizer(right_sizer)
-
+        
         gs = self.fig.add_gridspec(2, 4, height_ratios=[1.2, 1], wspace=0.3, hspace=0.3,
                                    left=0.05, right=0.98, bottom=0.08, top=0.95)
-
+        
         self.ax_raw1 = self.fig.add_subplot(gs[0, 0])
         self.ax_rec1 = self.fig.add_subplot(gs[0, 1], sharex=self.ax_raw1, sharey=self.ax_raw1)
-        self.ax_spec1 = self.fig.add_subplot(gs[1, 0], sharex=self.ax_raw1)
+        self.ax_spec1 = self.fig.add_subplot(gs[1, 0], sharex=self.ax_raw1) 
         self.ax_ang1  = self.fig.add_subplot(gs[1, 1])
-
+        
         self.ax_raw2 = self.fig.add_subplot(gs[0, 2], sharex=self.ax_raw1, sharey=self.ax_raw1)
         self.ax_rec2 = self.fig.add_subplot(gs[0, 3], sharex=self.ax_raw1, sharey=self.ax_raw1)
-        self.ax_spec2 = self.fig.add_subplot(gs[1, 2], sharex=self.ax_raw1)
+        self.ax_spec2 = self.fig.add_subplot(gs[1, 2], sharex=self.ax_raw1) 
         self.ax_ang2  = self.fig.add_subplot(gs[1, 3])
-
+        
         self.canvas.mpl_connect('button_press_event', self.on_click)
 
-        splitter.SplitVertically(left_panel, right_panel, 350)
+        splitter.SplitVertically(left_panel, right_panel, 360)
+        splitter.SetMinimumPaneSize(280)
         main_sizer.Add(splitter, 1, wx.EXPAND)
-
+        
         # Dialog buttons. Only these commit handlers may mutate the experiment.
         self.btn_export_exp = wx.Button(self, label="Export to Experiment...")
         self.btn_export_exp.Bind(wx.EVT_BUTTON, self.on_export_to_experiment)
@@ -1396,9 +1403,9 @@ class MapFittingDialog(wx.Dialog):
         h_sizer.Add(self.btn_save_new, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
         h_sizer.Add(self.btn_ok, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
         h_sizer.Add(self.btn_cancel, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-
+        
         main_sizer.Add(h_sizer, 0, wx.EXPAND)
-
+        
         self.SetSizer(main_sizer)
 
     def on_ok(self, event):
@@ -1477,7 +1484,7 @@ class MapFittingDialog(wx.Dialog):
         self.peak_list.Clear()
         for ds_idx in self._active_dataset_indices():
             self.peak_list.Append(self._bg_label(ds_idx))
-        for i, p in enumerate(self.engine.peaks):
+        for i, p in enumerate(self.engine.peaks): 
             self.peak_list.Append(self.peak_identifier_label(i, p))
         sel = curr if curr != -1 else 0
         if self.peak_list.GetCount():
@@ -1556,7 +1563,7 @@ class MapFittingDialog(wx.Dialog):
             p = self.engine.peaks[peak_idx]
             self.grid.save_to_lists([p["spec_params"]["x0"], p["spec_params"]["gamma"]] + [p["ang_params"].get(n, [0.0, -np.inf, np.inf]) for n in analysis.RULE_METADATA[p["rule"]]["params"]])
 
-    def on_add_peak(self, e):
+    def on_add_peak(self, e): 
         self.save_grid(self.peak_list.GetSelection())
         rule_name = self.rule_combo.GetValue() or "D2h_B1g"
         ds_idx = int(self.selected_slice.get("dataset_index", 0))
@@ -1596,7 +1603,7 @@ class MapFittingDialog(wx.Dialog):
         except ValueError:
             self.peak_list.SetSelection(self.peak_list.GetCount() - 1)
         self.on_peak_sel(None)
-
+        
     def on_rem_peak(self, e):
         sel = self.peak_list.GetSelection()
         peak_idx = self._selection_peak_index(sel)
@@ -1640,19 +1647,19 @@ class MapFittingDialog(wx.Dialog):
             self.load_grid()
             self.update_plots()
 
-    def on_preview(self, e):
+    def on_preview(self, e): 
         self.save_grid(self.peak_list.GetSelection())
         self.update_plots()
-
-    def on_viz(self, e):
+        
+    def on_viz(self, e): 
         self.update_plots()
-
+        
     def on_range_change(self, e):
-        try:
+        try: 
             self.engine.x_min_limit = float(self.txt_min_x.GetValue())
             self.engine.x_max_limit = float(self.txt_max_x.GetValue())
             self.update_plots()
-        except:
+        except: 
             pass
 
     def _set_fit_actions_enabled(self, enabled: bool) -> None:
@@ -1847,7 +1854,7 @@ class MapFittingDialog(wx.Dialog):
         prog.Pulse()
         success, msg, results = validation_engine.validate_row_by_row(row_fit_config)
         prog.Destroy()
-
+        
         if success and results:
             self._persist_row_fit_caches(results)
             global_matrices = [{"dataset_index": ds_idx, "matrix": validation_engine.reconstruct(ds_idx)} for ds_idx in validation_engine.active_dataset_indices()]
@@ -1921,7 +1928,7 @@ class MapFittingDialog(wx.Dialog):
         ds_idx = -1
         if clicked_ax in [self.ax_raw1, self.ax_rec1]: ds_idx = 0
         elif clicked_ax in [self.ax_raw2, self.ax_rec2]: ds_idx = 1
-
+        
         if ds_idx != -1:
             ds = self.engine.datasets[ds_idx]
             if ds["x"] is not None and ds["ang"] is not None and e.xdata is not None and e.ydata is not None:
@@ -1936,40 +1943,42 @@ class MapFittingDialog(wx.Dialog):
 
     def update_plots(self):
         if self.engine.datasets[0]["z"] is None: return
-
+        
         saved_xlim = self.ax_raw1.get_xlim()
         saved_ylim = self.ax_raw1.get_ylim()
-
+        
         def plot_set(ds_idx, ax_raw, ax_rec, ax_spec, ax_ang):
             ds = self.engine.datasets[ds_idx]
             if ds["z"] is None: return
-
+            
             z_raw = ds["z"]
             z_rec = self.engine.reconstruct(ds_idx)
             x = ds["x"]
             ang = ds["ang"]
             slice_ix, slice_iy = self._slice_indices(ds_idx)
-
-            try:
+            
+            try: 
                 vmin, vmax = float(self.txt_vmin.GetValue()), float(self.txt_vmax.GetValue())
-            except:
+            except: 
                 vmin, vmax = np.nanpercentile(z_raw, [1, 99])
-
+            
             ax_raw.clear(); ax_rec.clear()
             ax_raw.pcolormesh(x, ang, z_raw, vmin=vmin, vmax=vmax, cmap='inferno', shading='auto')
+            ax_raw.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(90.0))
             ax_raw.set_title(f"{ds['label']} Raw")
             ax_raw.set_ylabel("Angle")
-
+            
             ax_rec.pcolormesh(x, ang, z_rec, vmin=vmin, vmax=vmax, cmap='inferno', shading='auto')
+            ax_rec.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(90.0))
             ax_rec.set_title("Reconstruction")
             ax_rec.set_yticklabels([])
-
+            
             for ax in [ax_raw, ax_rec]:
-                if self.engine.x_min_limit > x.min():
+                if self.engine.x_min_limit > x.min(): 
                     ax.axvspan(x.min(), self.engine.x_min_limit, color='gray', alpha=0.5)
-                if self.engine.x_max_limit < x.max():
+                if self.engine.x_max_limit < x.max(): 
                     ax.axvspan(self.engine.x_max_limit, x.max(), color='gray', alpha=0.5)
-
+                
                 if 0 <= slice_iy < len(ang):
                     ax.axhline(ang[slice_iy], color='w', ls='--', alpha=0.5)
                 if 0 <= slice_ix < len(x):
@@ -1991,9 +2000,9 @@ class MapFittingDialog(wx.Dialog):
                 ax_spec.plot(x, z_raw[slice_iy,:], 'k', alpha=0.5)
                 ax_spec.plot(x, z_rec[slice_iy,:], 'r')
                 ax_spec.set_title(f"Spec @ {cur_ang:.1f}°")
-                if self.engine.x_min_limit > x.min():
+                if self.engine.x_min_limit > x.min(): 
                     ax_spec.axvspan(x.min(), self.engine.x_min_limit, color='gray', alpha=0.2)
-                if self.engine.x_max_limit < x.max():
+                if self.engine.x_max_limit < x.max(): 
                     ax_spec.axvspan(self.engine.x_max_limit, x.max(), color='gray', alpha=0.2)
 
             ax_ang.clear()
@@ -2005,13 +2014,13 @@ class MapFittingDialog(wx.Dialog):
 
         plot_set(0, self.ax_raw1, self.ax_rec1, self.ax_spec1, self.ax_ang1)
         plot_set(1, self.ax_raw2, self.ax_rec2, self.ax_spec2, self.ax_ang2)
-
+        
         if saved_xlim != (0.0, 1.0) and saved_ylim != (0.0, 1.0):
             self.ax_raw1.set_xlim(saved_xlim)
             self.ax_raw1.set_ylim(saved_ylim)
             self.ax_ang1.set_xlim(saved_ylim)
             self.ax_ang2.set_xlim(saved_ylim)
-
+        
         self.canvas.draw()
 
     @staticmethod
@@ -2029,7 +2038,7 @@ class MapFittingDialog(wx.Dialog):
     def on_export_to_experiment(self, e):
         """Stage explicitly requested Run objects until the main dialog commits."""
         self.save_grid(self.peak_list.GetSelection())
-
+        
         peak_names = [p["name"] for p in self.engine.peaks]
         with ExportOptionsDialog(self, peak_names) as dlg:
             if dlg.ShowModal() != wx.ID_OK:
@@ -2037,14 +2046,14 @@ class MapFittingDialog(wx.Dialog):
             options = dlg.get_options()
 
         self.result_runs = []
-
+        
         # 1. Full Reconstruction
         if options["full_rec"]:
             for i in range(2):
                 orig_run = self.run1 if i == 0 else self.run2
                 if orig_run is None or not orig_run.is_2d: continue
                 total_rec = self.engine.reconstruct(i)
-
+                
                 new_nickname = f"{orig_run.nickname}_TotalFit"
                 new_metadata = self._clean_export_metadata(orig_run)
                 new_metadata.pop("angle_rotation", None)
@@ -2053,7 +2062,7 @@ class MapFittingDialog(wx.Dialog):
                 new_metadata["is_reconstruction"] = True
                 new_metadata["fit_component"] = "Total"
                 new_metadata["source_run_id"] = orig_run.id
-
+                
                 new_run = Run(
                     id=new_run_id(prefix="fit"),
                     source_path=orig_run.source_path,
@@ -2079,7 +2088,7 @@ class MapFittingDialog(wx.Dialog):
                 if orig_run is None or not orig_run.is_2d: continue
                 areas = self.engine.get_peak_polar_areas(i)
                 if areas is None: continue
-
+                
                 new_nickname = f"{orig_run.nickname}_PolarAreas"
                 new_run = Run(
                     id=new_run_id(prefix="polar"),
@@ -2103,7 +2112,7 @@ class MapFittingDialog(wx.Dialog):
             orig_run = self.run1 if ds_idx == 0 else self.run2
             if not (orig_run and orig_run.is_2d): continue
             name = rec["name"]
-
+            
             # Check if this peak was selected
             if name == "Background":
                 if not options.get("background"):
@@ -2115,10 +2124,10 @@ class MapFittingDialog(wx.Dialog):
                         continue
                 except ValueError:
                     continue
-
+                
             matrix = rec["matrix"]
             new_nickname = f"{orig_run.nickname}_{name}_fit" if name != "Background" else f"{orig_run.nickname}_BackgroundFit"
-
+            
             new_metadata = self._clean_export_metadata(orig_run)
             new_metadata.pop("angle_rotation", None)
             new_metadata.pop("angle_rotation_summary", None)
@@ -2126,7 +2135,7 @@ class MapFittingDialog(wx.Dialog):
             new_metadata["is_reconstruction"] = True
             new_metadata["fit_component"] = name
             new_metadata["source_run_id"] = orig_run.id
-
+            
             new_run = Run(
                 id=new_run_id(prefix="fit"),
                 source_path=orig_run.source_path,
@@ -2176,7 +2185,7 @@ class MapFittingDialog(wx.Dialog):
                     raw_table=None,
                 )
                 self.result_runs.append(new_run)
-
+            
         # Count how many for each run
         r1_count = len([r for r in self.result_runs if r.metadata.get("source_run_id") == self.run1.id])
         lines = [f"Created {len(self.result_runs)} runs total.", f"- {self.run1.nickname}: {r1_count} runs"]

@@ -5,6 +5,7 @@ from typing import Any, Dict
 DEFAULT_SETTINGS = {
     "default_spectral_unit": "meV",
     "default_colormap": "OrRd",
+    "default_color_scale": "linear",
     "default_vmin_percent": 0.0,
     "default_vmax_percent": 100.0,
     "default_angle_slice_type": "polar",
